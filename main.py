@@ -2,6 +2,7 @@ import torch
 import logging
 import os
 import math
+import time
 from datasets import load_dataset, load_from_disk
 from transformers import AutoTokenizer
 from torch.utils.data import DataLoader
@@ -104,10 +105,14 @@ def get_lr(step):
     return min_lr + coeff * (max_lr - min_lr)
 
 # --- Training Loop ---
+log_file_path = "training_log.txt"
+log_lines = ["Step\tTrain Loss\tVal Loss\tLearning Rate"]
 train_losses = []
 val_losses = []
 val_loss_steps = []
 learning_rates = []
+val_loss_display = ""
+start_time = time.time()
 
 train_iter = iter(train_dataloader)
 val_iter = iter(val_dataloader)
@@ -141,12 +146,12 @@ for step in range(max_steps):
     optimizer.step()
     optimizer.zero_grad()
 
+    train_loss = loss.item() * gradient_accumulation_steps
     train_losses.append(loss.item() * gradient_accumulation_steps)
-
     if step > 0 and step % log_interval == 0:
         logging.info(f"Step {step}, Train Loss: {train_losses[-1]:.4f}, LR: {lr:.6f}")
     
-    if step > 0 and step % eval_interval == 0:
+    if step == 0 or step % eval_interval == 0 or step == max_steps:
         model.eval()
         current_val_loss = 0
         with torch.no_grad():
@@ -165,14 +170,30 @@ for step in range(max_steps):
         avg_val_loss = current_val_loss / val_steps
         val_losses.append(avg_val_loss)
         val_loss_steps.append(step)
-        logging.info(f"Step {step}, Val Loss: {avg_val_loss:.4f}")
+        val_loss_display = f"{avg_val_loss:.4f}"
+        logging.info(f"Step {step}, Val Loss: {val_loss_display}")
         model.train()
 
+    log_lines.append(f"{step}\t{train_loss:.4f}\t{val_loss_display}\t{lr:.6f}")
     if step % save_interval == 0 and step > 0:
         torch.save(model.state_dict(), f'model_step_{step}.pt')
 
 torch.save(model.state_dict(), 'model_final.pt')
 logging.info("Training finished.")
+
+# print time for training
+end_time = time.time()
+elapsed_time = end_time - start_time
+
+formatted_time = time.strftime("%H:%M:%S", time.gmtime(elapsed_time))
+
+print(f"Total training time: {formatted_time}")
+logging.info(f"Total training time: {formatted_time}")
+
+log_lines.append(f"Total training time: {formatted_time}")
+
+with open("training_log.txt", "w") as f:
+    f.write("\n".join(log_lines))
 
 # --- Plotting ---
 # Loss Plot

@@ -19,7 +19,7 @@ config = GPTConfig(
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 model_path = 'model_final.pt'
 # <<< CHANGE THIS TO TEST DIFFERENT MODELS >>>
-QUANTIZATION_MODE = 'bf16_partial' # Options: 'none', 'bf16_partial'
+QUANTIZATION_MODE = 'none' # Options: 'none', 'bf16_partial'
 
 
 def bytes_to_mb(b):
@@ -50,8 +50,6 @@ print(f"Total Parameters Count : {total_params / 1e6:.2f}M")
 print(f"Bits per Parameter     : {bits_per_param:.2f} bits")
 print(f"Model Parameters Memory: {bytes_to_mb(param_memory)}")
 
-
-
 # --- Initialize Gradients and Optimizer States for Analysis ---
 print("\n--- Initializing States for Analysis ---")
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
@@ -72,38 +70,51 @@ print("Done.")
 
 # 2. --- Measure Gradient Memory ---
 gradient_memory = 0
+total_grad_elements = 0
 grad_null_count = 0
 grad_not_required_count = 0
 for param in model.parameters():
     if param.grad is not None and param.requires_grad:
         gradient_memory += param.grad.numel() * param.grad.element_size()
+        total_grad_elements += param.grad.numel()
     elif param.grad is None and param.requires_grad:
         grad_null_count += 1
     elif param.grad is not None and not param.requires_grad:
         grad_not_required_count += 1
+
+bits_per_grad = (gradient_memory * 8) / total_grad_elements if total_grad_elements > 0 else 0
+
 print(f"Gradients Memory       : {bytes_to_mb(gradient_memory)}")
+print(f"Bits per Gradient      : {bits_per_grad:.2f} bits")
+
 
 # 3. --- Measure Optimizer State Memory ---
 optimizer_memory = 0
+total_optimizer_elements = 0
 for state in optimizer.state.values():
     for s in state.values():
         if isinstance(s, torch.Tensor):
             optimizer_memory += s.numel() * s.element_size()
+            total_optimizer_elements += s.numel()
 
-# Clear gradients for the next section
-optimizer.zero_grad()
-
-optimizer_memory = 0
-for state in optimizer.state.values():
-    for s in state.values():
-        if isinstance(s, torch.Tensor):
-            optimizer_memory += s.numel() * s.element_size()
+bits_per_optim_state = (optimizer_memory * 8) / total_optimizer_elements if total_optimizer_elements > 0 else 0
 
 print(f"Optimizer States Memory  : {bytes_to_mb(optimizer_memory)}")
+print(f"Bits per Optimizer State: {bits_per_optim_state:.2f} bits")
 print("-" * 35)
+
 total_training_memory = param_memory + gradient_memory + optimizer_memory
 print(f"Total Static Memory      : {bytes_to_mb(total_training_memory)}")
 print("-" * 35)
+
+# Calculate combined average bits per value for parameters, gradients, and optimizer states
+total_elements_all = total_params + total_grad_elements + total_optimizer_elements
+total_bits_all = (param_memory + gradient_memory + optimizer_memory) * 8
+average_bits_all = total_bits_all / total_elements_all if total_elements_all > 0 else 0
+
+print(f"Average Bits per Value (Parameters + Gradients + Optimizer States): {average_bits_all:.2f} bits")
+print("-" * 35)
+
 
 # 4. --- Measure Activation Memory (Inference) ---
 print(f"\n--- Dynamic Memory Analysis (Inference) ---")
@@ -140,10 +151,10 @@ else:
 print("\nNote: Activation memory is the 'working memory' needed for a forward pass.")
 print("-" * 35)
 print(f"Total inference memory is (Parameters + Activations): {bytes_to_mb(param_memory + activation_memory + gradient_memory + optimizer_memory)}")
-print("-" * 35)
+print("-" * 35) # Adjusted to only include parameters and activations for inference
 
 # 5. --- Measure Gradient Memory (Backward Pass) ---
+# The gradient memory is already measured above in section 2, but these counts are useful.
 print("="*45)
 print(f"Null gradient count: {grad_null_count}")
 print(f"Gradient not required count: {grad_not_required_count}")
- 
