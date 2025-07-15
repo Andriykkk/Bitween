@@ -8,6 +8,7 @@ from transformers import AutoTokenizer
 from torch.utils.data import DataLoader
 from model import GPT, GPTConfig
 import matplotlib.pyplot as plt
+from quantisation.q16bit_partial import convert_to_partial_16bit
 
 # --- Configuration ---
 config = GPTConfig(
@@ -28,11 +29,13 @@ min_lr = 1e-5
 warmup_steps = 200
 max_steps = 20000 # Total training steps
 
+QUANTIZATION_MODE = 'bf16_partial'
+
 gradient_accumulation_steps = 2 # Number of steps to accumulate gradients for
 eval_interval = 100
 log_interval = 10
 val_steps = 50
-save_interval = 1000
+save_interval = 5000
 tokenized_dataset_path = "tokenized_wikitext"
 
 # --- Logging ---
@@ -49,7 +52,7 @@ else:
     dataset = load_dataset('wikitext', 'wikitext-103-v1')
 
     def tokenize_function(examples):
-        return tokenizer(examples['text'], truncation=True, max_length=config.block_size)
+        return tokenizer(examples['text'])
 
     tokenized_datasets = dataset.map(tokenize_function, batched=True, num_proc=4, remove_columns=["text"])
 
@@ -85,10 +88,14 @@ val_dataloader = DataLoader(val_dataset, batch_size=batch_size)
 steps_per_epoch = math.ceil(len(train_dataset) / (batch_size * gradient_accumulation_steps))
 logging.info(f"Steps per epoch: {steps_per_epoch}")
 
-
 # --- Model and Optimizer ---
 model = GPT(config).to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=max_lr)
+
+if QUANTIZATION_MODE == 'bf16_partial':
+    model = convert_to_partial_16bit(model, verbose=False)
+
+use_amp = any(p.dtype in [torch.bfloat16, torch.float16] for p in model.parameters())
 
 # --- LR Scheduler ---
 def get_lr(step):
@@ -139,7 +146,8 @@ for step in range(max_steps):
         input_ids = batch['input_ids'].to(device)
         labels = batch['labels'].to(device)
 
-        logits, loss = model(input_ids, labels)
+        with torch.amp.autocast(device_type=device, dtype=torch.bfloat16, enabled=use_amp):
+            logits, loss = model(input_ids, labels)
         loss = loss / gradient_accumulation_steps
         loss.backward()
 
@@ -164,7 +172,8 @@ for step in range(max_steps):
                 
                 input_ids = val_batch['input_ids'].to(device)
                 labels = val_batch['labels'].to(device)
-                _, v_loss = model(input_ids, labels)
+                with torch.amp.autocast(device_type=device, dtype=torch.bfloat16, enabled=use_amp):
+                    _, v_loss = model(input_ids, labels)
                 current_val_loss += v_loss.item()
 
         avg_val_loss = current_val_loss / val_steps
