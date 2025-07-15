@@ -31,7 +31,8 @@ model = load_model_for_analysis(
     model_config=config,
     model_path=model_path,
     quantization_type=QUANTIZATION_MODE,
-    device=device
+    device=device,
+    print_summary=False
 )
 
 # 1. --- Measure Parameter Memory ---

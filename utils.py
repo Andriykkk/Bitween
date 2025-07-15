@@ -3,7 +3,7 @@ import os
 from model import GPT, GPTConfig
 from quantisation.q16bit_partial import convert_to_partial_16bit
 
-def load_model_for_analysis(model_config, model_path, quantization_type='none', device='cpu'):
+def load_model_for_analysis(model_config, model_path, quantization_type='none', device='cpu', print_summary=True):
     """
     Loads a GPT model for analysis, with optional quantization.
 
@@ -29,11 +29,11 @@ def load_model_for_analysis(model_config, model_path, quantization_type='none', 
         print(f"Warning: Model checkpoint not found at '{model_path}'. Using random weights.")
 
     if quantization_type == 'bf16_partial':
-        model = convert_to_partial_16bit(model, verbose=True)
+        model = convert_to_partial_16bit(model, verbose=print_summary)
     elif quantization_type != 'none':
         print(f"Warning: Unknown quantization type '{quantization_type}'. No quantization applied.")
     else:
-        print("Model loaded with default (Float32) precision.")
+        print("Model loaded with default precision.")
 
     print("-" * 25)
     return model

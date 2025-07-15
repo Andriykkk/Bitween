@@ -42,6 +42,8 @@ model = load_model_for_analysis(
     device=device
 )
 
+use_amp = any(p.dtype in [torch.bfloat16, torch.float16] for p in model.parameters())
+
 def profile_pass(mode, context_size, num_tokens):
     """Profiles a forward or forward+backward pass."""
     if mode not in ['inference', 'training']:
@@ -66,10 +68,12 @@ def profile_pass(mode, context_size, num_tokens):
         if mode == 'inference':
             with torch.no_grad():
                 for _ in range(num_tokens):
-                    _ = model(input_ids) # Forward pass
+                    with torch.amp.autocast(enabled=use_amp, device_type=device):
+                        _ = model(input_ids) # Forward pass
         else: # training
             for _ in range(num_tokens):
-                logits, loss = model(input_ids, targets=input_ids)
+                with torch.amp.autocast(enabled=use_amp, device_type=device):
+                    logits, loss = model(input_ids, targets=input_ids)
                 loss.backward() # Backward pass
                 # No optimizer step to isolate pass speed
 
