@@ -21,8 +21,12 @@ config = GPTConfig(
 # --- Hyperparameters ---
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 batch_size = 16 
-learning_rate = 1e-4
-max_steps = 20000
+# LR Scheduler Settings
+max_lr = 1e-4
+min_lr = 1e-5
+warmup_steps = 200
+max_steps = 20000 # Total training steps
+
 gradient_accumulation_steps = 2 # Number of steps to accumulate gradients for
 eval_interval = 100
 log_interval = 10
@@ -81,14 +85,29 @@ steps_per_epoch = math.ceil(len(train_dataset) / (batch_size * gradient_accumula
 logging.info(f"Steps per epoch: {steps_per_epoch}")
 
 
-# --- Model, Optimizer, and Loss ---
+# --- Model and Optimizer ---
 model = GPT(config).to(device)
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+optimizer = torch.optim.AdamW(model.parameters(), lr=max_lr)
+
+# --- LR Scheduler ---
+def get_lr(step):
+    # 1) linear warmup for warmup_steps
+    if step < warmup_steps:
+        return max_lr * (step + 1) / warmup_steps
+    # 2) if step > max_steps, return min learning rate
+    if step > max_steps:
+        return min_lr
+    # 3) in between, use cosine decay
+    decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (max_lr - min_lr)
 
 # --- Training Loop ---
 train_losses = []
 val_losses = []
 val_loss_steps = []
+learning_rates = []
 
 train_iter = iter(train_dataloader)
 val_iter = iter(val_dataloader)
@@ -98,6 +117,13 @@ model.train()
 optimizer.zero_grad()
 
 for step in range(max_steps):
+    # Set learning rate
+    lr = get_lr(step)
+    learning_rates.append(lr)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
+    # Gradient accumulation loop
     for _ in range(gradient_accumulation_steps):
         try:
             batch = next(train_iter)
@@ -117,8 +143,8 @@ for step in range(max_steps):
 
     train_losses.append(loss.item() * gradient_accumulation_steps)
 
-    if step > 0 and step % log_interval == 10:
-        logging.info(f"Step {step}, Train Loss: {train_losses[-1]:.4f}")
+    if step > 0 and step % log_interval == 0:
+        logging.info(f"Step {step}, Train Loss: {train_losses[-1]:.4f}, LR: {lr:.6f}")
     
     if step > 0 and step % eval_interval == 0:
         model.eval()
@@ -149,7 +175,9 @@ torch.save(model.state_dict(), 'model_final.pt')
 logging.info("Training finished.")
 
 # --- Plotting ---
-plt.figure(figsize=(12, 6))
+# Loss Plot
+plt.figure(figsize=(12, 5))
+plt.subplot(1, 2, 1)
 plt.plot(train_losses, label='Training Loss', alpha=0.7)
 plt.plot(val_loss_steps, val_losses, label='Validation Loss', marker='o')
 plt.xlabel('Steps')
@@ -157,5 +185,15 @@ plt.ylabel('Loss')
 plt.legend()
 plt.title('Training and Validation Loss')
 plt.grid(True)
-plt.savefig('loss_plot.png')
-logging.info("Saved loss plot to loss_plot.png")
+
+# Learning Rate Plot
+plt.subplot(1, 2, 2)
+plt.plot(learning_rates)
+plt.xlabel('Steps')
+plt.ylabel('Learning Rate')
+plt.title('Learning Rate Schedule')
+plt.grid(True)
+
+plt.tight_layout()
+plt.savefig('training_plots.png')
+logging.info("Saved training plots to training_plots.png")

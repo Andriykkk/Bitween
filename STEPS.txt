@@ -1,0 +1,5 @@
+1. check memory for model with different context size. /tests
+2. check time for model with  different context size and embedding size. /tests
+3. train models and check how fast they train /main
+4. try to quantise 16bit model and check how much faster model become and how much less memory it use and evaluate if it drop a lot or no. /tests evaluation
+5. check hugginface model with 0.5b for memory and size and try to quantise it and check how much faster model become and how much less memory it use and evaluate if it drop a lot or no, before train it on dataset. /tests main evaluation
