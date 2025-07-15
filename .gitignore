@@ -1,0 +1,18 @@
+# Python virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Dataset cache
+tokenized_wikitext/
+
+# IDE and editor directories
+.vscode/
+.idea/
+
+# Saved models
+*.pt
