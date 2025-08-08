@@ -52,7 +52,9 @@ print(f"Model Parameters Memory: {bytes_to_mb(param_memory)}")
 
 # --- Initialize Gradients and Optimizer States for Analysis ---
 print("\n--- Initializing States for Analysis ---")
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+# optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+import bitsandbytes as bnb
+optimizer = bnb.optim.Adam8bit(model.parameters(), lr=1e-4)
 dummy_input = torch.randint(0, config.vocab_size, (1, config.block_size), device=device)
 
 # Determine if we need to use autocast for mixed precision
@@ -91,12 +93,15 @@ print(f"Bits per Gradient      : {bits_per_grad:.2f} bits")
 # 3. --- Measure Optimizer State Memory ---
 optimizer_memory = 0
 total_optimizer_elements = 0
+
+total_optimised = 0
+total_unoptimised = 0
 for state in optimizer.state.values():
     for s in state.values():
         if isinstance(s, torch.Tensor):
-            optimizer_memory += s.numel() * s.element_size()
+            optimizer_memory += s.numel() * s.element_size() 
             total_optimizer_elements += s.numel()
-
+            
 bits_per_optim_state = (optimizer_memory * 8) / total_optimizer_elements if total_optimizer_elements > 0 else 0
 
 print(f"Optimizer States Memory  : {bytes_to_mb(optimizer_memory)}")
