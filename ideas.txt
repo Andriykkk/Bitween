@@ -1,0 +1,87 @@
+[ ] add outliers to separate matrix
+[ ] 
+[ ] add quantisation to 1 bit and perform with two 1 bit linear layers addition using bits functions(look at the pytorch graph for this)
+
+Key Files and Their Roles
+
+  The core logic of auto-round is primarily located in these files within the auto_round/ directory:
+
+   1. `autoround.py`: This is the main entry point and orchestrator.
+       * `AutoRound` class: This is the master class. It takes the model, tokenizer, and all quantization configurations as input. It manages the entire workflow, from data calibration to applying the quantization
+         and saving the final model.
+       * `quantize()` method: The main method that initiates the process. It decides whether to use the fast Round-To-Nearest (RTN) method or the more advanced iterative optimization based on the iters parameter.
+       * `quantize_rtn()` method: Implements the logic for the simple, non-iterative RTN quantization.
+       * `quantize_blocks()` / `quant_layers()` methods: Handle the iterative, sign-gradient-based optimization process block by block or layer by layer.
+
+   2. `wrapper.py`: This file contains the logic for temporarily modifying the model's layers for the optimization process.
+       * `WrapperLinear` class: This is a crucial component. It wraps a standard nn.Linear layer. Its purpose is to introduce learnable "rounding parameters" (alpha) and to calculate the quantization error (the
+         difference between the full-precision output and the quantized output), which serves as the loss for the optimization.
+       * `unwrapper_layer()` function: After optimization, this function takes the wrapped layer, applies the final learned rounding values to the original weights, and returns a standard, but now quantized, linear
+         layer.
+
+   3. `sign_sgd.py`: This file contains the custom optimizer.
+       * `SignSGD` class: A custom PyTorch optimizer. Instead of using the gradient's magnitude, it only uses its sign. This means it updates the learnable rounding parameters by a small, fixed amount in either the
+         positive or negative direction, which is key to its effectiveness in this specific optimization problem.
+
+   4. `data_type/` directory: This directory holds the low-level quantization functions.
+       * Files like int.py contain the actual mathematical operations for quantizing a tensor from floating-point to a lower-bit integer format and de-quantizing it back. These are the functions that WrapperLinear
+         calls internally during the forward pass.
+
+   5. `export/` directory: This handles saving the final quantized model.
+       * It contains the logic to convert the quantized model into different popular formats like auto_gptq, auto_awq, or gguf.
+
+  The Quantization Process Flow
+
+  Here is a step-by-step walkthrough of how auto-round performs its advanced quantization (iters > 0):
+
+   1. Initialization: An AutoRound object is created with the model and configuration. It identifies all the nn.Linear layers to be quantized.
+
+   2. Calibration Data Caching: The quantize() method first runs a calibration dataset through the model to capture and cache the inputs for each linear layer. This is vital because the optimization process needs
+      realistic inputs to accurately measure and minimize the quantization error. This happens in the cache_inter_data() method.
+
+   3. Layer Wrapping: The quantize_blocks() method iterates through the model's layers. Each nn.Linear layer is replaced by a WrapperLinear instance. This wrapper keeps the original weight but also initializes the
+      learnable rounding parameters.
+
+   4. Iterative Optimization Loop: For each layer, the following loop is executed for iters steps:
+      a.  Forward Pass: A batch of the cached calibration data is passed through the wrapped layer. Inside the WrapperLinear.forward() method, it calculates two things:
+          i.  The output of the original, full-precision layer.
+          ii. The output of the quantized layer (where the weights are quantized on-the-fly using the current rounding parameters).
+      b.  Loss Calculation: The difference (MSE) between these two outputs is calculated. This is the quantization error, which acts as the loss.
+      c.  Backward Pass: loss.backward() is called to compute the gradients of the loss with respect to the learnable rounding parameters.
+      d.  Optimizer Step: The SignSGD optimizer is called. It updates the rounding parameters based on the sign of their gradients.
+
+   5. Unwrapping and Replacement: After the optimization loop for a layer is complete, the unwrapper_layer() function is called. It takes the final, optimized rounding parameters, adds them to the original weights,
+      performs the final quantization, and packs the quantized weights, scales, and zero-points into a standard nn.Linear layer's attributes. This new, quantized layer then replaces the wrapper in the model.
+
+   6. Export: Once all layers are processed, the final model, now containing the quantized weights, is saved using the logic from the export/ directory.
+
+  By following this structure—separating the main orchestrator (AutoRound), the dynamic layer modification (WrapperLinear), the core optimization (SignSGD), and the low-level math (data_type/)—you can build a
+  powerful and extensible quantization library.
+
+
+# perplexity
+
+Part 1: When and Why auto-round Uses a Calibration Dataset
+
+  auto-round uses the calibration dataset only when performing its advanced, sign-gradient-descent-based optimization (i.e., when `iters > 0`).
+
+  It does not use a calibration dataset for the simple Round-To-Nearest (RTN) method (iters = 0), because RTN is a static, mathematical operation that doesn't require observing data.
+
+  Why it's needed for the advanced method:
+
+  The goal of the advanced method is to find the best possible way to round the weights to minimize the error introduced by quantization. This error is the difference between the layer's output with full-precision
+  weights and its output with quantized weights.
+
+  To measure this error accurately, you need to see how the layer behaves with realistic inputs.
+
+   1. To Generate Realistic Inputs: The calibration dataset (e.g., NeelNanda/pile-10k) is a collection of text samples. auto-round runs these samples through the model to capture the actual activation values that flow
+      into each layer. These captured activations are the "realistic inputs."
+
+   2. To Calculate Accurate Quantization Error (Loss): During the iterative optimization of a layer, these cached inputs are fed through the wrapped layer. This allows auto-round to calculate a meaningful loss (the
+      quantization error) that reflects how the layer will actually perform.
+
+   3. To Guide the Optimization: An accurate loss is essential for the SignSGD optimizer to effectively update the learnable rounding parameters. By minimizing the error on realistic data, the final quantized model is
+      much more likely to retain its original accuracy.
+
+  Think of it like tuning a high-performance car engine. You don't tune it in a vacuum; you put it on a dynamometer to simulate real-world load and conditions. The calibration dataset is the dynamometer for the
+  quantization process.
