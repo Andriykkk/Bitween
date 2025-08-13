@@ -1,56 +1,59 @@
 import torch
 
-def quantize_rtn(weight, bits=4, group_size=-1):
+def _quantize_8bit(tensor, scale, maxq):
+    """Quantizes a tensor to 8-bit."""
+    q_tensor = (tensor / scale).round().clamp(-maxq, maxq)
+    q_tensor = (q_tensor + maxq).to(torch.uint8)
+    return q_tensor
+
+def _quantize_4bit(tensor, scale, maxq):
+    """Quantizes a tensor to 4-bit and packs two values into a uint8."""
+    q_tensor = (tensor / scale).round().clamp(-maxq, maxq)
+    q_tensor = (q_tensor + maxq).to(torch.uint8)
+    
+    # Pack two 4-bit values into one uint8 byte
+    # The first value is stored in the lower 4 bits, the second in the higher 4 bits.
+    packed_tensor = q_tensor[:, :, ::2] | (q_tensor[:, :, 1::2] << 4)
+    return packed_tensor
+
+def quantize_rtn(tensor, bits=8, group_size=-1, eps=1e-5):
     """
-    Performs Round-To-Nearest (RTN) quantization on a weight tensor.
-
-    Args:
-        weight (torch.Tensor): The input weight tensor.
-        bits (int): The number of bits for quantization (e.g., 4).
-        group_size (int): The size of groups for quantization. 
-                          -1 means per-channel quantization.
-                          >0 means group-wise quantization.
-
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: A tuple containing the
-        quantized weights (q_weight), scales, and zero points.
+    Symmetric quantization with optional group-wise support.
+    Dispatches to the correct quantization function based on bit width.
     """
-    assert bits <= 8, "Only quantization to 8 bits or less is supported"
-    
-    # --- Determine quantization range ---
-    q_min = 0
-    q_max = 2**bits - 1
+    assert bits in [4, 8], "Only 4-bit and 8-bit quantization are supported."
+    if bits == 4 and tensor.shape[-1] % 2 != 0:
+        raise ValueError("For 4-bit quantization, the last dimension must be even.")
 
-    # --- Reshape for group-wise or per-channel quantization ---
-    orig_shape = weight.shape
-    if group_size > 0:
-        weight = weight.reshape(-1, group_size)
-    else: # Per-channel
-        weight = weight.reshape(weight.shape[0], -1)
+    maxq = 2 ** (bits - 1) - 1
 
-    # --- Calculate scale and zero point ---
-    # The scale is the range of the float values divided by the range of the integer values
-    w_max = torch.max(weight, dim=-1, keepdim=True)[0]
-    w_min = torch.min(weight, dim=-1, keepdim=True)[0]
-    
-    # To prevent division by zero
-    scale = (w_max - w_min).clamp(min=1e-6) / (q_max - q_min)
-    
-    # The zero point is the float value that maps to the integer 0
-    zero_point = torch.round(w_min / scale)
+    # --- Reshape for group-wise quantization ---
+    shape = tensor.shape
+    if group_size != -1:
+        if shape[-1] % group_size != 0:
+            raise ValueError("The last dimension must be divisible by group_size.")
+        t_view = tensor.view(shape[0], -1, group_size)
+    else:
+        # Treat the entire row as a single group
+        t_view = tensor.view(shape[0], 1, shape[-1])
 
-    # --- Quantize the weights ---
-    # 1. Rescale the weights to the integer range
-    # 2. Add the zero point
-    # 3. Round to the nearest integer
-    # 4. Clamp to the quantization range
-    q_weight = torch.round(weight / scale) + zero_point
-    q_weight = torch.clamp(q_weight, q_min, q_max).to(torch.uint8)
+    # --- Compute scale ---
+    max_val = t_view.abs().max(dim=2, keepdim=True)[0]
+    scale = (max_val / maxq).clamp(min=eps)
 
-    # --- Reshape back to original ---
-    if group_size > 0:
-        q_weight = q_weight.reshape(orig_shape)
-        scale = scale.reshape(orig_shape[0], -1)
-        zero_point = zero_point.reshape(orig_shape[0], -1)
+    # --- Dispatch to the correct quantization function ---
+    if bits == 8:
+        q_view = _quantize_8bit(t_view, scale, maxq)
+        q_tensor = q_view.view(*shape)
+    else: # bits == 4
+        q_view = _quantize_4bit(t_view, scale, maxq)
+        q_tensor = q_view.view(shape[0], -1)
+
+    zero_point = torch.full_like(scale, maxq)
     
-    return q_weight, scale, zero_point
+    # Adjust shape for per-row case
+    if group_size == -1:
+        scale = scale.squeeze(1)
+        zero_point = zero_point.squeeze(1)
+
+    return q_tensor, scale, zero_point, group_size

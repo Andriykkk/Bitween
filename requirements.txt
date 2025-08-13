@@ -1,3 +1,9 @@
+
 torch
 transformers
+bitsandbytes
+matplotlib
+scipy
 accelerate
+peft
+datasets

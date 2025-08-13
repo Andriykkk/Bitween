@@ -1,6 +1,6 @@
 [ ] add outliers to separate matrix
 [ ] 
-[ ] add quantisation to 1 bit and perform with two 1 bit linear layers addition using bits functions(look at the pytorch graph for this)
+[ ] add quantisation to 1 bit and perform with two 1 bit linear layers addition using bits functions instead of transforming back to 16bit(look at the pytorch graph for this)
 
 Key Files and Their Roles
 

@@ -16,3 +16,7 @@ tokenized_wikitext/
 
 # Saved models
 *.pt
+
+/temp_models
+/singlora_test_output
+/lora_test_output

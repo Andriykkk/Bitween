@@ -5,65 +5,91 @@ from .functional import quantize_rtn
 
 class QuantizedLinear(nn.Module):
     """
-    A quantized linear layer module.
-    
-    This layer stores weights in a quantized format and de-quantizes them
-    on-the-fly during the forward pass.
+    A quantized linear layer module that supports both 4-bit and 8-bit weights.
     """
-    def __init__(self, in_features, out_features, bias=True):
+    def __init__(self, in_features, out_features, bits=8, group_size=-1, bias=True):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
+        self.bits = bits
+        self.group_size = group_size
         
-        # Register buffers for quantized weights, scales, and zero points
-        self.register_buffer('qweight', torch.zeros((out_features, in_features), dtype=torch.uint8))
-        self.register_buffer('scale', torch.zeros((out_features, 1)))
-        self.register_buffer('zero_point', torch.zeros((out_features, 1)))
+        # Determine the shape of the quantized weight tensor
+        q_in_features = in_features if bits == 8 else in_features // 2
+        self.register_buffer('qweight', torch.zeros((out_features, q_in_features), dtype=torch.uint8))
+
+        # Determine the shape of the scale and zero_point buffers
+        if group_size == -1:
+            scale_zp_shape = (out_features, 1)
+        else:
+            num_groups = in_features // group_size
+            scale_zp_shape = (out_features, num_groups, 1)
+            
+        self.register_buffer('scale', torch.zeros(scale_zp_shape))
+        self.register_buffer('zero_point', torch.zeros(scale_zp_shape))
         
         if bias:
             self.register_buffer('bias', torch.zeros(out_features))
         else:
             self.bias = None
 
-    def forward(self, x):
-        # --- De-quantize the weights ---
-        # 1. Convert qweight to the same dtype as scale
-        # 2. Subtract the zero point
-        # 3. Multiply by the scale
-        dequantized_weight = (self.qweight.to(self.scale.dtype) - self.zero_point) * self.scale
+    def _dequantize_8bit(self):
+        """Dequantizes 8-bit weights."""
+        if self.group_size == -1:
+            # Per-row dequantization
+            w = (self.qweight.float() - self.zero_point) * self.scale
+        else:
+            # Group-wise dequantization
+            q_w_view = self.qweight.view(self.out_features, -1, self.group_size).float()
+            w = (q_w_view - self.zero_point) * self.scale
+            w = w.view(self.out_features, self.in_features)
+        return w
+
+    def _dequantize_4bit(self):
+        """Dequantizes 4-bit weights by unpacking them first."""
+        # Unpack two 4-bit values from each uint8 byte
+        low_bits = self.qweight & 0x0F
+        high_bits = (self.qweight & 0xF0) >> 4
         
-        # --- Perform the linear operation ---
-        return F.linear(x, dequantized_weight, self.bias)
+        # Interleave the unpacked values to restore original order
+        unpacked_qweight = torch.stack((low_bits, high_bits), dim=-1).view(self.out_features, -1)
+
+        if self.group_size == -1:
+            # Per-row dequantization
+            w = (unpacked_qweight.float() - self.zero_point) * self.scale
+        else:
+            # Group-wise dequantization
+            q_w_view = unpacked_qweight.view(self.out_features, -1, self.group_size).float()
+            w = (q_w_view - self.zero_point) * self.scale
+            w = w.view(self.out_features, self.in_features)
+        return w
+
+    def dequantize(self):
+        """Dispatches to the correct dequantization function based on bit width."""
+        if self.bits == 8:
+            return self._dequantize_8bit()
+        elif self.bits == 4:
+            return self._dequantize_4bit()
+        else:
+            raise NotImplementedError(f"Dequantization for {self.bits}-bit is not supported.")
+
+    def forward(self, x):
+        w = self.dequantize()
+        return F.linear(x, w, self.bias)
 
     @classmethod
-    def from_float(cls, float_module, bits=4, group_size=-1):
-        """
-        Creates a QuantizedLinear layer from a standard nn.Linear layer.
+    def from_float(cls, float_layer: nn.Linear, bits=8, group_size=-1):
+        q_weight, scale, zp, group_size_ret = quantize_rtn(float_layer.weight.data, bits=bits, group_size=group_size)
         
-        Args:
-            float_module (nn.Linear): The original, full-precision linear layer.
-            bits (int): The number of bits for quantization.
-            group_size (int): The group size for quantization.
-            
-        Returns:
-            QuantizedLinear: The new quantized linear layer.
-        """
-        # 1. Create a new instance of our quantized layer
-        q_module = cls(float_module.in_features, float_module.out_features, float_module.bias is not None)
-        
-        # 2. Quantize the weights from the float module
-        q_weight, scale, zero_point = quantize_rtn(
-            float_module.weight.data, bits=bits, group_size=group_size
-        )
-        
-        # 3. Assign the quantized data to the new module's buffers
-        q_module.qweight.data.copy_(q_weight)
-        q_module.scale.data.copy_(scale)
-        q_module.zero_point.data.copy_(zero_point)
-        if float_module.bias is not None:
-            q_module.bias.data.copy_(float_module.bias.data)
-            
-        return q_module
+        q_layer = cls(float_layer.in_features, float_layer.out_features, bits, group_size_ret, bias=float_layer.bias is not None)
+
+        q_layer.qweight.copy_(q_weight)
+        q_layer.scale.copy_(scale)
+        q_layer.zero_point.copy_(zp)
+        if float_layer.bias is not None:
+            q_layer.bias.data.copy_(float_layer.bias.data)
+
+        return q_layer
 
     def __repr__(self):
         return (f"QuantizedLinear(in_features={self.in_features}, out_features={self.out_features}, "
