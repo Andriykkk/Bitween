@@ -5,11 +5,12 @@ import gc
 import copy
 from transformers import AutoModelForCausalLM
 from bitween.utils.singlora import apply_singlora_to_model
+from bitween.modules import QuantizedLinear
 
 
 def find_all_linear_names(model):
     """Finds all linear layer names to be targeted by LoRA."""
-    linear_module_names = {name for name, module in model.named_modules() if isinstance(module, nn.Linear)}
+    linear_module_names = {name for name, module in model.named_modules() if isinstance(module, nn.Linear) or isinstance(module, QuantizedLinear)}
     linear_module_names.discard("lm_head")
     return list(linear_module_names)
 
@@ -119,7 +120,6 @@ def profile_pass(model, dummy_input, device, is_training=False, warmup_runs=5, t
         torch.cuda.empty_cache()
 
     return throughput
-
 
 def generate_lora_benchmark_report(model_path, dummy_input, device, text=""):
     """Generates an isolated benchmark report for a model with LoRA applied."""

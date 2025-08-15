@@ -106,18 +106,6 @@ def run_singlora_finetune_test():
         device=device
     )
 
-    for step in range(10):  # a few steps just to check gradients flow
-        optimizer.zero_grad()
-        outputs = quantized_model_singlora(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels
-        )
-        loss = outputs.loss
-        print(f"Step {step} - Loss: {loss.item():.4f}")
-        loss.backward()
-        optimizer.step()
-
     # Prepare optimizer
     optimizer = torch.optim.AdamW(
         quantized_model_singlora.parameters(), lr=1e-4
