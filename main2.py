@@ -1,243 +1,208 @@
 import torch
-import logging
-import os
-import math
-import time
-from datasets import load_dataset, load_from_disk
-from transformers import AutoTokenizer
-from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
-from model import GPT, GPTConfig
-import matplotlib.pyplot as plt
-from quantisation.q16bit_partial import convert_to_partial_16bit
+import torch.nn as nn
+import torch.nn.functional as F
+import triton
+import triton.language as tl
 
-# --- Configuration ---
-config = GPTConfig(
-    vocab_size=50257,  # GPT-2 tokenizer's vocab size
-    block_size=256,
-    n_embd=384,
-    n_head=6,
-    n_layer=6,
-    dropout=0.1
-)
+# Set up the device
+device = 'cuda'
+torch.cuda.manual_seed(123)
 
-# --- Hyperparameters ---
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-batch_size = 8 
-# LR Scheduler Settings
-max_lr = 1e-4
-min_lr = 1e-5
-warmup_steps = 200
-max_steps = 20000 # Total training steps
+# --- Provided quantization and dequantization functions ---
+# Note: These are taken from your provided code to prepare the weights.
+def _quantize_8bit(tensor, scale, maxq):
+    q_tensor = (tensor / scale).round().clamp(-maxq, maxq)
+    q_tensor = (q_tensor + maxq).to(torch.uint8)
+    return q_tensor
 
-QUANTIZATION_MODE = 'none'
+def _quantize_4bit(tensor, scale, maxq):
+    # This function is not used in the kernel but is kept for completeness.
+    q_tensor = (tensor / scale).round().clamp(-maxq, maxq)
+    q_tensor = (q_tensor + maxq).to(torch.uint8)
+    packed_tensor = q_tensor[:, :, ::2] | (q_tensor[:, :, 1::2] << 4)
+    return packed_tensor
 
-gradient_accumulation_steps = 4 # Number of steps to accumulate gradients for
-eval_interval = 100
-log_interval = 10
-val_steps = 50
-save_interval = 5000
-tokenized_dataset_path = "tokenized_wikitext"
+def quantize_rtn(tensor, bits=8, group_size=-1, eps=1e-5):
+    assert bits in [4, 8], "Only 4-bit and 8-bit quantization are supported."
+    if bits == 4 and tensor.shape[-1] % 2 != 0:
+        raise ValueError("For 4-bit quantization, the last dimension must be even.")
 
-# --- Logging ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    maxq = 2 ** (bits - 1) - 1
+    shape = tensor.shape
+    if group_size != -1:
+        if shape[-1] % group_size != 0:
+            raise ValueError("The last dimension must be divisible by group_size.")
+        t_view = tensor.view(shape[0], -1, group_size)
+    else:
+        t_view = tensor.view(shape[0], 1, shape[-1])
+    max_val = t_view.abs().max(dim=2, keepdim=True)[0]
+    scale = (max_val / maxq).clamp(min=eps)
 
-# --- Dataset and Tokenizer ---
-tokenizer = AutoTokenizer.from_pretrained('gpt2')
+    if bits == 8:
+        q_view = _quantize_8bit(t_view, scale, maxq)
+        q_tensor = q_view.view(*shape)
+    else: # bits == 4
+        q_view = _quantize_4bit(t_view, scale, maxq)
+        q_tensor = q_view.view(shape[0], -1)
 
-if os.path.exists(tokenized_dataset_path):
-    logging.info(f"Loading tokenized dataset from {tokenized_dataset_path}")
-    lm_datasets = load_from_disk(tokenized_dataset_path)
-else:
-    logging.info("Tokenizing and caching dataset...")
-    dataset = load_dataset('wikitext', 'wikitext-103-v1')
+    zero_point = torch.full_like(scale, maxq)
+    if group_size == -1:
+        scale = scale.squeeze(1)
+        zero_point = zero_point.squeeze(1)
 
-    def tokenize_function(examples):
-        return tokenizer(examples['text'])
+    return q_tensor, scale, zero_point, group_size
 
-    tokenized_datasets = dataset.map(tokenize_function, batched=True, num_proc=4, remove_columns=["text"])
 
-    def group_texts(examples):
-        concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
-        total_length = len(concatenated_examples[list(examples.keys())[0]])
-        total_length = (total_length // config.block_size) * config.block_size
-        result = {
-            k: [t[i : i + config.block_size] for i in range(0, total_length, config.block_size)]
-            for k, t in concatenated_examples.items()
-        }
-        result["labels"] = result["input_ids"].copy()
-        return result
-
-    lm_datasets = tokenized_datasets.map(
-        group_texts,
-        batched=True,
-        batch_size=1000,
-        num_proc=4,
-    )
-    lm_datasets.save_to_disk(tokenized_dataset_path)
-
-train_dataset = lm_datasets['train']
-val_dataset = lm_datasets['validation']
-
-train_dataset.set_format(type='torch', columns=['input_ids', 'labels'])
-val_dataset.set_format(type='torch', columns=['input_ids', 'labels'])
-
-train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-val_dataloader = DataLoader(val_dataset, batch_size=batch_size)
-
-# Calculate steps per epoch
-steps_per_epoch = math.ceil(len(train_dataset) / (batch_size * gradient_accumulation_steps))
-logging.info(f"Steps per epoch: {steps_per_epoch}")
-
-import bitsandbytes as bnb
-
-# --- Model and Optimizer ---
-model = GPT(config).to(device)
-# optimizer = torch.optim.AdamW(model.parameters(), lr=max_lr)
-# Use 8-bit Adam from bitsandbytes to save memory
-optimizer = bnb.optim.Adam8bit(model.parameters(), lr=max_lr)
-logging.info("Using 8-bit AdamW optimizer from bitsandbytes.")
-
-# if QUANTIZATION_MODE == 'bf16_partial':
-#     model = convert_to_partial_16bit(model, verbose=False)
-
-# use_amp = any(p.dtype in [torch.bfloat16, torch.float16] for p in model.parameters())
-use_amp = QUANTIZATION_MODE == 'bf16_partial'
-
-# --- LR Scheduler ---
-def get_lr(step):
-    # 1) linear warmup for warmup_steps
-    if step < warmup_steps:
-        return max_lr * (step + 1) / warmup_steps
-    # 2) if step > max_steps, return min learning rate
-    if step > max_steps:
-        return min_lr
-    # 3) in between, use cosine decay
-    decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-    return min_lr + coeff * (max_lr - min_lr)
-
-# --- Training Loop ---
-log_file_path = "training_log.txt"
-log_lines = ["Step\tTrain Loss\tVal Loss\tLearning Rate"]
-train_losses = []
-val_losses = []
-val_loss_steps = []
-learning_rates = []
-val_loss_display = ""
-start_time = time.time()
-
-train_iter = iter(train_dataloader)
-val_iter = iter(val_dataloader)
-
-logging.info("Starting training...")
-model.train()
-optimizer.zero_grad()
-
-scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
-
-for step in range(max_steps):
-    # Set learning rate
-    lr = get_lr(step)
-    learning_rates.append(lr)
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-
-    # Gradient accumulation loop
-    for _ in range(gradient_accumulation_steps):
-        try:
-            batch = next(train_iter)
-        except StopIteration:
-            train_iter = iter(train_dataloader)
-            batch = next(train_iter)
-
-        input_ids = batch['input_ids'].to(device)
-        labels = batch['labels'].to(device)
-
-        with autocast(dtype=torch.bfloat16, enabled=use_amp):
-            logits, loss = model(input_ids, labels)
-
-        loss = loss / gradient_accumulation_steps
-
-        if use_amp:
-            scaler.scale(loss).backward()
-        else:
-            loss.backward()
-
-    optimizer.step()
-    optimizer.zero_grad()
-
-    train_loss = loss.item() * gradient_accumulation_steps
-    train_losses.append(loss.item() * gradient_accumulation_steps)
-    if step > 0 and step % log_interval == 0:
-        logging.info(f"Step {step}, Train Loss: {train_losses[-1]:.4f}, LR: {lr:.6f}")
+# --- Triton kernel for quantized linear forward pass ---
+@triton.jit
+def quantized_linear_kernel(
+    # Pointers to input/output tensors
+    x_ptr, qweight_ptr, scale_ptr, zero_point_ptr, bias_ptr, c_ptr,
+    # Dimensions
+    M, N, K,
+    # Strides
+    stride_xm, stride_xk,
+    stride_qn, stride_qk,
+    stride_sm,
+    stride_zm,
+    stride_bm,
+    stride_cm, stride_cn,
+    # Block sizes
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    # Other configs
+    BIAS_ENABLED: tl.constexpr
+):
+    """
+    Triton kernel for quantized linear forward pass.
+    C = X @ dequantize(Q_W) + B
     
-    if step == 0 or step % eval_interval == 0 or step == max_steps:
-        model.eval()
-        current_val_loss = 0
-        with torch.no_grad():
-            for _ in range(val_steps):
-                try:
-                    val_batch = next(val_iter)
-                except StopIteration:
-                    val_iter = iter(val_dataloader)
-                    val_batch = next(val_iter)
-                
-                input_ids = val_batch['input_ids'].to(device)
-                labels = val_batch['labels'].to(device)
-                with torch.amp.autocast(device_type=device, dtype=torch.bfloat16, enabled=use_amp):
-                    _, v_loss = model(input_ids, labels)
-                current_val_loss += v_loss.item()
+    This kernel dequantizes the weights on the fly during the matmul operation.
+    It supports 8-bit quantization with per-row scaling.
+    """
+    # Get program IDs for the output block
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
 
-        avg_val_loss = current_val_loss / val_steps
-        val_losses.append(avg_val_loss)
-        val_loss_steps.append(step)
-        val_loss_display = f"{avg_val_loss:.4f}"
-        logging.info(f"Step {step}, Val Loss: {val_loss_display}")
-        model.train()
+    # Offsets for the current block of C
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 
-    log_lines.append(f"{step}\t{train_loss:.4f}\t{val_loss_display}\t{lr:.6f}")
-    if step % save_interval == 0 and step > 0:
-        torch.save(model.state_dict(), f'model_step_{step}.pt')
+    # Accumulator for the result of the block, initialized to zero
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
-torch.save(model.state_dict(), 'model_final.pt')
-logging.info("Training finished.")
+    # Loop over the inner K dimension
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        offs_k = k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+        
+        # Load block of input activation X
+        x_ptrs = x_ptr + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
+        x_block = tl.load(x_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] < K)).to(tl.float16)
 
-# print time for training
-end_time = time.time()
-elapsed_time = end_time - start_time
+        # Load block of quantized weight Q_W
+        q_w_ptrs = qweight_ptr + (offs_n[None, :] * stride_qn + offs_k[:, None] * stride_qk)
+        q_w_block = tl.load(q_w_ptrs, mask=(offs_n[None, :] < N) & (offs_k[:, None] < K))
+        
+        # --- FIX: Load scale and zero point as 1D tensors ---
+        # The previous code was incorrectly loading them as 2D tensors.
+        # This caused the dequantized_w_block to become 3D, leading to the dot product error.
+        scale_ptrs = scale_ptr + offs_n * stride_sm
+        scale_block = tl.load(scale_ptrs, mask=(offs_n < N))
+        
+        # Correctly load the zero point from its own tensor
+        zero_point_ptrs = zero_point_ptr + offs_n * stride_zm
+        zero_point_block = tl.load(zero_point_ptrs, mask=(offs_n < N))
 
-formatted_time = time.strftime("%H:%M:%S", time.gmtime(elapsed_time))
+        # Dequantize the weight block on the fly
+        # The `[None, :]` is needed here to correctly broadcast the 1D vectors
+        # (scale_block, zero_point_block) across the K dimension of the weight block.
+        dequantized_w_block = (q_w_block.to(tl.float16) - zero_point_block.to(tl.float16)[None, :]) * scale_block.to(tl.float16)[None, :]
+        
+        # Perform the block-wise matrix multiplication
+        accumulator += tl.dot(x_block, dequantized_w_block)
+    
+    # Load bias if enabled and add it to the accumulator
+    if BIAS_ENABLED:
+        bias_ptrs = bias_ptr + offs_n * stride_bm
+        bias_block = tl.load(bias_ptrs, mask=(offs_n < N), other=0.0)
+        accumulator += bias_block[None, :]
 
-print(f"Total training time: {formatted_time}")
-logging.info(f"Total training time: {formatted_time}")
+    # Store the final result back to global memory
+    c_ptrs = c_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
+    tl.store(c_ptrs, accumulator, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
 
-log_lines.append(f"Total training time: {formatted_time}")
+# --- Wrapper function to launch the kernel ---
+def triton_quantized_linear(x, qweight, scale, zero_point, bias=None):
+    # Ensure all tensors are on the GPU
+    x = x.to(device)
+    qweight = qweight.to(device)
+    scale = scale.to(device)
+    zero_point = zero_point.to(device)
+    if bias is not None:
+        bias = bias.to(device)
 
-with open("training_log.txt", "w") as f:
-    f.write("\n".join(log_lines))
+    # Get dimensions
+    M, K = x.shape
+    N, _ = qweight.shape
 
-# --- Plotting ---
-# Loss Plot
-plt.figure(figsize=(12, 5))
-plt.subplot(1, 2, 1)
-plt.plot(train_losses, label='Training Loss', alpha=0.7)
-plt.plot(val_loss_steps, val_losses, label='Validation Loss', marker='o')
-plt.xlabel('Steps')
-plt.ylabel('Loss')
-plt.legend()
-plt.title('Training and Validation Loss')
-plt.grid(True)
+    # Allocate the output tensor
+    c = torch.empty((M, N), device=device, dtype=torch.float32)
 
-# Learning Rate Plot
-plt.subplot(1, 2, 2)
-plt.plot(learning_rates)
-plt.xlabel('Steps')
-plt.ylabel('Learning Rate')
-plt.title('Learning Rate Schedule')
-plt.grid(True)
+    # Block sizes and grid dimensions
+    BLOCK_SIZE_M = 128
+    BLOCK_SIZE_N = 128
+    BLOCK_SIZE_K = 64
+    grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
 
-plt.tight_layout()
-plt.savefig('training_plots.png')
-logging.info("Saved training plots to training_plots.png")
+    # Launch the kernel
+    quantized_linear_kernel[grid](
+        x, qweight, scale, zero_point, bias, c,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        qweight.stride(0), qweight.stride(1),
+        scale.stride(0),
+        zero_point.stride(0),
+        bias.stride(0) if bias is not None else 0,
+        c.stride(0), c.stride(1),
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        BIAS_ENABLED=(bias is not None)
+    )
+    
+    return c
+
+
+# --- Main execution ---
+if __name__ == '__main__':
+    # Define layer dimensions
+    in_features, out_features = 512, 1024
+    
+    # Instantiate a float linear layer
+    float_layer = nn.Linear(in_features, out_features, bias=True).to(device)
+    
+    # Quantize the weights using the provided function (per-row)
+    qweight, scale, zero_point, _ = quantize_rtn(float_layer.weight.data, bits=8, group_size=-1)
+    
+    # Create a random input tensor
+    x = torch.randn(256, in_features, device=device, dtype=torch.float16)
+
+    # 1. Forward pass using the Triton kernel
+    triton_output = triton_quantized_linear(x, qweight, scale, zero_point, float_layer.bias)
+
+    # 2. Reference forward pass (PyTorch's F.linear)
+    # First, dequantize the weights on the CPU for the reference calculation.
+    # Note that `zero_point` is the value `maxq`, which is a constant for 8-bit symmetric quantization.
+    maxq = 2**(8-1)-1
+    ref_weight = (qweight.float() - maxq) * scale.view(-1, 1)
+    
+    # Then, perform the linear operation using the dequantized weights.
+    # We use half precision for the reference to match the Triton kernel's input.
+    pytorch_output = F.linear(x, ref_weight.half(), float_layer.bias.half())
+    
+    # 3. Verify the results
+    torch.testing.assert_close(triton_output.float(), pytorch_output.float(), rtol=1e-2, atol=1e-2)
+    print("Verification successful: Triton quantized kernel output matches PyTorch's output.")
+    print("max error:", (triton_output.float() - pytorch_output.float()).abs().max())
+    print("max error2:", (triton_output.float() - (float_layer(x.float()).float())).abs().max())

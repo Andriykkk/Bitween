@@ -66,6 +66,11 @@ def calculate_kl_divergence(original_model, quantized_model, tokenizer, dataset_
             logits1 = original_model(input_ids).logits
             logits2 = quantized_model(input_ids).logits
 
+        if logits1.ndim == 2:
+            logits1 = logits1.unsqueeze(1)
+        if logits2.ndim == 2:
+            logits2 = logits2.unsqueeze(1)
+
         min_len = min(logits1.shape[1], logits2.shape[1])
         logits1 = logits1[:, :min_len, :]
         logits2 = logits2[:, :min_len, :]

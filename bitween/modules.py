@@ -1,7 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .functional import quantize_rtn
+from bitween.functional import quantize_rtn
+from .kernels.int import quantized_linear_kernel
+import triton
 
 class QuantizedLinear(nn.Module):
     """
@@ -44,48 +46,69 @@ class QuantizedLinear(nn.Module):
             w = (q_w_view - self.zero_point) * self.scale
             w = w.view(self.out_features, self.in_features)
         return w
-
-    def _dequantize_4bit(self):
-        """Dequantizes 4-bit weights by unpacking them first."""
-        # Unpack two 4-bit values from each uint8 byte
-        low_bits = self.qweight & 0x0F
-        high_bits = (self.qweight & 0xF0) >> 4
-        
-        # Interleave the unpacked values to restore original order
-        unpacked_qweight = torch.stack((low_bits, high_bits), dim=-1).view(self.out_features, -1)
-
-        if self.group_size == -1:
-            # Per-row dequantization
-            w = (unpacked_qweight.float() - self.zero_point) * self.scale
-        else:
-            # Group-wise dequantization
-            q_w_view = unpacked_qweight.view(self.out_features, -1, self.group_size).float()
-            w = (q_w_view - self.zero_point) * self.scale
-            w = w.view(self.out_features, self.in_features)
-        return w
-
+    
     def dequantize(self):
         """Dispatches to the correct dequantization function based on bit width."""
         if self.bits == 8:
             return self._dequantize_8bit()
-        elif self.bits == 4:
-            return self._dequantize_4bit()
         else:
             raise NotImplementedError(f"Dequantization for {self.bits}-bit is not supported.")
 
     def forward(self, x):
-        w = self.dequantize()
-        return F.linear(x, w, self.bias)
+        device = x.device
+
+        original_shape = x.shape
+        x = x.reshape(-1, original_shape[-1])
+
+        M, K = x.shape
+        N, _ = self.qweight.shape
+
+        # Allocate the output tensor
+        c = torch.empty((M, N), device=device, dtype=torch.float32)
+
+        # Block sizes and grid dimensions
+        BLOCK_SIZE_M = 128
+        BLOCK_SIZE_N = 128
+        BLOCK_SIZE_K = 64
+        grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
+
+        # Launch the kernel
+        quantized_linear_kernel[grid](
+            x, self.qweight, self.scale, self.zero_point, self.bias, c,
+            M, N, K,
+            x.stride(0), x.stride(1),
+            self.qweight.stride(0), self.qweight.stride(1),
+            self.scale.stride(0),
+            self.zero_point.stride(0),
+            self.bias.stride(0) if self.bias is not None else 0,
+            c.stride(0), c.stride(1),
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            BIAS_ENABLED=(self.bias is not None)
+        )
+        
+        return c.reshape(*original_shape[:-1], N)
 
     @classmethod
     def from_float(cls, float_layer: nn.Linear, bits=8, group_size=-1):
-        q_weight, scale, zp, group_size_ret = quantize_rtn(float_layer.weight.data, bits=bits, group_size=group_size)
-        
+        qweight, scale, zero_point, _ = quantize_rtn(float_layer.weight.data, bits=8, group_size=-1)
+
+        device = float_layer.weight.device
+
+        qweight = qweight.contiguous()
+        zero_point = zero_point.contiguous()
+        group_size_ret = group_size
+
+        qweight = qweight.to(device)
+        scale = scale.to(device)
+        zero_point = zero_point.to(device)
+
         q_layer = cls(float_layer.in_features, float_layer.out_features, bits, group_size_ret, bias=float_layer.bias is not None)
 
-        q_layer.qweight.copy_(q_weight)
+        q_layer.qweight.copy_(qweight)
         q_layer.scale.copy_(scale)
-        q_layer.zero_point.copy_(zp)
+        q_layer.zero_point.copy_(zero_point)
         if float_layer.bias is not None:
             q_layer.bias.data.copy_(float_layer.bias.data)
 
