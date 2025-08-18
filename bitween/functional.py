@@ -1,43 +1,55 @@
 import torch
 
-def _quantize_8bit(tensor, scale, maxq):
-    q_tensor = (tensor / scale).round().clamp(-maxq, maxq)
-    q_tensor = (q_tensor + maxq).to(torch.uint8)
-    return q_tensor
+@torch.no_grad()
+def quantize_rtn(weight: torch.Tensor, bits: int = 8, group_size: int = 32, print_paddings: bool = False):
+    weight = weight.contiguous()
 
-def _quantize_4bit(tensor, scale, maxq):
-    # This function is not used in the kernel but is kept for completeness.
-    q_tensor = (tensor / scale).round().clamp(-maxq, maxq)
-    q_tensor = (q_tensor + maxq).to(torch.uint8)
-    packed_tensor = q_tensor[:, :, ::2] | (q_tensor[:, :, 1::2] << 4)
-    return packed_tensor
+    assert bits in [2, 4, 8], "Only 2, 4, or 8-bit quantization supported."
+    
+    Qmin = 0
+    Qmax = (1 << bits) - 1
 
-def quantize_rtn(tensor, bits=8, group_size=-1, eps=1e-5):
-    assert bits in [4, 8], "Only 4-bit and 8-bit quantization are supported."
-    if bits == 4 and tensor.shape[-1] % 2 != 0:
-        raise ValueError("For 4-bit quantization, the last dimension must be even.")
+    out_features, in_features = weight.shape
 
-    maxq = 2 ** (bits - 1) - 1
-    shape = tensor.shape
-    if group_size != -1:
-        if shape[-1] % group_size != 0:
-            raise ValueError("The last dimension must be divisible by group_size.")
-        t_view = tensor.view(shape[0], -1, group_size)
-    else:
-        t_view = tensor.view(shape[0], 1, shape[-1])
-    max_val = t_view.abs().max(dim=2, keepdim=True)[0]
-    scale = (max_val / maxq).clamp(min=eps)
+    # Pad in_features to be multiple of group_size if needed
+    pad = (group_size - in_features % group_size) % group_size
+    # if print_paddings:
+    #     print(f"Padding {pad} columns to {in_features} to make it a multiple of {group_size}")
+    # if pad > 0:
+    #     weight = torch.cat([weight, torch.zeros(out_features, pad, device=weight.device, dtype=weight.dtype)], dim=1)
+    #     in_features += pad
+    if pad > 0:
+        raise ValueError(f"Padding {pad} columns to {in_features} to make it a multiple of {group_size}")
 
-    if bits == 8:
-        q_view = _quantize_8bit(t_view, scale, maxq)
-        q_tensor = q_view.view(*shape)
-    else: # bits == 4
-        q_view = _quantize_4bit(t_view, scale, maxq)
-        q_tensor = q_view.view(shape[0], -1)
+    num_groups = in_features // group_size
+    weight = weight.view(out_features, num_groups, group_size)
 
-    zero_point = torch.full_like(scale, maxq)
-    if group_size == -1:
-        scale = scale.squeeze(1)
-        zero_point = zero_point.squeeze(1)
+    w_min = weight.amin(dim=-1, keepdim=True)  # [out_features, num_groups, 1]
+    w_max = weight.amax(dim=-1, keepdim=True)
 
-    return q_tensor, scale, zero_point, group_size
+    scale = ((w_max - w_min) / Qmax).clamp(min=1e-8)  # [out, groups, 1]
+    # Compute zero_point (per group)
+    zero_point = torch.round(Qmin - w_min / scale).clamp(Qmin, Qmax).to(torch.int32)
+
+    # Quantize with RTN
+    q = ((weight - zero_point) / scale)
+    noise = torch.empty_like(q).uniform_(-0.5, 0.5)
+    q = (q + noise).round().clamp(Qmin, Qmax).to(torch.int32)  # still [out, groups, group_size]
+
+    # Pack into int32
+    values_per_int32 = 32 // bits
+    total_vals = out_features * num_groups * group_size
+    total_int32 = total_vals // values_per_int32
+
+    q_flat = q.reshape(-1)
+    q_packed = torch.zeros(total_int32, dtype=torch.int32, device=weight.device)
+
+    for i in range(values_per_int32):
+        q_part = q_flat[i::values_per_int32]
+        q_packed |= (q_part << (i * bits))
+
+    packed_per_row = (num_groups * group_size) // values_per_int32
+    q_packed = q_packed.view(out_features, packed_per_row)
+
+    print(q_packed.shape, scale.squeeze(-1).shape, zero_point.squeeze(-1).shape)
+    return q_packed, scale.squeeze(-1), zero_point.squeeze(-1), group_size

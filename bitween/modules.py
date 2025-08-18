@@ -4,11 +4,13 @@ import torch.nn.functional as F
 from bitween.functional import quantize_rtn
 from .kernels.int import quantized_linear_kernel
 import triton
+import triton.language as tl
+import copy
 
 # Create a custom autograd function for the QuantizedLinear layer
 class QuantizedLinearFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, qweight, scale, zero_point, bias):
+    def forward(ctx, x, qweight, scale, zero_point, bias, bits, group_size):
         # Save tensors for backward pass
         ctx.save_for_backward(x, qweight, scale, zero_point, bias)
 
@@ -21,25 +23,35 @@ class QuantizedLinearFunction(torch.autograd.Function):
         N, _ = qweight.shape
 
         c = torch.empty((M, N), device=device, dtype=torch.float32)
+        # c = torch.empty((M, N), device=device, dtype=torch.int32)
 
         BLOCK_SIZE_M = 128
         BLOCK_SIZE_N = 128
         BLOCK_SIZE_K = 64
         grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
 
+        DTYPE = {
+            torch.float16: tl.float16,
+            torch.bfloat16: tl.bfloat16
+        }
+
         quantized_linear_kernel[grid](
             x_reshaped, qweight, scale, zero_point, bias, c,
             M, N, K,
+            bits,
+            (1 << bits) - 1,
             x_reshaped.stride(0), x_reshaped.stride(1),
             qweight.stride(0), qweight.stride(1),
-            scale.stride(0),
-            zero_point.stride(0),
+            scale.stride(0), scale.stride(1),    
+            zero_point.stride(0), zero_point.stride(1),
             bias.stride(0) if bias is not None else 0,
             c.stride(0), c.stride(1),
             BLOCK_SIZE_M=BLOCK_SIZE_M,
             BLOCK_SIZE_N=BLOCK_SIZE_N,
             BLOCK_SIZE_K=BLOCK_SIZE_K,
-            BIAS_ENABLED=(bias is not None)
+            GROUP_SIZE=group_size,
+            BIAS_ENABLED=(bias is not None),
+            DTYPE=DTYPE[x.dtype]
         )
         
         return c.reshape(*original_shape[:-1], N)
@@ -82,71 +94,66 @@ class QuantizedLinear(nn.Module):
     """
     A quantized linear layer module that supports both 4-bit and 8-bit weights.
     """
-    def __init__(self, in_features, out_features, bits=8, group_size=-1, bias=True):
+    def __init__(self, in_features, out_features, bits=8, group_size=32, bias=True, dtype=torch.bfloat16):
         super().__init__()
+
         self.in_features = in_features
         self.out_features = out_features
         self.bits = bits
         self.group_size = group_size
 
         self.requires_grad = False
+
+        if self.bits not in [2, 4, 8]:
+            raise ValueError("Only 2, 4, or 8 bits are supported.")
+        
+        if group_size < 1:
+            raise ValueError("Group size must be at least 1.")
+
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 and dtype == torch.bfloat16:
+            # Ampere (SM 8.0+) and newer support bfloat16 natively
+            self.dtype = torch.bfloat16
+        else:
+            self.dtype = torch.float16
         
         # Determine the shape of the quantized weight tensor
-        q_in_features = in_features if bits == 8 else in_features // 2
-        self.register_buffer('qweight', torch.zeros((out_features, q_in_features), dtype=torch.uint8))
+        values_per_int32 = 32 // self.bits
+        q_in_features = self.in_features // values_per_int32
+        self.register_buffer('qweight', torch.zeros((self.out_features, q_in_features), dtype=torch.int32))
 
-        # Determine the shape of the scale and zero_point buffers
-        if group_size == -1:
-            scale_zp_shape = (out_features, 1)
-        else:
-            num_groups = in_features // group_size
-            scale_zp_shape = (out_features, num_groups, 1)
+        num_groups = in_features // group_size
+        scale_zp_shape = (out_features, num_groups)
             
-        self.register_buffer('scale', torch.zeros(scale_zp_shape))
-        self.register_buffer('zero_point', torch.zeros(scale_zp_shape))
-        
+        self.register_buffer('scale', torch.zeros(scale_zp_shape, dtype=self.dtype))
+        self.register_buffer('zero_point', torch.zeros(scale_zp_shape, dtype=self.dtype))
+        print(self.qweight.squeeze(-1).shape, self.scale.shape, self.zero_point.squeeze(-1).shape)
         if bias:
-            self.register_buffer('bias', torch.zeros(out_features))
+            self.register_buffer('bias', torch.zeros(out_features, dtype=self.dtype))
         else:
             self.bias = None
-
-    def _dequantize_8bit(self):
-        """Dequantizes 8-bit weights."""
-        if self.group_size == -1:
-            # Per-row dequantization
-            w = (self.qweight.float() - self.zero_point) * self.scale
-        else:
-            # Group-wise dequantization
-            q_w_view = self.qweight.view(self.out_features, -1, self.group_size).float()
-            w = (q_w_view - self.zero_point) * self.scale
-            w = w.view(self.out_features, self.in_features)
-        return w
-    
-    def dequantize(self):
-        """Dispatches to the correct dequantization function based on bit width."""
-        if self.bits == 8:
-            return self._dequantize_8bit()
-        else:
-            raise NotImplementedError(f"Dequantization for {self.bits}-bit is not supported.")
-
+ 
     def forward(self, x):
-        return QuantizedLinearFunction.apply(x, self.qweight, self.scale, self.zero_point, self.bias)
+        if x.dtype != torch.bfloat16 or x.dtype != torch.float16:
+            x = x.to(self.dtype)
+        x = QuantizedLinearFunction.apply(x, self.qweight, self.scale, self.zero_point, self.bias, self.bits, self.group_size)
+        print("###", x)
+        return x
 
     @classmethod
-    def from_float(cls, float_layer: nn.Linear, bits=8, group_size=-1):
-        qweight, scale, zero_point, _ = quantize_rtn(float_layer.weight.data, bits=8, group_size=-1)
+    def from_float(cls, float_layer: nn.Linear, bits=8, group_size=32, print_paddings=False):
+        float_layer = copy.deepcopy(float_layer).to(torch.float32)
+        qweight, scale, zero_point, _ = quantize_rtn(float_layer.weight.data, bits=bits, group_size=group_size, print_paddings=print_paddings)
 
         device = float_layer.weight.device
 
         qweight = qweight.contiguous()
         zero_point = zero_point.contiguous()
-        group_size_ret = group_size
 
         qweight = qweight.to(device)
         scale = scale.to(device)
         zero_point = zero_point.to(device)
 
-        q_layer = cls(float_layer.in_features, float_layer.out_features, bits, group_size_ret, bias=float_layer.bias is not None)
+        q_layer = cls(float_layer.in_features, float_layer.out_features, bits, group_size, bias=float_layer.bias is not None, dtype=torch.bfloat16)
 
         q_layer.qweight.copy_(qweight)
         q_layer.scale.copy_(scale)

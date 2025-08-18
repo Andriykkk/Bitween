@@ -35,7 +35,8 @@ def main():
     # --- 3. Perform quantization and evaluation ---
     quantized_model = quantizer.quantize(
         evaluate_perplexity=False,
-        num_samples=5
+        num_samples=5,
+        print_paddings=True
     )
 
     # --- 4. Save models and run benchmark ---
@@ -65,24 +66,24 @@ def main():
 
 
 if __name__ == "__main__":
-    # # Define layer dimensions and batch size/sequence length
-    # in_features, out_features = 128, 128
-    # batch_size = 32
+    # Define layer dimensions and batch size/sequence length
+    in_features, out_features = 128, 128
+    batch_size = 32
     
-    # # Instantiate a float linear layer and a quantized layer
-    # float_layer = torch.nn.Linear(in_features, out_features, bias=True).cuda().half()
-    # q_layer = QuantizedLinear.from_float(float_layer, group_size=-1, bits=8).cuda()
+    # Instantiate a float linear layer and a quantized layer
+    float_layer = torch.nn.Linear(in_features, out_features, bias=True, dtype=torch.float16).cuda()
+    q_layer = QuantizedLinear.from_float(float_layer, bits=8).cuda()
     
-    # # Create a random input tensor
-    # x = torch.randn(batch_size, in_features, device='cuda', dtype=torch.float16)
+    # Create a random input tensor
+    x = torch.randn(batch_size, in_features, device='cuda', dtype=torch.float16)
 
-    # # Warm-up run to prevent CUDA overhead from affecting measurements
+    # Warm-up run to prevent CUDA overhead from affecting measurements
     # for _ in range(10):
     #     y_ref = float_layer(x)
     #     y_quant = q_layer(x)
         
-    # # --- Performance comparison ---
-    # # PyTorch timing
+    # --- Performance comparison ---
+    # PyTorch timing
     # start_time = time.time()
     # for _ in range(1000):
     #     y_ref = float_layer(x)
@@ -96,16 +97,17 @@ if __name__ == "__main__":
     # torch.cuda.synchronize()
     # quant_time = (time.time() - start_time) / 100
     
-    # # Sanity check
-    # y_ref = float_layer(x)
-    # y_quant = q_layer(x)
+    # Sanity check
+    y_ref = float_layer(x)
+    y_quant = q_layer(x)
 
-    # # Print results
+    # Print results
     # print(f"PyTorch Linear Time: {pytorch_time*1000:.3f} ms")
     # print(f"Quantized Kernel Time: {quant_time*1000:.3f} ms")
-    # print(f"Max Error: {(y_ref - y_quant).abs().max():.4f}")
+    print(f"Max Error: {(y_ref - y_quant).abs().max():.4f}")
+    print(f"Mean Error: {(y_ref - y_quant).abs().mean():.4f}")
     # print(f"Speedup: {pytorch_time / quant_time:.2f}x")
-    main()
+    # main()
     # def test_quantization_error():
     #     # Setup
     #     float_layer = torch.nn.Linear(1024, 512, bias=True).cuda().half()

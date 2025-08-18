@@ -32,13 +32,14 @@ class Bitween:
         self.group_size = group_size
         print(f"Bitween initialized with bits={bits}, group_size={group_size}")
 
-    def quantize(self, evaluate_perplexity=False, num_samples=100, **eval_kwargs):
+    def quantize(self, evaluate_perplexity=False, num_samples=100, print_paddings=False, **eval_kwargs):
         """
         Quantizes the linear layers of the model in-place.
         
         Args:
             evaluate_perplexity (bool): If True, run a full performance evaluation.
             num_samples (int): Number of samples to use for evaluation.
+            print_paddings (bool): If True, print padding to weights.
             **eval_kwargs: Additional arguments for the evaluation functions 
                           (e.g.).
         """
@@ -60,7 +61,7 @@ class Bitween:
                 print(f"  - Quantizing layer: {name}")
                 
                 q_module = QuantizedLinear.from_float(
-                    module, self.bits, self.group_size
+                    module, self.bits, self.group_size, print_paddings
                 )
                 
                 _set_module(quantized_model, name, q_module)
