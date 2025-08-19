@@ -6,6 +6,7 @@ import os
 import triton
 import triton.language as tl
 import time
+from bitween.functional import quantize_rtn, dequantize_rtn
 
 def main():
     """
@@ -67,46 +68,47 @@ def main():
 
 if __name__ == "__main__":
     # Define layer dimensions and batch size/sequence length
-    in_features, out_features = 128, 128
+    in_features, out_features = 1280, 1280
     batch_size = 32
     
     # Instantiate a float linear layer and a quantized layer
-    float_layer = torch.nn.Linear(in_features, out_features, bias=True, dtype=torch.float16).cuda()
+    float_layer = torch.nn.Linear(in_features, out_features, bias=True, dtype=torch.float32).cuda()
     q_layer = QuantizedLinear.from_float(float_layer, bits=8).cuda()
     
     # Create a random input tensor
-    x = torch.randn(batch_size, in_features, device='cuda', dtype=torch.float16)
+    x = torch.randn(batch_size, in_features, device='cuda', dtype=torch.float32)
 
     # Warm-up run to prevent CUDA overhead from affecting measurements
-    # for _ in range(10):
-    #     y_ref = float_layer(x)
-    #     y_quant = q_layer(x)
+    for _ in range(10):
+        y_ref = float_layer(x)
+        y_quant = q_layer(x)
         
     # --- Performance comparison ---
     # PyTorch timing
-    # start_time = time.time()
-    # for _ in range(1000):
-    #     y_ref = float_layer(x)
-    # torch.cuda.synchronize()
-    # pytorch_time = (time.time() - start_time) / 100
+    start_time = time.time()
+    for _ in range(1000):
+        y_ref = float_layer(x)
+    torch.cuda.synchronize()
+    pytorch_time = (time.time() - start_time) / 100
     
-    # # Quantized kernel timing
-    # start_time = time.time()
-    # for _ in range(1000):
-    #     y_quant = q_layer(x)
-    # torch.cuda.synchronize()
-    # quant_time = (time.time() - start_time) / 100
+    # Quantized kernel timing
+    start_time = time.time()
+    for _ in range(1000):
+        y_quant = q_layer(x)
+    torch.cuda.synchronize()
+    quant_time = (time.time() - start_time) / 100
     
     # Sanity check
     y_ref = float_layer(x)
     y_quant = q_layer(x)
 
     # Print results
-    # print(f"PyTorch Linear Time: {pytorch_time*1000:.3f} ms")
-    # print(f"Quantized Kernel Time: {quant_time*1000:.3f} ms")
+    print(f"PyTorch Linear Time: {pytorch_time*1000:.3f} ms")
+    print(f"Quantized Kernel Time: {quant_time*1000:.3f} ms")
+
     print(f"Max Error: {(y_ref - y_quant).abs().max():.4f}")
     print(f"Mean Error: {(y_ref - y_quant).abs().mean():.4f}")
-    # print(f"Speedup: {pytorch_time / quant_time:.2f}x")
+    print(f"Speedup: {pytorch_time / quant_time:.2f}x")
     # main()
     # def test_quantization_error():
     #     # Setup

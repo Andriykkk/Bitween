@@ -151,7 +151,7 @@ def quantized_linear_kernel(
 
         # 11. Dequantize
         deq_w_block = (q_vals - zp.to(tl.float32)) * scale
-        deq_w_block = deq_w_block.to(tl.float16)
+        # deq_w_block = deq_w_block.to(tl.float16)
 
         # 12. Matrix multiplication
         acc += tl.dot(x_block, deq_w_block)

@@ -32,7 +32,8 @@ class QuantizedLinearFunction(torch.autograd.Function):
 
         DTYPE = {
             torch.float16: tl.float16,
-            torch.bfloat16: tl.bfloat16
+            torch.bfloat16: tl.bfloat16,
+            torch.float32: tl.float32
         }
 
         quantized_linear_kernel[grid](
@@ -133,16 +134,15 @@ class QuantizedLinear(nn.Module):
             self.bias = None
  
     def forward(self, x):
-        if x.dtype != torch.bfloat16 or x.dtype != torch.float16:
-            x = x.to(self.dtype)
+        # if x.dtype != torch.bfloat16 or x.dtype != torch.float16:
+        #     x = x.to(self.dtype)
         x = QuantizedLinearFunction.apply(x, self.qweight, self.scale, self.zero_point, self.bias, self.bits, self.group_size)
-        print("###", x)
         return x
 
     @classmethod
-    def from_float(cls, float_layer: nn.Linear, bits=8, group_size=32, print_paddings=False):
+    def from_float(cls, float_layer: nn.Linear, bits=8, group_size=32):
         float_layer = copy.deepcopy(float_layer).to(torch.float32)
-        qweight, scale, zero_point, _ = quantize_rtn(float_layer.weight.data, bits=bits, group_size=group_size, print_paddings=print_paddings)
+        qweight, scale, zero_point, _ = quantize_rtn(float_layer.weight.data, bits=bits, group_size=group_size)
 
         device = float_layer.weight.device
 
