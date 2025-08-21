@@ -30,9 +30,12 @@ class Bitween:
         self.tokenizer = tokenizer
         self.bits = bits
         self.group_size = group_size
+
+        assert group_size > 0, "Group size must be greater than 0."
+
         print(f"Bitween initialized with bits={bits}, group_size={group_size}")
 
-    def quantize(self, evaluate_perplexity=False, num_samples=100, print_paddings=False, **eval_kwargs):
+    def quantize(self, evaluate_perplexity=False, num_samples=100, **eval_kwargs):
         """
         Quantizes the linear layers of the model in-place.
         
@@ -61,7 +64,7 @@ class Bitween:
                 print(f"  - Quantizing layer: {name}")
                 
                 q_module = QuantizedLinear.from_float(
-                    module, self.bits, self.group_size, print_paddings
+                    module, self.bits, self.group_size
                 )
                 
                 _set_module(quantized_model, name, q_module)

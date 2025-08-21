@@ -7,7 +7,6 @@ import triton
 import triton.language as tl
 import copy
 
-# Create a custom autograd function for the QuantizedLinear layer
 class QuantizedLinearFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, qweight, scale, zero_point, bias, bits, group_size):
@@ -59,37 +58,39 @@ class QuantizedLinearFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        # This is the STE part!
-        # Instead of calculating gradients through the non-differentiable kernel,
-        # we pretend we just used a normal linear layer and pass gradients back to the inputs.
-        
-        # This is where the magic happens for LoRA.
-        # The gradients will flow from `grad_output` through a 'virtual' full-precision layer
-        # back to the input `x`. This allows the gradients to reach the LoRA adapter layers,
-        # which are then updated correctly.
-        
         x, qweight, scale, zero_point, bias = ctx.saved_tensors
-        
-        # Dequantize the weight to its floating-point equivalent for the backward pass
-        # This is for the `grad_input` calculation
-        
-        # Note: You'll need to update the dequantization to handle 4-bit as well.
-        if qweight.dtype == torch.uint8:
-            qweight_view = qweight.view(qweight.shape[0], -1)
-            weight = (qweight_view.float() - zero_point) * scale
-        else:
-            raise NotImplementedError("Dequantization for backward pass needs to be implemented for this type.")
 
-        grad_input = grad_weight = grad_bias = None
+        # Only compute grad_input (treat qweight as frozen)
+        grad_input = None
 
-        # Calculate gradients for input (x)
+        out_features, packed_cols = qweight.shape
+        values_per_int32 = 32 // ctx.bits
+        group_size = ctx.group_size
+        in_features = (packed_cols * values_per_int32)
+        num_groups = in_features // group_size
+
+        # Unpack and dequantize weights
+        total_vals = out_features * num_groups * group_size
+        q_flat = torch.empty(total_vals, dtype=torch.int32, device=qweight.device)
+
+        for i in range(values_per_int32):
+            shift = i * ctx.bits
+            mask = (1 << ctx.bits) - 1
+            q_vals = (qweight.view(-1) >> shift) & mask
+            q_flat[i::values_per_int32] = q_vals
+
+        q = q_flat.view(out_features, num_groups, group_size)
+        scale = scale.view(out_features, num_groups, 1)
+        zero_point = zero_point.view(out_features, num_groups, 1)
+        weight = scale * (q.float() - zero_point.float())
+        weight = weight.view(out_features, in_features)
+
+        # Gradient for input x
         if ctx.needs_input_grad[0]:
             grad_input = grad_output @ weight
 
-        # Gradients for weight, scale, zero_point, and bias are not needed here,
-        # as they are not trainable in the base model.
-        
-        return grad_input, None, None, None, None
+        # Return None for all other non-differentiable inputs
+        return grad_input, None, None, None, None, None, None
 
 class QuantizedLinear(nn.Module):
     """
