@@ -92,7 +92,7 @@ def run_singlora_finetune_test():
     # --- 6. Test backpropagation on Quantized Model with SingLoRA using a single batch ---
     print("\n--- Testing backpropagation on Quantized model with SingLoRA ---")
 
-    quantizer = Bitween(copy.deepcopy(model), bits=8, group_size=-1)
+    quantizer = Bitween(copy.deepcopy(model), bits=8, group_size=128)
     quantized_model = quantizer.quantize(evaluate_perplexity=False)
 
     quantized_model_singlora = quantized_model.to(device)

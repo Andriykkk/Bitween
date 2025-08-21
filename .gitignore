@@ -20,3 +20,5 @@ tokenized_wikitext/
 /temp_models
 /singlora_test_output
 /lora_test_output
+
+docs.md

@@ -13,6 +13,9 @@ class QuantizedLinearFunction(torch.autograd.Function):
         # Save tensors for backward pass
         ctx.save_for_backward(x, qweight, scale, zero_point, bias)
 
+        ctx.bits = bits
+        ctx.group_size = group_size
+
         # The fast, non-differentiable forward pass using the Triton kernel
         device = x.device
         original_shape = x.shape

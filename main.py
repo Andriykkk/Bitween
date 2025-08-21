@@ -61,7 +61,7 @@ def main():
     # Run the LoRA benchmark report
     from bitween.lora_benchmark import generate_lora_benchmark_report
     dummy_input_dict = {"input_ids": dummy_input}
-    generate_lora_benchmark_report(fp32_path, dummy_input_dict, device, text="FP32")
+    # generate_lora_benchmark_report(fp32_path, dummy_input_dict, device, text="FP32")
     generate_lora_benchmark_report(quantized_path, dummy_input_dict, device, text="Quantized")
 
 
