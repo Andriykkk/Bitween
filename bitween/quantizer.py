@@ -35,14 +35,15 @@ class Bitween:
 
         print(f"Bitween initialized with bits={bits}, group_size={group_size}")
 
-    def quantize(self, evaluate_perplexity=False, num_samples=100, **eval_kwargs):
+    def quantize(self, evaluate_perplexity=False, num_samples=100, rtn=False, trainable=False, **eval_kwargs):
         """
         Quantizes the linear layers of the model in-place.
         
         Args:
             evaluate_perplexity (bool): If True, run a full performance evaluation.
             num_samples (int): Number of samples to use for evaluation.
-            print_paddings (bool): If True, print padding to weights.
+            rtn (bool): If True, return the quantized model with rtn.
+            trainable (bool): If True, use calibration data to perform quantization.
             **eval_kwargs: Additional arguments for the evaluation functions 
                           (e.g.).
         """
@@ -54,20 +55,24 @@ class Bitween:
             original_ppl = calculate_perplexity(self.model, self.tokenizer, num_samples=num_samples, **eval_kwargs)
 
         print("\n--- Starting quantization ---")
-        
-        # Create a deepcopy for quantization to keep the original model intact for KL-divergence
-        quantized_model = copy.deepcopy(self.model)
-        
-        # Find and replace all linear layers
-        for name, module in quantized_model.named_modules():
-            if isinstance(module, nn.Linear):
-                print(f"  - Quantizing layer: {name}")
-                
-                q_module = QuantizedLinear.from_float(
-                    module, self.bits, self.group_size
-                )
-                
-                _set_module(quantized_model, name, q_module)
+
+        if (rtn and not trainable) or (not rtn and not trainable):        
+            # Create a deepcopy for quantization to keep the original model intact for KL-divergence
+            quantized_model = copy.deepcopy(self.model)
+            
+            # Find and replace all linear layers
+            for name, module in quantized_model.named_modules():
+                if isinstance(module, nn.Linear):
+                    print(f"  - Quantizing layer: {name}")
+                    
+                    q_module = QuantizedLinear.from_float(
+                        module, self.bits, self.group_size
+                    )
+                    
+                    _set_module(quantized_model, name, q_module)
+
+        if not rtn and trainable:
+            pass
                 
         print("--- Quantization complete ---")
 
