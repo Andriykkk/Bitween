@@ -31,84 +31,88 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     
     # --- 2. Initialize the quantizer ---
-    quantizer = Bitween(model, tokenizer=tokenizer, bits=8, group_size=128)
+    quantizer = Bitween(model, tokenizer=tokenizer, bits=4, group_size=128)
 
     # --- 3. Perform quantization and evaluation ---
     quantized_model = quantizer.quantize(
-        evaluate_perplexity=False,
+        evaluate_perplexity=True,
+        # calculate_parameters_memory=True,
         num_samples=5,
-        rtn=True
+        # rtn=True,
+        trainable=True,
+        nsamples=256,
+        seqlen=256,
     )
 
     # --- 4. Save models and run benchmark ---
-    print("\n--- Preparing for Benchmark ---")
-    save_dir = "temp_models"
-    os.makedirs(save_dir, exist_ok=True)
-    fp32_path = os.path.join(save_dir, "opt125m_fp32.pth")
-    quantized_path = os.path.join(save_dir, "opt125m_quantized.pth")
+    # print("\n--- Preparing for Benchmark ---")
+    # save_dir = "temp_models"
+    # os.makedirs(save_dir, exist_ok=True)
+    # fp32_path = os.path.join(save_dir, "opt125m_fp32.pth")
+    # quantized_path = os.path.join(save_dir, "opt125m_quantized.pth")
 
-    print(f"Saving FP32 model to {fp32_path}...")
-    torch.save(model, fp32_path)
+    # print(f"Saving FP32 model to {fp32_path}...")
+    # torch.save(model, fp32_path)
     
-    print(f"Saving quantized model to {quantized_path}...")
-    torch.save(quantized_model, quantized_path)
+    # print(f"Saving quantized model to {quantized_path}...")
+    # torch.save(quantized_model, quantized_path)
 
-    # Create a dummy input for benchmarking
-    dummy_input = torch.randint(0, model.config.vocab_size, (1, 128), device=device)
+    # # Create a dummy input for benchmarking
+    # dummy_input = torch.randint(0, model.config.vocab_size, (1, 128), device=device)
 
     # Run the benchmark report
     # generate_benchmark_report(fp32_path, quantized_path, dummy_input, device)
 
     # Run the LoRA benchmark report
-    from bitween.lora_benchmark import generate_lora_benchmark_report
-    dummy_input_dict = {"input_ids": dummy_input}
-    generate_lora_benchmark_report(fp32_path, dummy_input_dict, device, text="FP32")
-    generate_lora_benchmark_report(quantized_path, dummy_input_dict, device, text="Quantized")
+    # from bitween.lora_benchmark import generate_lora_benchmark_report
+    # dummy_input_dict = {"input_ids": dummy_input}
+    # generate_lora_benchmark_report(fp32_path, dummy_input_dict, device, text="FP32")
+    # generate_lora_benchmark_report(quantized_path, dummy_input_dict, device, text="Quantized")
 
 
 if __name__ == "__main__":
-    # Define layer dimensions and batch size/sequence length
-    in_features, out_features = 1280, 1280
-    batch_size = 32
+    # # Define layer dimensions and batch size/sequence length
+    # in_features, out_features = 1280, 1280
+    # batch_size = 32
     
-    # Instantiate a float linear layer and a quantized layer
-    float_layer = torch.nn.Linear(in_features, out_features, bias=True, dtype=torch.float32).cuda()
-    q_layer = QuantizedLinear.from_float(float_layer, bits=8).cuda()
+    # # Instantiate a float linear layer and a quantized layer
+    # float_layer = torch.nn.Linear(in_features, out_features, bias=True, dtype=torch.float32).cuda()
+    # q_layer = QuantizedLinear.from_float(float_layer, bits=8).cuda()
     
-    # Create a random input tensor
-    x = torch.randn(batch_size, in_features, device='cuda', dtype=torch.float32)
+    # # Create a random input tensor
+    # x = torch.randn(batch_size, in_features, device='cuda', dtype=torch.float32)
 
-    # Warm-up run to prevent CUDA overhead from affecting measurements
-    for _ in range(10):
-        y_ref = float_layer(x)
-        y_quant = q_layer(x)
+    # # Warm-up run to prevent CUDA overhead from affecting measurements
+    # for _ in range(10):
+    #     y_ref = float_layer(x)
+    #     y_quant = q_layer(x)
         
-    # --- Performance comparison ---
-    # PyTorch timing
-    start_time = time.time()
-    for _ in range(1000):
-        y_ref = float_layer(x)
-    torch.cuda.synchronize()
-    pytorch_time = (time.time() - start_time) / 100
+    # # --- Performance comparison ---
+    # # PyTorch timing
+    # start_time = time.time()
+    # for _ in range(1000):
+    #     y_ref = float_layer(x)
+    # torch.cuda.synchronize()
+    # pytorch_time = (time.time() - start_time) / 100
     
-    # Quantized kernel timing
-    start_time = time.time()
-    for _ in range(1000):
-        y_quant = q_layer(x)
-    torch.cuda.synchronize()
-    quant_time = (time.time() - start_time) / 100
+    # # Quantized kernel timing
+    # start_time = time.time()
+    # for _ in range(1000):
+    #     y_quant = q_layer(x)
+    # torch.cuda.synchronize()
+    # quant_time = (time.time() - start_time) / 100
     
-    # Sanity check
-    y_ref = float_layer(x)
-    y_quant = q_layer(x)
+    # # Sanity check
+    # y_ref = float_layer(x)
+    # y_quant = q_layer(x)
 
-    # Print results
-    print(f"PyTorch Linear Time: {pytorch_time*1000:.3f} ms")
-    print(f"Quantized Kernel Time: {quant_time*1000:.3f} ms")
+    # # Print results
+    # print(f"PyTorch Linear Time: {pytorch_time*1000:.3f} ms")
+    # print(f"Quantized Kernel Time: {quant_time*1000:.3f} ms")
 
-    print(f"Max Error: {(y_ref - y_quant).abs().max():.4f}")
-    print(f"Mean Error: {(y_ref - y_quant).abs().mean():.4f}")
-    print(f"Speedup: {pytorch_time / quant_time:.2f}x")
+    # print(f"Max Error: {(y_ref - y_quant).abs().max():.4f}")
+    # print(f"Mean Error: {(y_ref - y_quant).abs().mean():.4f}")
+    # print(f"Speedup: {pytorch_time / quant_time:.2f}x")
     main()
 
     # def get_quantized_model_size(model):

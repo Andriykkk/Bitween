@@ -1,3 +1,59 @@
+  #1. Create Wrapper Module (wrapper.py)
+
+  - New file: Implement WrapperLinear class similar to auto-round
+  - Key components:
+    - Learnable parameters: value (rounding), min_scale, max_scale (clipping)
+    - Dynamic quantization/dequantization in forward pass
+    - Parameter initialization and management
+
+  2. Enhance Quantizer Class (quantizer.py)
+
+  - Modify: Add trainable quantization workflow
+  - New methods:
+    - cache_inter_data(): Cache block inputs using calibration dataset
+    - quantize_blocks(): Block-by-block optimization
+    - quantize_block(): Core training loop for single block
+  - Integration: Combine with existing RTN workflow
+
+  4. Implement Training Components
+
+  - Optimizer: Add SignSGD or similar optimizer for quantization parameters
+  - Loss function: MSE between original and quantized block outputs
+  - Learning rate scheduling: Adaptive scheduling during training
+
+  5. Block Detection and Management (block_utils.py)
+
+  - New file: Detect and manage model blocks
+  - Features:
+    - Automatic block detection for different architectures
+    - Block input/output management
+    - Block-wise processing utilities
+
+  6. Update Core Modules (modules.py)
+
+  - Enhance: QuantizedLinear to support learnable parameters during training
+  - Add: Temporary wrapper functionality during optimization
+  - Maintain: Backward compatibility with existing RTN approach
+
+  7. Training Loop Integration (quantizer.py)
+
+  - Core workflow:
+    a. Cache inputs for each block using calibration data
+    b. For each block: wrap layers → optimize → unwrap with best params
+    c. Use MSE loss between original and quantized outputs
+    d. Backpropagate through learnable parameters only
+
+  8. Configuration and API Updates
+
+  - Extend: Bitween.__init__() with training parameters
+  - Add parameters: iters, lr, enable_minmax_tuning, calib_dataset
+  - API: quantize(trainable=True, calib_data=dataset)
+
+
+
+
+
+
   Core Concepts
 
   The fundamental idea behind auto-round's quantization is to treat the rounding process as an optimization problem. Instead of simply rounding to the nearest value (RTN), it introduces learnable parameters that

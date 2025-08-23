@@ -1,0 +1,292 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from .modules import QuantizedLinear
+from .functional import quantize_rtn, dequantize_rtn
+import copy
+
+
+def reshape_and_pad_tensor(v, group_size=-1):
+    """Reshapes the tensor based on the group size for parameter initialization."""
+    if group_size == 0:
+        return v.reshape(1, -1)
+    if group_size == -1 or v.shape[1] < group_size:
+        return v
+    if v.shape[1] % group_size == 0:
+        v = v.reshape(-1, group_size)
+    else:
+        pad_len = (v.shape[1] + group_size - 1) // group_size * group_size - v.shape[1]
+        v = torch.nn.functional.pad(v, (0, pad_len))
+        v = v.reshape(-1, group_size)
+    return v
+
+
+class WrapperLinear(nn.Module):
+    """
+    A wrapper for linear layers that enables trainable quantization.
+    
+    This wrapper temporarily replaces a linear layer during the optimization phase,
+    introducing learnable parameters for quantization. After training, it can be
+    converted back to a QuantizedLinear for efficient inference.
+    """
+    
+    def __init__(
+        self,
+        orig_layer,
+        bits=8,
+        group_size=32,
+        enable_minmax_tuning=True,
+        enable_round_tuning=True,
+        device="cpu"
+    ):
+        super().__init__()
+        
+        self.orig_layer = orig_layer
+        self.bits = bits
+        self.group_size = group_size
+        self.enable_minmax_tuning = enable_minmax_tuning
+        self.enable_round_tuning = enable_round_tuning
+        self.device = device
+        
+        # Store original weight for reference
+        self.register_buffer('orig_weight', orig_layer.weight.data.clone())
+        if orig_layer.bias is not None:
+            self.register_buffer('orig_bias', orig_layer.bias.data.clone())
+        else:
+            self.orig_bias = None
+        
+        # Initialize quantization parameters
+        self._init_quantization_params()
+        
+        # Initialize learnable parameters
+        self._init_learnable_params()
+        
+        # Track best parameters during training
+        self.best_params = {}
+        self.best_loss = float('inf')
+    
+    def _init_quantization_params(self):
+        """Initialize base quantization parameters using RTN."""
+        with torch.no_grad():
+            # Get RTN quantization parameters
+            qweight, scale, zero_point, _ = quantize_rtn(
+                self.orig_weight, 
+                bits=self.bits, 
+                group_size=self.group_size
+            )
+            
+            # Store as buffers (non-trainable)
+            self.register_buffer('base_qweight', qweight)
+            self.register_buffer('base_scale', scale)
+            self.register_buffer('base_zero_point', zero_point)
+    
+    def _init_learnable_params(self):
+        """Initialize learnable parameters for quantization optimization."""
+        weight_shape = self.orig_weight.shape
+        
+        # Learnable rounding parameter (value)
+        if self.enable_round_tuning:
+            # Initialize with small random values around zero
+            value_param = torch.zeros_like(self.orig_weight) * 0.01
+            self.value = nn.Parameter(value_param)
+        else:
+            self.value = None
+        
+        # Learnable min/max scale parameters  
+        if self.enable_minmax_tuning:
+            num_groups = weight_shape[1] // self.group_size
+            scale_shape = (weight_shape[0], num_groups)
+            
+            # Initialize close to 1.0 (no change)
+            self.min_scale = nn.Parameter(torch.ones(scale_shape) * 1.0)
+            self.max_scale = nn.Parameter(torch.ones(scale_shape) * 1.0)
+        else:
+            self.min_scale = None
+            self.max_scale = None
+    
+    def _quantize_weight_with_learnable_params(self):
+        """Apply quantization using learnable parameters."""
+        weight = self.orig_weight.clone()
+        
+        # Apply learnable rounding adjustment
+        if self.value is not None:
+            weight = weight + self.value
+        
+        # Get base quantization parameters
+        scale = self.base_scale.clone()
+        zero_point = self.base_zero_point.clone()
+        
+        # Apply learnable min/max scaling
+        if self.min_scale is not None and self.max_scale is not None:
+            scale = scale * self.min_scale.unsqueeze(-1) * self.max_scale.unsqueeze(-1)
+        
+        # Perform quantization
+        out_features, in_features = weight.shape
+        num_groups = in_features // self.group_size
+        
+        # Reshape for group-wise quantization
+        weight_grouped = weight.view(out_features, num_groups, self.group_size)
+        
+        # Quantize each group
+        max_val = (1 << self.bits) - 1
+        
+        # Find min/max per group if no learnable scaling
+        if self.min_scale is None:
+            w_min = weight_grouped.min(dim=-1, keepdim=True)[0]
+            w_max = weight_grouped.max(dim=-1, keepdim=True)[0]
+            scale = (w_max - w_min) / max_val
+            zero_point = -w_min / scale
+        
+        # Apply quantization
+        weight_q = torch.clamp(
+            torch.round(weight_grouped / scale.unsqueeze(-1) + zero_point.unsqueeze(-1)),
+            0, max_val
+        )
+        
+        # Dequantize for forward pass
+        weight_dq = scale.unsqueeze(-1) * (weight_q - zero_point.unsqueeze(-1))
+        weight_dq = weight_dq.view(out_features, in_features)
+        
+        return weight_dq, weight_q, scale, zero_point
+    
+    def forward(self, x):
+        """Forward pass with learnable quantization."""
+        # Get quantized weight using learnable parameters
+        weight_dq, _, _, _ = self._quantize_weight_with_learnable_params()
+        
+        # Apply linear transformation
+        bias = self.orig_bias if self.orig_bias is not None else None
+        return F.linear(x, weight_dq, bias)
+    
+    def update_best_params(self, loss_value):
+        """Update best parameters if current loss is better."""
+        if loss_value < self.best_loss:
+            self.best_loss = loss_value
+            self.best_params = {}
+            
+            if self.value is not None:
+                self.best_params['value'] = self.value.data.clone()
+            if self.min_scale is not None:
+                self.best_params['min_scale'] = self.min_scale.data.clone()
+            if self.max_scale is not None:
+                self.best_params['max_scale'] = self.max_scale.data.clone()
+    
+    def apply_best_params(self):
+        """Apply the best found parameters."""
+        if self.best_params:
+            if 'value' in self.best_params and self.value is not None:
+                self.value.data.copy_(self.best_params['value'])
+            if 'min_scale' in self.best_params and self.min_scale is not None:
+                self.min_scale.data.copy_(self.best_params['min_scale'])
+            if 'max_scale' in self.best_params and self.max_scale is not None:
+                self.max_scale.data.copy_(self.best_params['max_scale'])
+    
+    def to_quantized_linear(self) -> QuantizedLinear:
+        """
+        Convert the wrapper to a QuantizedLinear using the optimized parameters.
+        This removes all learnable parameters and creates an efficient inference layer.
+        """
+        with torch.no_grad():
+            # Apply best parameters
+            self.apply_best_params()
+            
+            # Get final quantized parameters
+            _, weight_q, scale, zero_point = self._quantize_weight_with_learnable_params()
+            
+            # Create QuantizedLinear instance
+            q_layer = QuantizedLinear(
+                self.orig_layer.in_features,
+                self.orig_layer.out_features, 
+                bits=self.bits,
+                group_size=self.group_size,
+                bias=self.orig_layer.bias is not None
+            )
+            
+            # Pack quantized weights for QuantizedLinear format
+            out_features, num_groups, group_size = weight_q.shape
+            values_per_int32 = 32 // self.bits
+            
+            # Flatten and pack weights
+            weight_flat = weight_q.view(-1).int()
+            packed_size = (len(weight_flat) + values_per_int32 - 1) // values_per_int32
+            qweight_packed = torch.zeros(packed_size, dtype=torch.int32, device=weight_flat.device)
+            
+            for i in range(values_per_int32):
+                if i * len(weight_flat) // values_per_int32 < len(weight_flat):
+                    start_idx = i * len(weight_flat) // values_per_int32
+                    end_idx = min((i + 1) * len(weight_flat) // values_per_int32, len(weight_flat))
+                    if start_idx < len(weight_flat):
+                        vals = weight_flat[start_idx:end_idx:values_per_int32]
+                        qweight_packed[start_idx:end_idx:values_per_int32] |= (vals << (i * self.bits))
+            
+            qweight_packed = qweight_packed.view(out_features, -1)
+            
+            # Copy parameters
+            q_layer.qweight.copy_(qweight_packed)
+            q_layer.scale.copy_(scale)
+            q_layer.zero_point.copy_(zero_point)
+            
+            if self.orig_layer.bias is not None:
+                q_layer.bias.copy_(self.orig_layer.bias)
+            
+            return q_layer
+
+
+def wrapper_block(block, enable_minmax_tuning=True, enable_round_tuning=True, bits=8, group_size=32, device="cpu"):
+    """
+    Wrap all linear layers in a block with WrapperLinear for training.
+    
+    Returns:
+        tuple: (quantized_layer_names, unquantized_layer_names)
+    """
+    quantized_layer_names = []
+    unquantized_layer_names = []
+    
+    for name, module in block.named_modules():
+        if isinstance(module, nn.Linear):
+            # Create wrapper
+            wrapper = WrapperLinear(
+                module,
+                bits=bits,
+                group_size=group_size,
+                enable_minmax_tuning=enable_minmax_tuning,
+                enable_round_tuning=enable_round_tuning,
+                device=device
+            )
+            
+            # Replace the module
+            _set_module(block, name, wrapper)
+            quantized_layer_names.append(name)
+        else:
+            unquantized_layer_names.append(name)
+    
+    return quantized_layer_names, unquantized_layer_names
+
+
+def unwrapper_block(block, apply_quantization=True):
+    """
+    Unwrap all WrapperLinear layers in a block, converting them to QuantizedLinear.
+    
+    Args:
+        block: The block containing wrapped layers
+        apply_quantization: If True, convert to QuantizedLinear. If False, restore original layers.
+    """
+    for name, module in list(block.named_modules()):
+        if isinstance(module, WrapperLinear):
+            if apply_quantization:
+                # Convert to quantized layer
+                quantized_layer = module.to_quantized_linear()
+                _set_module(block, name, quantized_layer)
+            else:
+                # Restore original layer
+                _set_module(block, name, module.orig_layer)
+
+
+def _set_module(model, submodule_key, module):
+    """Helper function to replace a module within a model hierarchy."""
+    tokens = submodule_key.split('.')
+    sub_tokens = tokens[:-1]
+    cur_mod = model
+    for s in sub_tokens:
+        cur_mod = getattr(cur_mod, s)
+    setattr(cur_mod, tokens[-1], module)

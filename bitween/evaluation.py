@@ -3,7 +3,7 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from tqdm import tqdm
 
-def calculate_perplexity(model, tokenizer, dataset_name="wikitext", dataset_config="wikitext-2-raw-v1", split="test", num_samples=200):
+def calculate_perplexity(model, tokenizer, dataset_name="wikitext", dataset_config="wikitext-2-raw-v1", split="test", num_samples=200, **kwargs):
     """
     Calculates the perplexity of a model on a given dataset.
     """
@@ -41,7 +41,7 @@ def calculate_perplexity(model, tokenizer, dataset_name="wikitext", dataset_conf
     print(f"Perplexity calculated: {perplexity:.4f}")
     return perplexity
 
-def calculate_kl_divergence(original_model, quantized_model, tokenizer, dataset_name="wikitext", dataset_config="wikitext-2-raw-v1", split="test", num_samples=200):
+def calculate_kl_divergence(original_model, quantized_model, tokenizer, dataset_name="wikitext", dataset_config="wikitext-2-raw-v1", split="test", num_samples=200, **kwargs):
     """
     Calculates the average KL-Divergence between the output distributions of two models.
     """
