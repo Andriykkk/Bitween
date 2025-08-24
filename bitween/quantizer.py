@@ -8,6 +8,9 @@ from .utils.sign_sgd import SignSGD, CombinedScheduler
 from .evaluation import calculate_perplexity, calculate_kl_divergence, print_report
 import copy
 import gc
+import os
+import tempfile
+import shutil
 from tqdm import tqdm
 from typing import Dict, List, Optional
 
@@ -31,7 +34,8 @@ class Bitween:
     """
     A simple quantizer class that takes a model and quantization configuration.
     """
-    def __init__(self, model, tokenizer=None, bits=8, group_size=32, iters=1, lr=0.005, enable_minmax_tuning=True, seqlen=2048):
+    def __init__(self, model, tokenizer=None, bits=8, group_size=32, iters=1, lr=0.005, enable_minmax_tuning=True, seqlen=2048, 
+                 cache_to_disk=False, max_memory_mb=512):
         self.model = model
         self.tokenizer = tokenizer
         self.bits = bits
@@ -42,12 +46,20 @@ class Bitween:
         self.lr = lr        # Learning rate for optimization
         self.enable_minmax_tuning = enable_minmax_tuning  # Enable min/max scale tuning
         self.seqlen = seqlen  # Sequence length for calibration data
+        
+        # Memory management parameters
+        self.cache_to_disk = cache_to_disk  # Save cache tensors to filesystem
+        self.max_memory_mb = max_memory_mb  # Maximum memory for caching (MB)
+        self.cache_dir = None  # Will be set when needed
 
         assert group_size > 0, "Group size must be greater than 0."
 
         print(f"Bitween initialized with bits={bits}, group_size={group_size}")
+        if cache_to_disk:
+            print(f"Disk caching enabled with max memory: {max_memory_mb}MB")
 
-    def quantize(self, evaluate_perplexity=False, num_samples=100, rtn=False, trainable=False, calib_dataset="pile-10k", nsamples=None, **eval_kwargs):
+    def quantize(self, evaluate_perplexity=False, num_samples=100, rtn=False, trainable=False, calib_dataset="pile-10k", nsamples=None, 
+                 cache_to_disk=None, max_memory_mb=None, **eval_kwargs):
         """
         Quantizes the linear layers of the model.
 
@@ -58,6 +70,8 @@ class Bitween:
             trainable (bool): If True, use trainable quantization (slower, higher quality).
             calib_dataset (str): Dataset name for calibration ('pile-10k', etc.).
             nsamples (int): Number of calibration samples to use for training. If None, uses all available samples.
+            cache_to_disk (bool): Override instance setting for disk caching. If None, uses instance setting.
+            max_memory_mb (int): Override instance setting for memory limit. If None, uses instance setting.
             **eval_kwargs: Additional arguments for the evaluation functions.
         
         Returns:
@@ -88,7 +102,14 @@ class Bitween:
                     _set_module(quantized_model, name, q_module)
 
         if trainable and not rtn:
+            # Override cache settings if specified
+            if cache_to_disk is not None:
+                self.cache_to_disk = cache_to_disk
+            if max_memory_mb is not None:
+                self.max_memory_mb = max_memory_mb
+                
             print(f"Trainable mode: iters={self.iters}, lr={self.lr}, minmax_tuning={self.enable_minmax_tuning}")
+            print(f"Cache mode: {'disk' if self.cache_to_disk else 'memory'} (max: {self.max_memory_mb}MB)")
             # Trainable quantization: Use calibration data to optimize quantization parameters
             print(f"Using trainable quantization with {calib_dataset} dataset")
             quantized_model = self._trainable_quantize(calib_dataset, nsamples)
@@ -150,26 +171,55 @@ class Bitween:
         # Step 3: Cache intermediate data (inputs to each block) - ONCE for all blocks
         cached_inputs = self._cache_inter_data(quantized_model, calib_data, block_names, actual_nsamples)
         
-        # Step 4: Quantize each block using cached inputs
-        for block_name in block_names:
-            print(f"\n--- Quantizing block: {block_name} ---")
-            block = self._get_module(quantized_model, block_name)
-            block_inputs = cached_inputs[block_name]
-            self._quantize_block(block, block_inputs)
+        # Step 4: Quantize each block/layer using cached inputs
+        try:
+            for block_name in block_names:
+                print(f"\n--- Quantizing: {block_name} ---")
+                block_or_layer = self._get_module(quantized_model, block_name)
+                
+                # Load cached inputs for this block/layer
+                block_inputs = self._load_block_cache(cached_inputs, block_name)
+                
+                if not block_inputs:
+                    print(f"Warning: No cached inputs found for {block_name}, skipping...")
+                    continue
+                
+                # Quantize the block or individual layer
+                result = self._quantize_block(block_or_layer, block_inputs)
+                
+                # If it's a single layer, we need to replace it in the model
+                if isinstance(block_or_layer, nn.Linear) and result is not None:
+                    _set_module(quantized_model, block_name, result)
+                    print(f"Replaced {block_name} with quantized version")
+                
+                # Clean up cache for this block to free memory
+                self._cleanup_block_cache(cached_inputs, block_name)
+        
+        finally:
+            # Always clean up all cache files when done
+            self._cleanup_all_cache()
         
         return quantized_model
     
     def _get_block_names(self, model) -> List[str]:
         """
-        Detect transformer blocks in the model architecture.
+        Detect transformer blocks and standalone layers in the model architecture.
         
-        This function identifies the main transformer blocks that should be
-        quantized together. Different architectures have different naming patterns.
+        This function identifies:
+        1. Main transformer blocks that should be quantized together
+        2. Standalone linear layers that are not part of any block
         
         Returns:
-            List of block names (e.g., ['model.layers.0', 'model.layers.1', ...])
+            List of block names and standalone layer names
         """
         block_names = []
+        all_linear_layers = set()
+        layers_in_blocks = set()
+        
+        # Collect all linear layers first
+        for name, module in model.named_modules():
+            if isinstance(module, nn.Linear):
+                all_linear_layers.add(name)
         
         # Common patterns for transformer blocks
         patterns = [
@@ -179,6 +229,7 @@ class Bitween:
             'decoder',     # T5: decoder.block.0, decoder.block.1, ...
         ]
         
+        # Find transformer blocks
         for name, module in model.named_modules():
             # Look for numbered blocks (e.g., layers.0, h.1, blocks.2, etc.)
             for pattern in patterns:
@@ -190,51 +241,114 @@ class Bitween:
                             block_path = '.'.join(parts[:i + 2])
                             if block_path not in block_names:
                                 block_names.append(block_path)
+                                
+                                # Mark all linear layers in this block as "covered"
+                                block_module = self._get_module(model, block_path)
+                                for sub_name, sub_module in block_module.named_modules():
+                                    if isinstance(sub_module, nn.Linear):
+                                        full_layer_name = f"{block_path}.{sub_name}" if sub_name else block_path
+                                        layers_in_blocks.add(full_layer_name)
                             break
                     break
         
         # Sort block names to ensure consistent processing order
         block_names.sort()
         
-        # Fallback: if no blocks detected, quantize layer by layer
-        if not block_names:
-            print("Warning: No transformer blocks detected. Using layer-by-layer quantization.")
-            for name, module in model.named_modules():
-                if isinstance(module, nn.Linear):
-                    block_names.append(name)
+        # Find standalone linear layers (not covered by any block)
+        standalone_layers = all_linear_layers - layers_in_blocks
+        standalone_layers = sorted(list(standalone_layers))
+        
+        # Add standalone layers to the processing list
+        if standalone_layers:
+            print(f"Found {len(standalone_layers)} standalone linear layers:")
+            for layer_name in standalone_layers:
+                print(f"  - {layer_name}")
+                block_names.append(layer_name)
+        
+        if block_names:
+            transformer_blocks = [name for name in block_names if name not in standalone_layers]
+            print(f"Found {len(transformer_blocks)} transformer blocks and {len(standalone_layers)} standalone layers")
+        else:
+            print("Warning: No transformer blocks or linear layers detected.")
         
         return block_names
     
-    def _cache_inter_data(self, model, calib_data, block_names: List[str], nsamples: int) -> Dict[str, List[torch.Tensor]]:
+    def _cache_inter_data(self, model, calib_data, block_names: List[str], nsamples: int) -> Dict[str, str]:
         """
-        Cache intermediate activations (inputs to each block) using calibration data.
-        
-        This is crucial for trainable quantization because we need to compare
-        the outputs of original vs quantized blocks during optimization.
+        Cache intermediate activations with memory-efficient disk storage.
         
         Args:
             model: The model to analyze
             calib_data: Calibration dataset
             block_names: List of block names to cache inputs for
+            nsamples: Number of samples to process
             
         Returns:
-            Dictionary mapping block names to lists of input tensors
+            Dictionary mapping block names to cache file paths or memory cache keys
         """
         print("Caching intermediate activations...")
         
-        cached_inputs = {name: [] for name in block_names}
-        hooks = []
+        # Setup cache storage
+        if self.cache_to_disk:
+            # Create temporary directory for cache files
+            self.cache_dir = tempfile.mkdtemp(prefix="bitween_cache_")
+            print(f"Using disk cache directory: {self.cache_dir}")
+            cached_paths = {}
+        else:
+            # Use in-memory storage
+            cached_inputs = {name: [] for name in block_names}
+        
+        # Memory tracking
+        current_memory_mb = 0
+        max_memory_bytes = self.max_memory_mb * 1024 * 1024
+        
+        # Initialize block-specific storage and chunk tracking
+        block_caches = {name: [] for name in block_names}
+        block_chunk_counters = {name: 0 for name in block_names}  # Track chunks per block
         
         def make_hook(block_name):
             def hook_fn(module, input, output):
-                # Store the input to this block
+                nonlocal current_memory_mb
+                
+                # Extract input tensor
                 if isinstance(input, tuple):
-                    cached_inputs[block_name].append(input[0].detach().cpu())
+                    tensor = input[0].detach().cpu()
                 else:
-                    cached_inputs[block_name].append(input.detach().cpu())
+                    tensor = input.detach().cpu()
+                
+                # Calculate tensor size in bytes
+                tensor_size = tensor.numel() * tensor.element_size()
+                
+                if self.cache_to_disk:
+                    # Check memory limit before adding new tensor
+                    if current_memory_mb + tensor_size > max_memory_bytes:
+                        # Flush ALL blocks to disk and clear memory
+                        for b_name, tensors in block_caches.items():
+                            if tensors:  # Only flush non-empty caches
+                                self._flush_block_cache_to_disk(b_name, tensors, block_chunk_counters[b_name])
+                                block_chunk_counters[b_name] += 1
+                        
+                        # Clear all block caches and reset memory counter
+                        for b_name in block_caches:
+                            block_caches[b_name] = []
+                        current_memory_mb = 0
+                        
+                        # Force garbage collection
+                        gc.collect()
+                        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                        
+                        print(f"Flushed cache chunks to disk, freed memory (limit: {self.max_memory_mb}MB)")
+                    
+                    block_caches[block_name].append(tensor)
+                    current_memory_mb += tensor_size
+                else:
+                    # Direct memory storage
+                    cached_inputs[block_name].append(tensor)
+                    
             return hook_fn
         
         # Register hooks for each block
+        hooks = []
         for block_name in block_names:
             block = self._get_module(model, block_name)
             hook = block.register_forward_hook(make_hook(block_name))
@@ -244,39 +358,194 @@ class Bitween:
         model.eval()
         with torch.no_grad():
             dataloader = calib_data.get_dataloader(batch_size=1)
+            
             for i, batch in enumerate(tqdm(dataloader, desc="Caching block inputs", total=nsamples)):
                 if i >= nsamples:
                     break
                     
                 input_ids = batch['input_ids'].to(model.device)
                 
-                # Forward pass to trigger hooks and cache inputs for ALL blocks
+                # Forward pass to trigger hooks
                 try:
                     _ = model(input_ids)
                 except Exception as e:
                     print(f"Warning: Forward pass failed for batch {i}: {e}")
                     continue
+                
+                # Periodic memory cleanup during caching
+                if self.cache_to_disk and (i + 1) % 50 == 0:
+                    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                    gc.collect()
         
         # Remove hooks
         for hook in hooks:
             hook.remove()
         
-        print(f"Cached inputs for {len(block_names)} blocks")
-        return cached_inputs
+        # Finalize caching
+        if self.cache_to_disk:
+            # Flush any remaining data to disk
+            for block_name in block_names:
+                if block_caches[block_name]:
+                    self._flush_block_cache_to_disk(block_name, block_caches[block_name], block_chunk_counters[block_name])
+                    block_chunk_counters[block_name] += 1
+            
+            # Clear all memory caches
+            block_caches.clear()
+            gc.collect()
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            
+            # Return chunk info for each block
+            cached_paths = {}
+            total_size_mb = 0
+            
+            for block_name in block_names:
+                # Collect all chunk files for this block
+                chunk_files = []
+                for chunk_id in range(block_chunk_counters[block_name]):
+                    chunk_file = os.path.join(self.cache_dir, f"{block_name.replace('.', '_')}_chunk_{chunk_id}.pt")
+                    if os.path.exists(chunk_file):
+                        chunk_files.append(chunk_file)
+                        total_size_mb += os.path.getsize(chunk_file) / (1024 * 1024)
+                
+                if chunk_files:
+                    cached_paths[block_name] = {
+                        'chunk_files': chunk_files,
+                        'num_chunks': len(chunk_files)
+                    }
+                    print(f"Block {block_name}: {len(chunk_files)} chunks")
+                else:
+                    print(f"Warning: No cache chunks found for block {block_name}")
+            
+            print(f"Cached {len(block_names)} blocks to disk ({total_size_mb:.1f}MB total in chunks)")
+            print(f"Memory freed, using chunked disk storage")
+            return cached_paths
+        else:
+            print(f"Cached inputs for {len(block_names)} blocks in memory")
+            return cached_inputs
     
-    def _quantize_block(self, block, block_inputs: List[torch.Tensor], batch_size: int = 32):
-        """
-        Memory-efficient quantization of a single block.
+    def _flush_block_cache_to_disk(self, block_name: str, tensors: List[torch.Tensor], chunk_id: int):
+        """Save a block's cached tensors to disk as a separate chunk file."""
+        if not tensors:
+            return
+            
+        # Create unique chunk file name
+        chunk_file = os.path.join(self.cache_dir, f"{block_name.replace('.', '_')}_chunk_{chunk_id}.pt")
         
-        Efficient approach:
-        1. Cache original outputs ONCE using all available samples
-        2. Wrap layers with learnable parameters (only for this block)
-        3. Optimize using ALL cached samples for many iterations
-        4. Unwrap and clean up before moving to next block
+        # Save directly to chunk file (no appending needed)
+        torch.save(tensors, chunk_file)
+        
+        # Optional: Log chunk info
+        chunk_size_mb = sum(t.numel() * t.element_size() for t in tensors) / (1024 * 1024)
+        print(f"Saved chunk {chunk_id} for {block_name}: {len(tensors)} tensors ({chunk_size_mb:.1f}MB)")
+    
+    def _load_block_cache(self, cache_path_or_data, block_name: str) -> List[torch.Tensor]:
+        """Load cached tensors for a specific block from chunk files."""
+        if self.cache_to_disk:
+            if isinstance(cache_path_or_data, dict) and block_name in cache_path_or_data:
+                chunk_info = cache_path_or_data[block_name]
+                
+                if isinstance(chunk_info, dict) and 'chunk_files' in chunk_info:
+                    # New chunked format
+                    chunk_files = chunk_info['chunk_files']
+                    
+                    # Force garbage collection before loading
+                    gc.collect()
+                    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                    
+                    # Load all chunks and combine
+                    all_tensors = []
+                    for chunk_file in chunk_files:
+                        if os.path.exists(chunk_file):
+                            chunk_tensors = torch.load(chunk_file, map_location='cpu')
+                            all_tensors.extend(chunk_tensors)
+                        else:
+                            print(f"Warning: Chunk file not found: {chunk_file}")
+                    
+                    print(f"Loaded {len(all_tensors)} cached tensors for {block_name} from {len(chunk_files)} chunks")
+                    return all_tensors
+                    
+                elif isinstance(chunk_info, str):
+                    # Legacy single file format (for backward compatibility)
+                    cache_file = chunk_info
+                    if os.path.exists(cache_file):
+                        gc.collect()
+                        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                        
+                        tensors = torch.load(cache_file, map_location='cpu')
+                        print(f"Loaded {len(tensors)} cached tensors for {block_name}")
+                        return tensors
+                    else:
+                        print(f"Warning: Cache file not found: {cache_file}")
+                        return []
+                else:
+                    print(f"Warning: Invalid cache format for block {block_name}")
+                    return []
+            else:
+                return []
+        else:
+            # Direct memory access
+            return cache_path_or_data.get(block_name, [])
+    
+    def _cleanup_block_cache(self, cache_data, block_name: str):
+        """Clean up cache for a specific block (handles both chunked and single file formats)."""
+        if self.cache_to_disk:
+            if isinstance(cache_data, dict) and block_name in cache_data:
+                chunk_info = cache_data[block_name]
+                
+                if isinstance(chunk_info, dict) and 'chunk_files' in chunk_info:
+                    # New chunked format - delete all chunk files
+                    chunk_files = chunk_info['chunk_files']
+                    deleted_count = 0
+                    
+                    for chunk_file in chunk_files:
+                        if os.path.exists(chunk_file):
+                            try:
+                                os.remove(chunk_file)
+                                deleted_count += 1
+                            except Exception as e:
+                                print(f"Warning: Failed to delete chunk file {chunk_file}: {e}")
+                    
+                    print(f"Deleted {deleted_count}/{len(chunk_files)} chunk files for {block_name}")
+                    
+                elif isinstance(chunk_info, str):
+                    # Legacy single file format
+                    cache_file = chunk_info
+                    if os.path.exists(cache_file):
+                        try:
+                            os.remove(cache_file)
+                            print(f"Deleted cache file for {block_name}")
+                        except Exception as e:
+                            print(f"Warning: Failed to delete cache file {cache_file}: {e}")
+                
+                # Remove from dict to prevent re-access
+                del cache_data[block_name]
+        else:
+            # Clear from memory
+            if block_name in cache_data:
+                del cache_data[block_name]
+        
+        # Aggressive garbage collection
+        gc.collect()
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    
+    def _cleanup_all_cache(self):
+        """Clean up all cache files and directories."""
+        if self.cache_to_disk and self.cache_dir and os.path.exists(self.cache_dir):
+            shutil.rmtree(self.cache_dir)
+            print(f"Cleaned up cache directory: {self.cache_dir}")
+            self.cache_dir = None
+    
+    def _quantize_block(self, block_or_layer, block_inputs: List[torch.Tensor], batch_size: int = 32):
+        """
+        Memory-efficient quantization of a single block or individual layer.
+        
+        This method handles both:
+        1. Transformer blocks (containing multiple linear layers)
+        2. Individual linear layers (standalone layers not in blocks)
         
         Args:
-            block: The transformer block to quantize
-            block_inputs: List of ALL input tensors cached for this block
+            block_or_layer: Either a transformer block module or a single linear layer
+            block_inputs: List of ALL input tensors cached for this block/layer
             batch_size: Mini-batch size for processing samples
         """
         if not block_inputs:
@@ -284,18 +553,29 @@ class Bitween:
             return
         
         num_samples = len(block_inputs)
-        print(f"Optimizing block with {num_samples} cached samples")
+        
+        # Detect if this is a single linear layer or a block
+        is_single_layer = isinstance(block_or_layer, nn.Linear)
+        item_type = "linear layer" if is_single_layer else "block"
+        
+        print(f"Optimizing {item_type} with {num_samples} cached samples")
         
         # Step 1: Cache original outputs using ALL samples
-        print("Caching original block outputs for all samples...")
+        print(f"Caching original {item_type} outputs for all samples...")
         original_outputs = []
-        block.eval()
+        block_or_layer.eval()
         
         with torch.no_grad():
             for inp in tqdm(block_inputs, desc="Caching original outputs", leave=False):
-                inp = inp.to(next(block.parameters()).device)
+                inp = inp.to(next(block_or_layer.parameters()).device)
                 try:
-                    orig_out = block(inp)
+                    orig_out = block_or_layer(inp)
+                    
+                    # Handle different output formats (tensor vs tuple)
+                    if isinstance(orig_out, tuple):
+                        # Take the first element (usually the main output tensor)
+                        orig_out = orig_out[0]
+                    
                     original_outputs.append(orig_out.detach().cpu())  # Store on CPU to save GPU memory
                 except Exception as e:
                     print(f"Warning: Failed to cache output: {e}")
@@ -303,34 +583,51 @@ class Bitween:
         
         print(f"Cached {len(original_outputs)} original outputs")
         
-        # Step 2: Wrap linear layers with learnable parameters (ONLY this block)
-        quantized_names, unquantized_names = wrapper_block(
-            block, 
-            enable_minmax_tuning=self.enable_minmax_tuning,
-            enable_round_tuning=True,
-            bits=self.bits,
-            group_size=self.group_size,
-            device=next(block.parameters()).device
-        )
+        # Step 2: Handle wrapping based on type
+        if is_single_layer:
+            # For individual linear layers, create a temporary wrapper
+            wrapper = WrapperLinear(
+                block_or_layer,
+                bits=self.bits,
+                group_size=self.group_size,
+                enable_minmax_tuning=self.enable_minmax_tuning,
+                enable_round_tuning=True,
+                device=next(block_or_layer.parameters()).device
+            )
+            quantized_names = ["single_layer"]
+            wrappers = [wrapper]
+        else:
+            # For blocks, wrap all linear layers inside
+            quantized_names, unquantized_names = wrapper_block(
+                block_or_layer, 
+                enable_minmax_tuning=self.enable_minmax_tuning,
+                enable_round_tuning=True,
+                bits=self.bits,
+                group_size=self.group_size,
+                device=next(block_or_layer.parameters()).device
+            )
+            
+            # Collect wrappers
+            wrappers = []
+            for name, module in block_or_layer.named_modules():
+                if isinstance(module, WrapperLinear):
+                    wrappers.append(module)
         
         print(f"Wrapped {len(quantized_names)} linear layers")
         
         if not quantized_names:
-            print("No linear layers found in this block")
+            print(f"No linear layers found in this {item_type}")
             return
         
-        # Step 3: Setup optimizer (ONLY for this block's parameters)
+        # Step 3: Setup optimizer parameters
         learnable_params = []
-        wrappers = []
-        for name, module in block.named_modules():
-            if isinstance(module, WrapperLinear):
-                wrappers.append(module)
-                if module.value is not None:
-                    learnable_params.append(module.value)
-                if module.min_scale is not None:
-                    learnable_params.append(module.min_scale)
-                if module.max_scale is not None:
-                    learnable_params.append(module.max_scale)
+        for wrapper in wrappers:
+            if wrapper.value is not None:
+                learnable_params.append(wrapper.value)
+            if wrapper.min_scale is not None:
+                learnable_params.append(wrapper.min_scale)
+            if wrapper.max_scale is not None:
+                learnable_params.append(wrapper.max_scale)
         
         if not learnable_params:
             print("Warning: No learnable parameters found")
@@ -378,11 +675,20 @@ class Bitween:
                 
                 # Process mini-batch and accumulate gradients
                 for i in range(batch_start, batch_end):
-                    inp = block_inputs[i].to(next(block.parameters()).device)
+                    inp = block_inputs[i].to(next(block_or_layer.parameters()).device)
                     orig_out = original_outputs[i].to(inp.device)
                     
-                    # Forward pass through quantized block
-                    quant_out = block(inp)
+                    # Forward pass through quantized block/layer
+                    if is_single_layer:
+                        # For single layer, use the wrapper directly
+                        quant_out = wrapper(inp)
+                    else:
+                        # For blocks, use the block with wrapped layers
+                        quant_out = block_or_layer(inp)
+                    
+                    # Handle tuple outputs (extract main tensor)
+                    if isinstance(quant_out, tuple):
+                        quant_out = quant_out[0]
                     
                     # MSE loss between original and quantized outputs
                     loss = F.mse_loss(quant_out, orig_out)
@@ -419,15 +725,29 @@ class Bitween:
         print(f"Block optimization complete. Best loss: {best_loss:.6f} ({improvement:.1f}% improvement)")
         
         # Step 5: Apply best parameters and convert to QuantizedLinear
-        for wrapper in wrappers:
-            wrapper.apply_best_params()
+        for wrapper_inst in wrappers:
+            wrapper_inst.apply_best_params()
         
-        unwrapper_block(block, apply_quantization=True)
-        print(f"Converted {len(quantized_names)} layers to QuantizedLinear")
+        if is_single_layer:
+            # For single layer, convert wrapper to QuantizedLinear and replace
+            quantized_layer = wrapper.to_quantized_linear()
+            # Note: The parent module replacement needs to be handled by the caller
+            print(f"Converted single layer to QuantizedLinear")
+        else:
+            # For blocks, unwrap all layers within the block
+            unwrapper_block(block_or_layer, apply_quantization=True)
+            print(f"Converted {len(quantized_names)} layers to QuantizedLinear")
         
-        # Step 6: Clean up memory
+        # Step 6: Clean up memory aggressively
         del original_outputs, learnable_params, wrappers, optimizer, scheduler
+        if is_single_layer:
+            del wrapper  # Clean up the wrapper reference
+        gc.collect()
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        
+        # Return quantized layer for single layer case
+        if is_single_layer:
+            return quantized_layer
     
     def _get_module(self, model, module_name: str):
         """Get a module by its dotted name."""

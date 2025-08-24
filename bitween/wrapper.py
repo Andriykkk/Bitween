@@ -46,9 +46,11 @@ class WrapperLinear(nn.Module):
         self.group_size = group_size
         self.enable_minmax_tuning = enable_minmax_tuning
         self.enable_round_tuning = enable_round_tuning
-        self.device = device
         
-        # Store original weight for reference
+        # Use the device of the original layer's weight, not the passed device parameter
+        self.device = orig_layer.weight.device
+        
+        # Store original weight for reference (already on correct device)
         self.register_buffer('orig_weight', orig_layer.weight.data.clone())
         if orig_layer.bias is not None:
             self.register_buffer('orig_bias', orig_layer.bias.data.clone())
@@ -58,8 +60,11 @@ class WrapperLinear(nn.Module):
         # Initialize quantization parameters
         self._init_quantization_params()
         
-        # Initialize learnable parameters
+        # Initialize learnable parameters (will be on same device)
         self._init_learnable_params()
+        
+        # Ensure wrapper is on the same device as original layer
+        self.to(self.device)
         
         # Track best parameters during training
         self.best_params = {}
@@ -112,42 +117,44 @@ class WrapperLinear(nn.Module):
         if self.value is not None:
             weight = weight + self.value
         
-        # Get base quantization parameters
-        scale = self.base_scale.clone()
-        zero_point = self.base_zero_point.clone()
-        
-        # Apply learnable min/max scaling
-        if self.min_scale is not None and self.max_scale is not None:
-            scale = scale * self.min_scale.unsqueeze(-1) * self.max_scale.unsqueeze(-1)
-        
-        # Perform quantization
+        # Use the base quantization approach with learnable adjustments
         out_features, in_features = weight.shape
         num_groups = in_features // self.group_size
         
         # Reshape for group-wise quantization
         weight_grouped = weight.view(out_features, num_groups, self.group_size)
         
-        # Quantize each group
+        # Calculate quantization parameters per group
         max_val = (1 << self.bits) - 1
+        w_min = weight_grouped.min(dim=-1, keepdim=True)[0]  # Shape: (out_features, num_groups, 1)
+        w_max = weight_grouped.max(dim=-1, keepdim=True)[0]  # Shape: (out_features, num_groups, 1)
         
-        # Find min/max per group if no learnable scaling
-        if self.min_scale is None:
-            w_min = weight_grouped.min(dim=-1, keepdim=True)[0]
-            w_max = weight_grouped.max(dim=-1, keepdim=True)[0]
-            scale = (w_max - w_min) / max_val
-            zero_point = -w_min / scale
+        # Base scale and zero_point calculation
+        scale = (w_max - w_min) / max_val  # Shape: (out_features, num_groups, 1)
+        zero_point = -w_min / scale        # Shape: (out_features, num_groups, 1)
+        
+        # Apply learnable min/max scaling adjustments
+        if self.min_scale is not None and self.max_scale is not None:
+            # min_scale and max_scale have shape (out_features, num_groups)
+            # We need to add a dimension for broadcasting
+            scale_adjustment = self.min_scale.unsqueeze(-1) * self.max_scale.unsqueeze(-1)  # (out_features, num_groups, 1)
+            scale = scale * scale_adjustment
         
         # Apply quantization
         weight_q = torch.clamp(
-            torch.round(weight_grouped / scale.unsqueeze(-1) + zero_point.unsqueeze(-1)),
+            torch.round(weight_grouped / scale + zero_point),
             0, max_val
         )
         
         # Dequantize for forward pass
-        weight_dq = scale.unsqueeze(-1) * (weight_q - zero_point.unsqueeze(-1))
+        weight_dq = scale * (weight_q - zero_point)
         weight_dq = weight_dq.view(out_features, in_features)
         
-        return weight_dq, weight_q, scale, zero_point
+        # Return with proper shapes for compatibility
+        scale_flat = scale.squeeze(-1)      # Shape: (out_features, num_groups)
+        zero_point_flat = zero_point.squeeze(-1)  # Shape: (out_features, num_groups)
+        
+        return weight_dq, weight_q, scale_flat, zero_point_flat
     
     def forward(self, x):
         """Forward pass with learnable quantization."""
@@ -202,29 +209,26 @@ class WrapperLinear(nn.Module):
                 bias=self.orig_layer.bias is not None
             )
             
-            # Pack quantized weights for QuantizedLinear format
-            out_features, num_groups, group_size = weight_q.shape
-            values_per_int32 = 32 // self.bits
+            # Use the same quantization approach as your quantize_rtn function
+            # Just apply quantization directly to the original weight using optimized parameters
+            from .functional import quantize_rtn
             
-            # Flatten and pack weights
-            weight_flat = weight_q.view(-1).int()
-            packed_size = (len(weight_flat) + values_per_int32 - 1) // values_per_int32
-            qweight_packed = torch.zeros(packed_size, dtype=torch.int32, device=weight_flat.device)
+            # Apply learned adjustments to the original weight
+            adjusted_weight = self.orig_weight.clone()
+            if self.value is not None:
+                adjusted_weight = adjusted_weight + self.value
             
-            for i in range(values_per_int32):
-                if i * len(weight_flat) // values_per_int32 < len(weight_flat):
-                    start_idx = i * len(weight_flat) // values_per_int32
-                    end_idx = min((i + 1) * len(weight_flat) // values_per_int32, len(weight_flat))
-                    if start_idx < len(weight_flat):
-                        vals = weight_flat[start_idx:end_idx:values_per_int32]
-                        qweight_packed[start_idx:end_idx:values_per_int32] |= (vals << (i * self.bits))
+            # Use quantize_rtn with the adjusted weight to get proper packing
+            qweight_packed, scale_final, zero_point_final, _ = quantize_rtn(
+                adjusted_weight, 
+                bits=self.bits, 
+                group_size=self.group_size
+            )
             
-            qweight_packed = qweight_packed.view(out_features, -1)
-            
-            # Copy parameters
+            # Copy parameters (use the final quantization results)
             q_layer.qweight.copy_(qweight_packed)
-            q_layer.scale.copy_(scale)
-            q_layer.zero_point.copy_(zero_point)
+            q_layer.scale.copy_(scale_final)
+            q_layer.zero_point.copy_(zero_point_final)
             
             if self.orig_layer.bias is not None:
                 q_layer.bias.copy_(self.orig_layer.bias)
