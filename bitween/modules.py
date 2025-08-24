@@ -27,16 +27,14 @@ class QuantizedLinearFunction(torch.autograd.Function):
         c = torch.empty((M, N), device=device, dtype=torch.float32)
         # c = torch.empty((M, N), device=device, dtype=torch.int32)
 
-        BLOCK_SIZE_M = 128
-        BLOCK_SIZE_N = 128
-        BLOCK_SIZE_K = 64
-        grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
-
         DTYPE = {
             torch.float16: tl.float16,
             torch.bfloat16: tl.bfloat16,
             torch.float32: tl.float32
         }
+
+        def grid(meta):
+            return (triton.cdiv(M, meta['BLOCK_SIZE_M']), triton.cdiv(N, meta['BLOCK_SIZE_N']))
 
         quantized_linear_kernel[grid](
             x_reshaped, qweight, scale, zero_point, bias, c,
@@ -49,9 +47,6 @@ class QuantizedLinearFunction(torch.autograd.Function):
             zero_point.stride(0), zero_point.stride(1),
             bias.stride(0) if bias is not None else 0,
             c.stride(0), c.stride(1),
-            BLOCK_SIZE_M=BLOCK_SIZE_M,
-            BLOCK_SIZE_N=BLOCK_SIZE_N,
-            BLOCK_SIZE_K=BLOCK_SIZE_K,
             GROUP_SIZE=group_size,
             BIAS_ENABLED=(bias is not None),
             DTYPE=DTYPE[x.dtype]

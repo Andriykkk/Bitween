@@ -7,6 +7,8 @@ import triton
 import triton.language as tl
 import time
 from bitween.functional import quantize_rtn, dequantize_rtn
+import matplotlib.pyplot as plt
+import numpy as np
 
 def main():
     """
@@ -72,50 +74,247 @@ def main():
     generate_lora_benchmark_report(quantized_path, dummy_input_dict, device, text="Quantized")
 
 
-if __name__ == "__main__":
-    # # Define layer dimensions and batch size/sequence length
-    # in_features, out_features = 1280, 1280
-    # batch_size = 32
+def benchmark_quantized_layers():
+    """
+    Benchmark QuantizedLinear layers across different sizes and generate plots.
+    """
+    print("\n--- Benchmarking Quantized Layers ---")
     
-    # # Instantiate a float linear layer and a quantized layer
-    # float_layer = torch.nn.Linear(in_features, out_features, bias=True, dtype=torch.float32).cuda()
-    # q_layer = QuantizedLinear.from_float(float_layer, bits=8).cuda()
+    # Define test configurations
+    layer_sizes = [128, 256, 512, 1024,
+                    # 2048, 4096
+                    ]
+    batch_sizes = [1, 
+                #    16, 32
+                   ]
+    warmup_iterations = 10
+    benchmark_iterations = 1000
     
-    # # Create a random input tensor
-    # x = torch.randn(batch_size, in_features, device='cuda', dtype=torch.float32)
-
-    # # Warm-up run to prevent CUDA overhead from affecting measurements
-    # for _ in range(10):
-    #     y_ref = float_layer(x)
-    #     y_quant = q_layer(x)
+    # Results storage
+    results = {}
+    
+    for batch_size in batch_sizes:
+        results[batch_size] = {
+            'sizes': [],
+            'pytorch_times': [],
+            'quantized_times': [],
+            'speedups': [],
+            'max_errors': [],
+            'mean_errors': []
+        }
         
-    # # --- Performance comparison ---
-    # # PyTorch timing
-    # start_time = time.time()
-    # for _ in range(1000):
-    #     y_ref = float_layer(x)
-    # torch.cuda.synchronize()
-    # pytorch_time = (time.time() - start_time) / 100
+        print(f"\nBenchmarking with batch_size={batch_size}")
+        
+        for size in layer_sizes:
+            print(f"  Testing {size}x{size} layers...")
+            
+            # Create layers
+            float_layer = torch.nn.Linear(size, size, bias=True, dtype=torch.float32).cuda()
+            q_layer = QuantizedLinear.from_float(float_layer, bits=8).cuda()
+            
+            # Create input tensor
+            x = torch.randn(batch_size, size, device='cuda', dtype=torch.float32)
+            
+            # Warm-up run
+            for _ in range(warmup_iterations):
+                with torch.no_grad():
+                    _ = float_layer(x)
+                    _ = q_layer(x)
+            
+            torch.cuda.synchronize()
+            
+            # Benchmark PyTorch Linear
+            start_time = time.time()
+            for _ in range(benchmark_iterations):
+                with torch.no_grad():
+                    _ = float_layer(x)
+            torch.cuda.synchronize()
+            pytorch_time = (time.time() - start_time) / benchmark_iterations
+            
+            # Benchmark Quantized Linear
+            start_time = time.time()
+            for _ in range(benchmark_iterations):
+                with torch.no_grad():
+                    _ = q_layer(x)
+            torch.cuda.synchronize()
+            quantized_time = (time.time() - start_time) / benchmark_iterations
+            
+            # Calculate errors
+            with torch.no_grad():
+                y_ref = float_layer(x)
+                y_quant = q_layer(x)
+                max_error = (y_ref - y_quant).abs().max().item()
+                mean_error = (y_ref - y_quant).abs().mean().item()
+            
+            # Store results
+            speedup = pytorch_time / quantized_time
+            results[batch_size]['sizes'].append(size)
+            results[batch_size]['pytorch_times'].append(pytorch_time * 1000)  # Convert to ms
+            results[batch_size]['quantized_times'].append(quantized_time * 1000)  # Convert to ms
+            results[batch_size]['speedups'].append(speedup)
+            results[batch_size]['max_errors'].append(max_error)
+            results[batch_size]['mean_errors'].append(mean_error)
+            
+            print(f"    PyTorch: {pytorch_time*1000:.3f}ms, Quantized: {quantized_time*1000:.3f}ms")
+            print(f"    Speedup: {speedup:.2f}x, Max Error: {max_error:.4f}, Mean Error: {mean_error:.4f}")
+            
+            # Cleanup
+            del float_layer, q_layer, x, y_ref, y_quant
+            torch.cuda.empty_cache()
     
-    # # Quantized kernel timing
-    # start_time = time.time()
-    # for _ in range(1000):
-    #     y_quant = q_layer(x)
-    # torch.cuda.synchronize()
-    # quant_time = (time.time() - start_time) / 100
+    # Generate plots
+    _generate_benchmark_plots(results)
     
-    # # Sanity check
-    # y_ref = float_layer(x)
-    # y_quant = q_layer(x)
+    return results
 
-    # # Print results
-    # print(f"PyTorch Linear Time: {pytorch_time*1000:.3f} ms")
-    # print(f"Quantized Kernel Time: {quant_time*1000:.3f} ms")
 
-    # print(f"Max Error: {(y_ref - y_quant).abs().max():.4f}")
-    # print(f"Mean Error: {(y_ref - y_quant).abs().mean():.4f}")
-    # print(f"Speedup: {pytorch_time / quant_time:.2f}x")
-    main()
+def _generate_benchmark_plots(results):
+    """
+    Generate and save benchmark plots.
+    """
+    print("\nGenerating benchmark plots...")
+    
+    # Create figure with subplots
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
+    fig.suptitle('QuantizedLinear Performance Benchmarks', fontsize=16)
+    
+    colors = ['blue', 'red', 'green']
+    markers = ['o', 's', '^']
+    
+    # Plot 1: Execution Times
+    for i, (batch_size, data) in enumerate(results.items()):
+        ax1.plot(data['sizes'], data['pytorch_times'], 
+                color=colors[i], marker=markers[i], linestyle='--', 
+                label=f'PyTorch (batch={batch_size})')
+        ax1.plot(data['sizes'], data['quantized_times'], 
+                color=colors[i], marker=markers[i], linestyle='-', 
+                label=f'Quantized (batch={batch_size})')
+    
+    ax1.set_xlabel('Layer Size')
+    ax1.set_ylabel('Time (ms)')
+    ax1.set_title('Execution Time Comparison')
+    ax1.set_xscale('log', base=2)
+    ax1.set_yscale('log')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot 2: Speedup
+    for i, (batch_size, data) in enumerate(results.items()):
+        ax2.plot(data['sizes'], data['speedups'], 
+                color=colors[i], marker=markers[i], 
+                label=f'Batch Size {batch_size}')
+    
+    ax2.set_xlabel('Layer Size')
+    ax2.set_ylabel('Speedup (x)')
+    ax2.set_title('Quantized vs PyTorch Speedup')
+    ax2.set_xscale('log', base=2)
+    ax2.axhline(y=1.0, color='black', linestyle='--', alpha=0.5, label='No speedup')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    # Plot 3: Max Error
+    for i, (batch_size, data) in enumerate(results.items()):
+        ax3.plot(data['sizes'], data['max_errors'], 
+                color=colors[i], marker=markers[i], 
+                label=f'Batch Size {batch_size}')
+    
+    ax3.set_xlabel('Layer Size')
+    ax3.set_ylabel('Max Absolute Error')
+    ax3.set_title('Maximum Quantization Error')
+    ax3.set_xscale('log', base=2)
+    ax3.set_yscale('log')
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
+    
+    # Plot 4: Mean Error
+    for i, (batch_size, data) in enumerate(results.items()):
+        ax4.plot(data['sizes'], data['mean_errors'], 
+                color=colors[i], marker=markers[i], 
+                label=f'Batch Size {batch_size}')
+    
+    ax4.set_xlabel('Layer Size')
+    ax4.set_ylabel('Mean Absolute Error')
+    ax4.set_title('Mean Quantization Error')
+    ax4.set_xscale('log', base=2)
+    ax4.set_yscale('log')
+    ax4.legend()
+    ax4.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    # Save plot
+    os.makedirs('benchmarks', exist_ok=True)
+    plot_path = 'benchmarks/quantized_linear_benchmark.png'
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    print(f"Benchmark plot saved to: {plot_path}")
+    
+    # Also save as PDF
+    pdf_path = 'benchmarks/quantized_linear_benchmark.pdf'
+    plt.savefig(pdf_path, bbox_inches='tight')
+    print(f"Benchmark plot saved to: {pdf_path}")
+    
+    plt.show()
+    
+    # Generate summary table
+    _generate_summary_table(results)
+
+
+def _generate_summary_table(results):
+    """
+    Generate and save a summary table of benchmark results.
+    """
+    print("\n--- Benchmark Summary ---")
+    
+    # Create summary table
+    summary_lines = []
+    summary_lines.append("| Batch Size | Layer Size | PyTorch (ms) | Quantized (ms) | Speedup | Max Error | Mean Error |")
+    summary_lines.append("|------------|------------|--------------|----------------|---------|-----------|------------|")
+    
+    for batch_size, data in results.items():
+        for i, size in enumerate(data['sizes']):
+            pytorch_time = data['pytorch_times'][i]
+            quantized_time = data['quantized_times'][i] 
+            speedup = data['speedups'][i]
+            max_error = data['max_errors'][i]
+            mean_error = data['mean_errors'][i]
+            
+            line = f"| {batch_size:10d} | {size:10d} | {pytorch_time:12.3f} | {quantized_time:14.3f} | {speedup:7.2f} | {max_error:9.4f} | {mean_error:10.4f} |"
+            summary_lines.append(line)
+            print(line)
+    
+    # Save summary to file
+    os.makedirs('benchmarks', exist_ok=True)
+    summary_path = 'benchmarks/benchmark_summary.md'
+    with open(summary_path, 'w') as f:
+        f.write("# QuantizedLinear Benchmark Results\n\n")
+        f.write("\n".join(summary_lines))
+    
+    print(f"\nBenchmark summary saved to: {summary_path}")
+    
+    # Print overall statistics
+    print("\n--- Overall Statistics ---")
+    all_speedups = []
+    all_max_errors = []
+    all_mean_errors = []
+    
+    for data in results.values():
+        all_speedups.extend(data['speedups'])
+        all_max_errors.extend(data['max_errors'])
+        all_mean_errors.extend(data['mean_errors'])
+    
+    print(f"Average Speedup: {np.mean(all_speedups):.2f}x (±{np.std(all_speedups):.2f})")
+    print(f"Best Speedup: {np.max(all_speedups):.2f}x")
+    print(f"Worst Speedup: {np.min(all_speedups):.2f}x")
+    print(f"Average Max Error: {np.mean(all_max_errors):.4f} (±{np.std(all_max_errors):.4f})")
+    print(f"Average Mean Error: {np.mean(all_mean_errors):.4f} (±{np.std(all_mean_errors):.4f})")
+
+
+if __name__ == "__main__":
+    # Run comprehensive benchmarking of QuantizedLinear layers
+    benchmark_results = benchmark_quantized_layers()
+    
+    # Uncomment to run the full quantization pipeline
+    # main()
 
     # def get_quantized_model_size(model):
     #     total_bytes = 0
