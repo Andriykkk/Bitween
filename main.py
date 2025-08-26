@@ -42,10 +42,12 @@ def main():
         num_samples=5,
         # rtn=True,
         trainable=True,
-        nsamples=3,
+        nsamples=12,
+        batch_size=3,
         seqlen=256,
         cache_to_disk=True,
-        max_memory_mb=2048
+        max_memory_mb=2048,
+        ignore_layers=['lm_head', 'embed_tokens']
     )
 
     # --- 4. Save models and run benchmark ---
@@ -310,11 +312,9 @@ def _generate_summary_table(results):
 
 
 if __name__ == "__main__":
-    # Run comprehensive benchmarking of QuantizedLinear layers
-    benchmark_results = benchmark_quantized_layers()
+    # benchmark_results = benchmark_quantized_layers()
     
-    # Uncomment to run the full quantization pipeline
-    # main()
+    main()
 
     # def get_quantized_model_size(model):
     #     total_bytes = 0

@@ -126,7 +126,7 @@ class QuantizedLinear(nn.Module):
             
         self.register_buffer('scale', torch.zeros(scale_zp_shape, dtype=self.dtype))
         self.register_buffer('zero_point', torch.zeros(scale_zp_shape, dtype=self.dtype))
-        print(self.qweight.squeeze(-1).shape, self.scale.shape, self.zero_point.squeeze(-1).shape)
+        
         if bias:
             self.register_buffer('bias', torch.zeros(out_features, dtype=self.dtype))
         else:

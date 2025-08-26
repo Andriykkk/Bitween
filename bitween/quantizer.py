@@ -35,7 +35,7 @@ class Bitween:
     A simple quantizer class that takes a model and quantization configuration.
     """
     def __init__(self, model, tokenizer=None, bits=8, group_size=32, iters=1, lr=0.005, enable_minmax_tuning=True, seqlen=2048, 
-                 cache_to_disk=False, max_memory_mb=512):
+                 cache_to_disk=False, max_memory_mb=512, ignore_layers=None, batch_size=32):
         self.model = model
         self.tokenizer = tokenizer
         self.bits = bits
@@ -51,15 +51,15 @@ class Bitween:
         self.cache_to_disk = cache_to_disk  # Save cache tensors to filesystem
         self.max_memory_mb = max_memory_mb  # Maximum memory for caching (MB)
         self.cache_dir = None  # Will be set when needed
+        
+        # Layers to ignore during quantization
+        self.ignore_layers = set(ignore_layers) if ignore_layers else set()
+        self.batch_size = batch_size
 
         assert group_size > 0, "Group size must be greater than 0."
 
-        print(f"Bitween initialized with bits={bits}, group_size={group_size}")
-        if cache_to_disk:
-            print(f"Disk caching enabled with max memory: {max_memory_mb}MB")
-
     def quantize(self, evaluate_perplexity=False, num_samples=100, rtn=False, trainable=False, calib_dataset="pile-10k", nsamples=None, 
-                 cache_to_disk=None, max_memory_mb=None, **eval_kwargs):
+                 cache_to_disk=None, max_memory_mb=None, ignore_layers=None, batch_size=None, **eval_kwargs):
         """
         Quantizes the linear layers of the model.
 
@@ -72,11 +72,21 @@ class Bitween:
             nsamples (int): Number of calibration samples to use for training. If None, uses all available samples.
             cache_to_disk (bool): Override instance setting for disk caching. If None, uses instance setting.
             max_memory_mb (int): Override instance setting for memory limit. If None, uses instance setting.
+            ignore_layers (list): List of layer names to skip during quantization (e.g., ['lm_head', 'embed_tokens']).
+            batch_size (int): Override batch size for training mini-batches. If None, uses instance setting.
             **eval_kwargs: Additional arguments for the evaluation functions.
         
         Returns:
             Quantized model using QuantizedLinear layers with optimized parameters.
         """
+        # Handle override parameters - temporarily update instance variables
+        original_ignore_layers = self.ignore_layers
+        
+        if ignore_layers is not None:
+            self.ignore_layers = set(ignore_layers)
+        if batch_size is not None:
+            self.batch_size = batch_size
+            
         original_ppl = None
         if evaluate_perplexity and self.tokenizer is not None and num_samples > 0:
             if self.tokenizer is None:
@@ -93,6 +103,10 @@ class Bitween:
             # Find and replace all linear layers
             for name, module in quantized_model.named_modules():
                 if isinstance(module, nn.Linear):
+                    if name in self.ignore_layers:
+                        print(f"  - Skipping ignored layer: {name}")
+                        continue
+                        
                     print(f"  - Quantizing layer: {name}")
                     
                     q_module = QuantizedLinear.from_float(
@@ -112,7 +126,7 @@ class Bitween:
             print(f"Cache mode: {'disk' if self.cache_to_disk else 'memory'} (max: {self.max_memory_mb}MB)")
             # Trainable quantization: Use calibration data to optimize quantization parameters
             print(f"Using trainable quantization with {calib_dataset} dataset")
-            quantized_model = self._trainable_quantize(calib_dataset, nsamples)
+            quantized_model = self._trainable_quantize(calib_dataset, nsamples, self.batch_size)
                 
         print("--- Quantization complete ---")
 
@@ -125,9 +139,11 @@ class Bitween:
             
             print_report(original_ppl, quantized_ppl, kl_div)
 
+        # Restore original settings
+        self.ignore_layers = original_ignore_layers
         return quantized_model
 
-    def _trainable_quantize(self, calib_dataset: str, nsamples: Optional[int]):
+    def _trainable_quantize(self, calib_dataset: str, nsamples: Optional[int], batch_size: int):
         """
         Performs trainable quantization using calibration dataset.
         
@@ -185,7 +201,7 @@ class Bitween:
                     continue
                 
                 # Quantize the block or individual layer
-                result = self._quantize_block(block_or_layer, block_inputs)
+                result = self._quantize_block(block_or_layer, block_inputs, block_name, batch_size)
                 
                 # If it's a single layer, we need to replace it in the model
                 if isinstance(block_or_layer, nn.Linear) and result is not None:
@@ -216,9 +232,9 @@ class Bitween:
         all_linear_layers = set()
         layers_in_blocks = set()
         
-        # Collect all linear layers first
+        # Collect all linear layers first, excluding ignored layers
         for name, module in model.named_modules():
-            if isinstance(module, nn.Linear):
+            if isinstance(module, nn.Linear) and name not in self.ignore_layers:
                 all_linear_layers.add(name)
         
         # Common patterns for transformer blocks
@@ -247,9 +263,30 @@ class Bitween:
                                 for sub_name, sub_module in block_module.named_modules():
                                     if isinstance(sub_module, nn.Linear):
                                         full_layer_name = f"{block_path}.{sub_name}" if sub_name else block_path
-                                        layers_in_blocks.add(full_layer_name)
+                                        if full_layer_name not in self.ignore_layers:
+                                            layers_in_blocks.add(full_layer_name)
                             break
                     break
+        
+        # Filter out blocks that contain only ignored layers
+        filtered_block_names = []
+        for block_name in block_names:
+            block_module = self._get_module(model, block_name)
+            has_quantizable_layers = False
+            
+            for sub_name, sub_module in block_module.named_modules():
+                if isinstance(sub_module, nn.Linear):
+                    full_layer_name = f"{block_name}.{sub_name}" if sub_name else block_name
+                    if full_layer_name not in self.ignore_layers:
+                        has_quantizable_layers = True
+                        break
+            
+            if has_quantizable_layers:
+                filtered_block_names.append(block_name)
+            else:
+                print(f"Skipping block '{block_name}' - all linear layers are in ignore list")
+        
+        block_names = filtered_block_names
         
         # Sort block names to ensure consistent processing order
         block_names.sort()
@@ -264,6 +301,12 @@ class Bitween:
             for layer_name in standalone_layers:
                 print(f"  - {layer_name}")
                 block_names.append(layer_name)
+        
+        # Print ignored layers summary
+        if self.ignore_layers:
+            print(f"Ignoring {len(self.ignore_layers)} layers from quantization:")
+            for ignored_layer in sorted(self.ignore_layers):
+                print(f"  - {ignored_layer}")
         
         if block_names:
             transformer_blocks = [name for name in block_names if name not in standalone_layers]
@@ -412,7 +455,6 @@ class Bitween:
                         'chunk_files': chunk_files,
                         'num_chunks': len(chunk_files)
                     }
-                    print(f"Block {block_name}: {len(chunk_files)} chunks")
                 else:
                     print(f"Warning: No cache chunks found for block {block_name}")
             
@@ -436,7 +478,6 @@ class Bitween:
         
         # Optional: Log chunk info
         chunk_size_mb = sum(t.numel() * t.element_size() for t in tensors) / (1024 * 1024)
-        print(f"Saved chunk {chunk_id} for {block_name}: {len(tensors)} tensors ({chunk_size_mb:.1f}MB)")
     
     def _load_block_cache(self, cache_path_or_data, block_name: str) -> List[torch.Tensor]:
         """Load cached tensors for a specific block from chunk files."""
@@ -460,23 +501,7 @@ class Bitween:
                             all_tensors.extend(chunk_tensors)
                         else:
                             print(f"Warning: Chunk file not found: {chunk_file}")
-                    
-                    print(f"Loaded {len(all_tensors)} cached tensors for {block_name} from {len(chunk_files)} chunks")
                     return all_tensors
-                    
-                elif isinstance(chunk_info, str):
-                    # Legacy single file format (for backward compatibility)
-                    cache_file = chunk_info
-                    if os.path.exists(cache_file):
-                        gc.collect()
-                        torch.cuda.empty_cache() if torch.cuda.is_available() else None
-                        
-                        tensors = torch.load(cache_file, map_location='cpu')
-                        print(f"Loaded {len(tensors)} cached tensors for {block_name}")
-                        return tensors
-                    else:
-                        print(f"Warning: Cache file not found: {cache_file}")
-                        return []
                 else:
                     print(f"Warning: Invalid cache format for block {block_name}")
                     return []
@@ -504,19 +529,6 @@ class Bitween:
                                 deleted_count += 1
                             except Exception as e:
                                 print(f"Warning: Failed to delete chunk file {chunk_file}: {e}")
-                    
-                    print(f"Deleted {deleted_count}/{len(chunk_files)} chunk files for {block_name}")
-                    
-                elif isinstance(chunk_info, str):
-                    # Legacy single file format
-                    cache_file = chunk_info
-                    if os.path.exists(cache_file):
-                        try:
-                            os.remove(cache_file)
-                            print(f"Deleted cache file for {block_name}")
-                        except Exception as e:
-                            print(f"Warning: Failed to delete cache file {cache_file}: {e}")
-                
                 # Remove from dict to prevent re-access
                 del cache_data[block_name]
         else:
@@ -535,7 +547,7 @@ class Bitween:
             print(f"Cleaned up cache directory: {self.cache_dir}")
             self.cache_dir = None
     
-    def _quantize_block(self, block_or_layer, block_inputs: List[torch.Tensor], batch_size: int = 32):
+    def _quantize_block(self, block_or_layer, block_inputs: List[torch.Tensor], block_name: str, batch_size: int):
         """
         Memory-efficient quantization of a single block or individual layer.
         
@@ -546,7 +558,7 @@ class Bitween:
         Args:
             block_or_layer: Either a transformer block module or a single linear layer
             block_inputs: List of ALL input tensors cached for this block/layer
-            batch_size: Mini-batch size for processing samples
+            block_name: Name of the block/layer for logging and ignore checking
         """
         if not block_inputs:
             print("Warning: No cached inputs for this block, skipping...")
@@ -558,10 +570,6 @@ class Bitween:
         is_single_layer = isinstance(block_or_layer, nn.Linear)
         item_type = "linear layer" if is_single_layer else "block"
         
-        print(f"Optimizing {item_type} with {num_samples} cached samples")
-        
-        # Step 1: Cache original outputs using ALL samples
-        print(f"Caching original {item_type} outputs for all samples...")
         original_outputs = []
         block_or_layer.eval()
         
@@ -581,10 +589,13 @@ class Bitween:
                     print(f"Warning: Failed to cache output: {e}")
                     continue
         
-        print(f"Cached {len(original_outputs)} original outputs")
-        
         # Step 2: Handle wrapping based on type
         if is_single_layer:
+            # Check if this single layer should be ignored
+            if block_name in self.ignore_layers:
+                print(f"Skipping ignored standalone layer: {block_name}")
+                return  # Skip this layer entirely
+                
             # For individual linear layers, create a temporary wrapper
             wrapper = WrapperLinear(
                 block_or_layer,
@@ -604,7 +615,9 @@ class Bitween:
                 enable_round_tuning=True,
                 bits=self.bits,
                 group_size=self.group_size,
-                device=next(block_or_layer.parameters()).device
+                device=next(block_or_layer.parameters()).device,
+                ignore_layers=self.ignore_layers,
+                block_prefix=block_name
             )
             
             # Collect wrappers
@@ -612,8 +625,6 @@ class Bitween:
             for name, module in block_or_layer.named_modules():
                 if isinstance(module, WrapperLinear):
                     wrappers.append(module)
-        
-        print(f"Wrapped {len(quantized_names)} linear layers")
         
         if not quantized_names:
             print(f"No linear layers found in this {item_type}")
@@ -729,14 +740,9 @@ class Bitween:
             wrapper_inst.apply_best_params()
         
         if is_single_layer:
-            # For single layer, convert wrapper to QuantizedLinear and replace
             quantized_layer = wrapper.to_quantized_linear()
-            # Note: The parent module replacement needs to be handled by the caller
-            print(f"Converted single layer to QuantizedLinear")
         else:
-            # For blocks, unwrap all layers within the block
             unwrapper_block(block_or_layer, apply_quantization=True)
-            print(f"Converted {len(quantized_names)} layers to QuantizedLinear")
         
         # Step 6: Clean up memory aggressively
         del original_outputs, learnable_params, wrappers, optimizer, scheduler

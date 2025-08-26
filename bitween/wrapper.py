@@ -236,18 +236,38 @@ class WrapperLinear(nn.Module):
             return q_layer
 
 
-def wrapper_block(block, enable_minmax_tuning=True, enable_round_tuning=True, bits=8, group_size=32, device="cpu"):
+def wrapper_block(block, enable_minmax_tuning=True, enable_round_tuning=True, bits=8, group_size=32, device="cpu", 
+                  ignore_layers=None, block_prefix=""):
     """
     Wrap all linear layers in a block with WrapperLinear for training.
+    
+    Args:
+        block: The block containing linear layers to wrap
+        enable_minmax_tuning: Enable min/max scale tuning
+        enable_round_tuning: Enable rounding value tuning  
+        bits: Number of quantization bits
+        group_size: Group size for quantization
+        device: Device to place tensors on
+        ignore_layers: Set of layer names to skip during wrapping
+        block_prefix: Prefix to add to layer names when checking ignore_layers
     
     Returns:
         tuple: (quantized_layer_names, unquantized_layer_names)
     """
     quantized_layer_names = []
     unquantized_layer_names = []
+    ignore_layers = ignore_layers or set()
     
     for name, module in block.named_modules():
         if isinstance(module, nn.Linear):
+            # Construct full layer name for ignore check
+            full_layer_name = f"{block_prefix}.{name}" if block_prefix and name else (block_prefix or name)
+            
+            if full_layer_name in ignore_layers:
+                print(f"  Skipping ignored layer: {full_layer_name}")
+                unquantized_layer_names.append(name)
+                continue
+                
             # Create wrapper
             wrapper = WrapperLinear(
                 module,
@@ -278,11 +298,9 @@ def unwrapper_block(block, apply_quantization=True):
     for name, module in list(block.named_modules()):
         if isinstance(module, WrapperLinear):
             if apply_quantization:
-                # Convert to quantized layer
                 quantized_layer = module.to_quantized_linear()
                 _set_module(block, name, quantized_layer)
             else:
-                # Restore original layer
                 _set_module(block, name, module.orig_layer)
 
 
