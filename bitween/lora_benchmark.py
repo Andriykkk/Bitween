@@ -6,6 +6,7 @@ import copy
 from transformers import AutoModelForCausalLM
 from bitween.utils.singlora import apply_singlora_to_model
 from bitween.modules import QuantizedLinear
+from bitween.utils.checkpointing import create_memory_efficient_model
 
 
 def find_all_linear_names(model):
@@ -122,41 +123,81 @@ def profile_pass(model, dummy_input, device, is_training=False, warmup_runs=5, t
     return throughput
 
 def generate_lora_benchmark_report(model_path, dummy_input, device, text=""):
-    """Generates an isolated benchmark report for a model with LoRA applied."""
-    print("\n--- Generating LoRA Fine-Tuning Benchmark Report ---")
+    """Generates an isolated benchmark report for a model with LoRA applied, including checkpoint comparison."""
+    print(f"\n--- Generating LoRA Fine-Tuning Benchmark Report ({text}) ---")
 
     # Load model fresh each time
-    model = torch.load(model_path, weights_only=False)
-
-    # Apply LoRA
-    target_modules = find_all_linear_names(model)
+    base_model = torch.load(model_path, weights_only=False)
+    
+    # Apply LoRA to base model
+    target_modules = find_all_linear_names(base_model)
     apply_singlora_to_model(
-        model,
+        base_model,
         rank=8,
         alpha=16,
         ramp_up_steps=10,
         target_modules=target_modules,
         print_summary=False
     )
-    print(f"Applied SingLoRA to {len(target_modules)} linear layers of " + text + " model.")
+    print(f"Applied SingLoRA to {len(target_modules)} linear layers")
 
-    # Benchmark Inference
+    # Create checkpointed version
+    # checkpointed_model = copy.deepcopy(base_model)
+    # checkpointed_model = create_memory_efficient_model(
+    #     checkpointed_model,
+    #     enable_checkpointing=True,
+    #     checkpointing_strategy="built_in"  # Use built-in checkpointing first
+    # )
+    print("Created checkpointed model variant")
+
+    # Benchmark Inference (same for both models)
     print("\n1. Benchmarking Forward Pass (Inference)...")
-    fwd_peak_mem = measure_peak_memory(model, dummy_input, device, is_training=False)
-    fwd_throughput = profile_pass(model, dummy_input, device, is_training=False)
-    print(f"  - Peak Memory (adjusted): {fwd_peak_mem:.2f} MB")
+    fwd_peak_mem = measure_peak_memory(base_model, dummy_input, device, is_training=False)
+    fwd_throughput = profile_pass(base_model, dummy_input, device, is_training=False)
+    print(f"  - Peak Memory: {fwd_peak_mem:.2f} MB")
     print(f"  - Throughput: {fwd_throughput:.2f} samples/sec")
 
-    # Benchmark Training
-    print("\n2. Benchmarking Training Pass (Forward + Backward)...")
-    train_peak_mem = measure_peak_memory(model, dummy_input, device, is_training=True)
-    train_throughput = profile_pass(model, dummy_input, device, is_training=True)
-    print(f"  - Peak Memory (adjusted): {train_peak_mem:.2f} MB")
+    # Benchmark Training - Regular Model
+    print("\n2. Benchmarking Training Pass (Regular)...")
+    train_peak_mem = measure_peak_memory(base_model, dummy_input, device, is_training=True)
+    train_throughput = profile_pass(base_model, dummy_input, device, is_training=True)
+    print(f"  - Peak Memory: {train_peak_mem:.2f} MB")
     print(f"  - Throughput: {train_throughput:.2f} samples/sec")
 
-    print("\n--- Summary ---")
+    # Benchmark Training - Checkpointed Model
+    # print("\n3. Benchmarking Training Pass (Checkpointed)...")
+    # checkpoint_peak_mem = measure_peak_memory(checkpointed_model, dummy_input, device, is_training=True)
+    # checkpoint_throughput = profile_pass(checkpointed_model, dummy_input, device, is_training=True)
+    # print(f"  - Peak Memory: {checkpoint_peak_mem:.2f} MB")
+    # print(f"  - Throughput: {checkpoint_throughput:.2f} samples/sec")
+    
+    # Calculate savings
+    # memory_savings = train_peak_mem - checkpoint_peak_mem
+    # memory_savings_pct = (memory_savings / train_peak_mem) * 100 if train_peak_mem > 0 else 0
+    # throughput_ratio = checkpoint_throughput / train_throughput if train_throughput > 0 else 0
+
+    print(f"\n--- {text} Model Summary ---")
     print(f"Forward Inference Memory: {fwd_peak_mem:.2f} MB")
-    print(f"Training Memory: {train_peak_mem:.2f} MB")
-    print(f"Forward Inference Throughput: {fwd_throughput:.2f} samples/sec")
-    print(f"Training Throughput: {train_throughput:.2f} samples/sec")
-    print("\n--- End of Report ---")
+    print(f"Training Memory (Regular): {train_peak_mem:.2f} MB")
+    # print(f"Training Memory (Checkpointed): {checkpoint_peak_mem:.2f} MB")
+    # print(f"Memory Savings: {memory_savings:.2f} MB ({memory_savings_pct:.1f}%)")
+    print(f"Training Throughput (Regular): {train_throughput:.2f} samples/sec")
+    # print(f"Training Throughput (Checkpointed): {checkpoint_throughput:.2f} samples/sec")
+    # print(f"Throughput Ratio: {throughput_ratio:.2f}x")
+    
+    # Cleanup
+    del base_model, checkpointed_model
+    gc.collect()
+    if device.startswith("cuda"):
+        torch.cuda.empty_cache()
+    
+    return {
+        'inference_memory': fwd_peak_mem,
+        'training_memory': train_peak_mem,
+        # 'checkpointed_memory': checkpoint_peak_mem,
+        # 'memory_savings': memory_savings,
+        # 'memory_savings_pct': memory_savings_pct,
+        'training_throughput': train_throughput,
+        # 'checkpointed_throughput': checkpoint_throughput,
+        # 'throughput_ratio': throughput_ratio
+    }

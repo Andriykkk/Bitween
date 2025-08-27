@@ -359,6 +359,13 @@ def generate_benchmark_report(fp32_model_path, quantized_model_path, input_tenso
     with torch.no_grad():
         fp32_output = fp32_model(input_tensor)
         quant_output = quantized_model(input_tensor)
+    
+    # Extract logits if outputs are objects with .logits attribute
+    if hasattr(fp32_output, 'logits'):
+        fp32_output = fp32_output.logits
+    if hasattr(quant_output, 'logits'):
+        quant_output = quant_output.logits
+        
     max_error = (fp32_output - quant_output).abs().max()
     print(f"Max Error between FP32 and Quantized outputs: {max_error:.4f}")
     del fp32_model, quantized_model

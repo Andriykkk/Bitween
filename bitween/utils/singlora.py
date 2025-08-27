@@ -110,9 +110,27 @@ class SingLoRALayer(nn.Module):
         # This computes (ΔW * x)
         update_weight = self._get_update_weight()
         
+        # Ensure dtype consistency between input and weight
+        if x.dtype != update_weight.dtype:
+            if x.dtype == torch.float32 and update_weight.dtype == torch.float16:
+                update_weight = update_weight.to(torch.float32)
+            elif x.dtype == torch.float16 and update_weight.dtype == torch.float32:
+                x = x.to(torch.float32)  # Promote to higher precision for computation
+        
         lora_output = F.linear(x, update_weight)  # Bias is already in original_output
 
-        # 3. Sum the outputs for the final result
+        # 3. Ensure dtype consistency for addition
+        if original_output.dtype != lora_output.dtype:
+            # Convert to the higher precision dtype
+            if original_output.dtype == torch.float32:
+                lora_output = lora_output.to(torch.float32)
+            elif lora_output.dtype == torch.float32:
+                original_output = original_output.to(torch.float32)
+            else:
+                # Both are same lower precision, keep as is
+                pass
+
+        # 4. Sum the outputs for the final result
         return original_output + lora_output
 
     def __repr__(self):

@@ -5,7 +5,7 @@ from .modules import QuantizedLinear
 from .wrapper import WrapperLinear, wrapper_block, unwrapper_block
 from .calib_dataset import get_calibration_dataset
 from .utils.sign_sgd import SignSGD, CombinedScheduler
-from .evaluation import calculate_perplexity, calculate_kl_divergence, print_report
+from .utils.evaluation import calculate_perplexity, calculate_kl_divergence, print_report
 import copy
 import gc
 import os

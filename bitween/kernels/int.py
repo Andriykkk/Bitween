@@ -157,8 +157,16 @@ def quantized_linear_kernel(
 
         # 11. Dequantize
         deq_w_block = (q_vals - zp.to(tl.float32)) * scale
-        # deq_w_block = deq_w_block.to(tl.float16)
-
+        
+        # 12. Ensure dtype consistency for matrix multiplication
+        # Convert both operands to the same dtype to avoid Triton compilation errors
+        x_dtype = x_block.dtype
+        if x_dtype != deq_w_block.dtype:
+            if x_dtype == tl.float16:
+                deq_w_block = deq_w_block.to(tl.float16)
+            else:
+                x_block = x_block.to(tl.float32)
+        
         # 12. Matrix multiplication
         acc += tl.dot(x_block, deq_w_block)
 
