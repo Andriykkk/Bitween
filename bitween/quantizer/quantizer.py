@@ -1,34 +1,17 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .modules import QuantizedLinear
-from .wrapper import WrapperLinear, wrapper_block, unwrapper_block
-from .calib_dataset import get_calibration_dataset
-from .utils.sign_sgd import SignSGD, CombinedScheduler
-from .utils.evaluation import calculate_perplexity, calculate_kl_divergence, print_report
+from ..modules import QuantizedLinear
+from ..wrapper import WrapperLinear, wrapper_block, unwrapper_block
+from ..calib_dataset import get_calibration_dataset
+from ..utils.sign_sgd import SignSGD, CombinedScheduler
+from ..utils.evaluation import calculate_perplexity, calculate_kl_divergence, print_report
 import copy
 import gc
-import os
-import tempfile
-import shutil
 from tqdm import tqdm
 from typing import Dict, List, Optional
-
-def _set_module(model, submodule_key, module):
-    """
-    Helper function to replace a module within a model hierarchy.
-    
-    Args:
-        model (nn.Module): The main model.
-        submodule_key (str): The dot-separated key to the submodule (e.g., "layer1.0.conv1").
-        module (nn.Module): The new module to replace the old one.
-    """
-    tokens = submodule_key.split('.')
-    sub_tokens = tokens[:-1]
-    cur_mod = model
-    for s in sub_tokens:
-        cur_mod = getattr(cur_mod, s)
-    setattr(cur_mod, tokens[-1], module)
+from .func import _set_module
+from .utils.cache_manager import CacheManager
 
 class Bitween:
     """
@@ -50,7 +33,6 @@ class Bitween:
         # Memory management parameters
         self.cache_to_disk = cache_to_disk  # Save cache tensors to filesystem
         self.max_memory_mb = max_memory_mb  # Maximum memory for caching (MB)
-        self.cache_dir = None  # Will be set when needed
         
         # Layers to ignore during quantization
         self.ignore_layers = set(ignore_layers) if ignore_layers else set()
@@ -185,7 +167,10 @@ class Bitween:
         print(f"Using {actual_nsamples} calibration samples for training")
         
         # Step 3: Cache intermediate data (inputs to each block) - ONCE for all blocks
-        cached_inputs = self._cache_inter_data(quantized_model, calib_data, block_names, actual_nsamples)
+        cached_inputs = CacheManager.cache_block_inputs(
+            quantized_model, calib_data, block_names, actual_nsamples,
+            cache_to_disk=self.cache_to_disk, max_memory_mb=self.max_memory_mb
+        )
         
         # Step 4: Quantize each block/layer using cached inputs
         try:
@@ -194,7 +179,7 @@ class Bitween:
                 block_or_layer = self._get_module(quantized_model, block_name)
                 
                 # Load cached inputs for this block/layer
-                block_inputs = self._load_block_cache(cached_inputs, block_name)
+                block_inputs = CacheManager.load_block_cache(cached_inputs, block_name, cache_to_disk=self.cache_to_disk)
                 
                 if not block_inputs:
                     print(f"Warning: No cached inputs found for {block_name}, skipping...")
@@ -209,11 +194,11 @@ class Bitween:
                     print(f"Replaced {block_name} with quantized version")
                 
                 # Clean up cache for this block to free memory
-                self._cleanup_block_cache(cached_inputs, block_name)
+                CacheManager.cleanup_block_cache(cached_inputs, block_name, cache_to_disk=self.cache_to_disk)
         
         finally:
             # Always clean up all cache files when done
-            self._cleanup_all_cache()
+            CacheManager.cleanup_all_cache(cached_inputs, cache_to_disk=self.cache_to_disk)
         
         return quantized_model
     
@@ -316,236 +301,6 @@ class Bitween:
         
         return block_names
     
-    def _cache_inter_data(self, model, calib_data, block_names: List[str], nsamples: int) -> Dict[str, str]:
-        """
-        Cache intermediate activations with memory-efficient disk storage.
-        
-        Args:
-            model: The model to analyze
-            calib_data: Calibration dataset
-            block_names: List of block names to cache inputs for
-            nsamples: Number of samples to process
-            
-        Returns:
-            Dictionary mapping block names to cache file paths or memory cache keys
-        """
-        print("Caching intermediate activations...")
-        
-        # Setup cache storage
-        if self.cache_to_disk:
-            # Create temporary directory for cache files
-            self.cache_dir = tempfile.mkdtemp(prefix="bitween_cache_")
-            print(f"Using disk cache directory: {self.cache_dir}")
-            cached_paths = {}
-        else:
-            # Use in-memory storage
-            cached_inputs = {name: [] for name in block_names}
-        
-        # Memory tracking
-        current_memory_mb = 0
-        max_memory_bytes = self.max_memory_mb * 1024 * 1024
-        
-        # Initialize block-specific storage and chunk tracking
-        block_caches = {name: [] for name in block_names}
-        block_chunk_counters = {name: 0 for name in block_names}  # Track chunks per block
-        
-        def make_hook(block_name):
-            def hook_fn(module, input, output):
-                nonlocal current_memory_mb
-                
-                # Extract input tensor
-                if isinstance(input, tuple):
-                    tensor = input[0].detach().cpu()
-                else:
-                    tensor = input.detach().cpu()
-                
-                # Calculate tensor size in bytes
-                tensor_size = tensor.numel() * tensor.element_size()
-                
-                if self.cache_to_disk:
-                    # Check memory limit before adding new tensor
-                    if current_memory_mb + tensor_size > max_memory_bytes:
-                        # Flush ALL blocks to disk and clear memory
-                        for b_name, tensors in block_caches.items():
-                            if tensors:  # Only flush non-empty caches
-                                self._flush_block_cache_to_disk(b_name, tensors, block_chunk_counters[b_name])
-                                block_chunk_counters[b_name] += 1
-                        
-                        # Clear all block caches and reset memory counter
-                        for b_name in block_caches:
-                            block_caches[b_name] = []
-                        current_memory_mb = 0
-                        
-                        # Force garbage collection
-                        gc.collect()
-                        torch.cuda.empty_cache() if torch.cuda.is_available() else None
-                        
-                        print(f"Flushed cache chunks to disk, freed memory (limit: {self.max_memory_mb}MB)")
-                    
-                    block_caches[block_name].append(tensor)
-                    current_memory_mb += tensor_size
-                else:
-                    # Direct memory storage
-                    cached_inputs[block_name].append(tensor)
-                    
-            return hook_fn
-        
-        # Register hooks for each block
-        hooks = []
-        for block_name in block_names:
-            block = self._get_module(model, block_name)
-            hook = block.register_forward_hook(make_hook(block_name))
-            hooks.append(hook)
-        
-        # Run calibration data through model to collect inputs
-        model.eval()
-        with torch.no_grad():
-            dataloader = calib_data.get_dataloader(batch_size=1)
-            
-            for i, batch in enumerate(tqdm(dataloader, desc="Caching block inputs", total=nsamples)):
-                if i >= nsamples:
-                    break
-                    
-                input_ids = batch['input_ids'].to(model.device)
-                
-                # Forward pass to trigger hooks
-                try:
-                    _ = model(input_ids)
-                except Exception as e:
-                    print(f"Warning: Forward pass failed for batch {i}: {e}")
-                    continue
-                
-                # Periodic memory cleanup during caching
-                if self.cache_to_disk and (i + 1) % 50 == 0:
-                    torch.cuda.empty_cache() if torch.cuda.is_available() else None
-                    gc.collect()
-        
-        # Remove hooks
-        for hook in hooks:
-            hook.remove()
-        
-        # Finalize caching
-        if self.cache_to_disk:
-            # Flush any remaining data to disk
-            for block_name in block_names:
-                if block_caches[block_name]:
-                    self._flush_block_cache_to_disk(block_name, block_caches[block_name], block_chunk_counters[block_name])
-                    block_chunk_counters[block_name] += 1
-            
-            # Clear all memory caches
-            block_caches.clear()
-            gc.collect()
-            torch.cuda.empty_cache() if torch.cuda.is_available() else None
-            
-            # Return chunk info for each block
-            cached_paths = {}
-            total_size_mb = 0
-            
-            for block_name in block_names:
-                # Collect all chunk files for this block
-                chunk_files = []
-                for chunk_id in range(block_chunk_counters[block_name]):
-                    chunk_file = os.path.join(self.cache_dir, f"{block_name.replace('.', '_')}_chunk_{chunk_id}.pt")
-                    if os.path.exists(chunk_file):
-                        chunk_files.append(chunk_file)
-                        total_size_mb += os.path.getsize(chunk_file) / (1024 * 1024)
-                
-                if chunk_files:
-                    cached_paths[block_name] = {
-                        'chunk_files': chunk_files,
-                        'num_chunks': len(chunk_files)
-                    }
-                else:
-                    print(f"Warning: No cache chunks found for block {block_name}")
-            
-            print(f"Cached {len(block_names)} blocks to disk ({total_size_mb:.1f}MB total in chunks)")
-            print(f"Memory freed, using chunked disk storage")
-            return cached_paths
-        else:
-            print(f"Cached inputs for {len(block_names)} blocks in memory")
-            return cached_inputs
-    
-    def _flush_block_cache_to_disk(self, block_name: str, tensors: List[torch.Tensor], chunk_id: int):
-        """Save a block's cached tensors to disk as a separate chunk file."""
-        if not tensors:
-            return
-            
-        # Create unique chunk file name
-        chunk_file = os.path.join(self.cache_dir, f"{block_name.replace('.', '_')}_chunk_{chunk_id}.pt")
-        
-        # Save directly to chunk file (no appending needed)
-        torch.save(tensors, chunk_file)
-        
-        # Optional: Log chunk info
-        chunk_size_mb = sum(t.numel() * t.element_size() for t in tensors) / (1024 * 1024)
-    
-    def _load_block_cache(self, cache_path_or_data, block_name: str) -> List[torch.Tensor]:
-        """Load cached tensors for a specific block from chunk files."""
-        if self.cache_to_disk:
-            if isinstance(cache_path_or_data, dict) and block_name in cache_path_or_data:
-                chunk_info = cache_path_or_data[block_name]
-                
-                if isinstance(chunk_info, dict) and 'chunk_files' in chunk_info:
-                    # New chunked format
-                    chunk_files = chunk_info['chunk_files']
-                    
-                    # Force garbage collection before loading
-                    gc.collect()
-                    torch.cuda.empty_cache() if torch.cuda.is_available() else None
-                    
-                    # Load all chunks and combine
-                    all_tensors = []
-                    for chunk_file in chunk_files:
-                        if os.path.exists(chunk_file):
-                            chunk_tensors = torch.load(chunk_file, map_location='cpu')
-                            all_tensors.extend(chunk_tensors)
-                        else:
-                            print(f"Warning: Chunk file not found: {chunk_file}")
-                    return all_tensors
-                else:
-                    print(f"Warning: Invalid cache format for block {block_name}")
-                    return []
-            else:
-                return []
-        else:
-            # Direct memory access
-            return cache_path_or_data.get(block_name, [])
-    
-    def _cleanup_block_cache(self, cache_data, block_name: str):
-        """Clean up cache for a specific block (handles both chunked and single file formats)."""
-        if self.cache_to_disk:
-            if isinstance(cache_data, dict) and block_name in cache_data:
-                chunk_info = cache_data[block_name]
-                
-                if isinstance(chunk_info, dict) and 'chunk_files' in chunk_info:
-                    # New chunked format - delete all chunk files
-                    chunk_files = chunk_info['chunk_files']
-                    deleted_count = 0
-                    
-                    for chunk_file in chunk_files:
-                        if os.path.exists(chunk_file):
-                            try:
-                                os.remove(chunk_file)
-                                deleted_count += 1
-                            except Exception as e:
-                                print(f"Warning: Failed to delete chunk file {chunk_file}: {e}")
-                # Remove from dict to prevent re-access
-                del cache_data[block_name]
-        else:
-            # Clear from memory
-            if block_name in cache_data:
-                del cache_data[block_name]
-        
-        # Aggressive garbage collection
-        gc.collect()
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
-    
-    def _cleanup_all_cache(self):
-        """Clean up all cache files and directories."""
-        if self.cache_to_disk and self.cache_dir and os.path.exists(self.cache_dir):
-            shutil.rmtree(self.cache_dir)
-            print(f"Cleaned up cache directory: {self.cache_dir}")
-            self.cache_dir = None
     
     def _quantize_block(self, block_or_layer, block_inputs: List[torch.Tensor], block_name: str, batch_size: int):
         """
@@ -757,9 +512,5 @@ class Bitween:
     
     def _get_module(self, model, module_name: str):
         """Get a module by its dotted name."""
-        tokens = module_name.split('.')
-        cur_mod = model
-        for token in tokens:
-            cur_mod = getattr(cur_mod, token)
-        return cur_mod
+        return CacheManager._get_module(model, module_name)
 

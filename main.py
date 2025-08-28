@@ -9,7 +9,6 @@ import time
 from bitween.functional import quantize_rtn, dequantize_rtn
 import matplotlib.pyplot as plt
 import numpy as np
-from bitween.utils.checkpointing import create_memory_efficient_model
 
 def main():
     """
@@ -37,19 +36,19 @@ def main():
     quantizer = Bitween(model, tokenizer=tokenizer, bits=4, group_size=128)
 
     # # --- 3. Perform quantization and evaluation ---
-    # quantized_model = quantizer.quantize(
-    #     evaluate_perplexity=True,
-    #     # calculate_parameters_memory=True,
-    #     num_samples=5,
-    #     rtn=True,
-    #     # trainable=True,
-    #     nsamples=12,
-    #     batch_size=3,
-    #     seqlen=256,
-    #     cache_to_disk=True,
-    #     max_memory_mb=2048,
-    #     ignore_layers=['lm_head', 'embed_tokens']
-    # )
+    quantized_model = quantizer.quantize(
+        evaluate_perplexity=True,
+        # calculate_parameters_memory=True,
+        num_samples=5,
+        # rtn=True,
+        trainable=True,
+        nsamples=12,
+        batch_size=3,
+        seqlen=256,
+        cache_to_disk=True,
+        max_memory_mb=2048,
+        ignore_layers=['lm_head', 'embed_tokens']
+    )
 
     # --- 4. Save models and run benchmark ---
     print("\n--- Preparing for Benchmark ---")
@@ -61,14 +60,14 @@ def main():
     print(f"Saving FP32 model to {fp32_path}...")
     torch.save(model, fp32_path)
     
-    # print(f"Saving quantized model to {quantized_path}...")
-    # torch.save(quantized_model, quantized_path)
+    print(f"Saving quantized model to {quantized_path}...")
+    torch.save(quantized_model, quantized_path)
 
     # Create a dummy input for benchmarking
     dummy_input = torch.randint(0, model.config.vocab_size, (1, 128), device=device)
 
-    # import copy
-    # base_model = torch.load(fp32_path, weights_only=False)
+    import copy
+    base_model = torch.load(fp32_path, weights_only=False)
     # checkpointed_model = copy.deepcopy(base_model)
     # checkpointed_model = create_memory_efficient_model(
     #     checkpointed_model,
@@ -77,7 +76,7 @@ def main():
     # )
 
     # Run the benchmark report
-    # generate_benchmark_report(fp32_path, quantized_path, dummy_input, device)
+    generate_benchmark_report(fp32_path, quantized_path, dummy_input, device)
 
     # Run the LoRA benchmark report
     from bitween.lora_benchmark import generate_lora_benchmark_report
