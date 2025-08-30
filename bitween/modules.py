@@ -19,12 +19,20 @@ class QuantizedLinearFunction(torch.autograd.Function):
         # The fast, non-differentiable forward pass using the Triton kernel
         device = x.device
         original_shape = x.shape
-        x_reshaped = x.reshape(-1, original_shape[-1])
+        
+        # Use 16-bit dtype based on GPU capability
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
+            target_dtype = torch.bfloat16
+        else:
+            target_dtype = torch.float16
+        
+        # Convert input to target dtype before kernel
+        x_reshaped = x.reshape(-1, original_shape[-1]).to(target_dtype)
 
         M, K = x_reshaped.shape
         N, _ = qweight.shape
-
-        c = torch.empty((M, N), device=device, dtype=torch.float32)
+        
+        c = torch.empty((M, N), device=device, dtype=target_dtype)
         # c = torch.empty((M, N), device=device, dtype=torch.int32)
 
         DTYPE = {
@@ -49,7 +57,7 @@ class QuantizedLinearFunction(torch.autograd.Function):
             c.stride(0), c.stride(1),
             GROUP_SIZE=group_size,
             BIAS_ENABLED=(bias is not None),
-            DTYPE=DTYPE[x.dtype]
+            DTYPE=DTYPE[target_dtype]
         )
         
         return c.reshape(*original_shape[:-1], N)

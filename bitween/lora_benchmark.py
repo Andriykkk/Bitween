@@ -6,7 +6,7 @@ import copy
 from transformers import AutoModelForCausalLM
 from bitween.utils.singlora import apply_singlora_to_model
 from bitween.modules import QuantizedLinear
-from bitween.utils.checkpointing import create_memory_efficient_model
+# from bitween.utils.checkpointing import create_memory_efficient_model
 
 
 def find_all_linear_names(model):

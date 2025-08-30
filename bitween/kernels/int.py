@@ -120,7 +120,7 @@ def quantized_linear_kernel(
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)  # col indices
 
     # 3. Accumulator for result
-    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=DTYPE)
 
     values_per_int32 = 32 // bits  # e.g. 8 for 4-bit
 
@@ -147,7 +147,7 @@ def quantized_linear_kernel(
 
         # 9. Unpack and dequantize
         q_vals = (packed_vals >> shift[:, None]) & maxq  # extract bits
-        q_vals = q_vals.to(tl.float32)
+        q_vals = q_vals.to(DTYPE)
 
         # 10. Load scale and zp using group indices
         scale_ptrs = scale_ptr + offs_n[None, :] * stride_scale_row + group_idx[:, None] * stride_scale_group
@@ -156,19 +156,11 @@ def quantized_linear_kernel(
         zp = tl.load(zp_ptrs)
 
         # 11. Dequantize
-        deq_w_block = (q_vals - zp.to(tl.float32)) * scale
+        deq_w_block = (q_vals - zp.to(DTYPE)) * scale
         
-        # 12. Ensure dtype consistency for matrix multiplication
-        # Convert both operands to the same dtype to avoid Triton compilation errors
-        x_dtype = x_block.dtype
-        if x_dtype != deq_w_block.dtype:
-            if x_dtype == tl.float16:
-                deq_w_block = deq_w_block.to(tl.float16)
-            else:
-                x_block = x_block.to(tl.float32)
-        
-        # 12. Matrix multiplication
-        acc += tl.dot(x_block, deq_w_block)
+        # 12. Matrix multiplication (force 16-bit output)
+        dot_result = tl.dot(x_block, deq_w_block, out_dtype=DTYPE)
+        acc += dot_result
 
     # 13. Add bias if needed
     if BIAS_ENABLED:
@@ -179,4 +171,4 @@ def quantized_linear_kernel(
     # 14. Store result
     out_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    tl.store(out_ptrs, acc.to(tl.float16), mask=mask)
+    tl.store(out_ptrs, acc, mask=mask)
