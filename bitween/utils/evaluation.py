@@ -41,53 +41,64 @@ def calculate_perplexity(model, tokenizer, dataset_name="wikitext", dataset_conf
     print(f"Perplexity calculated: {perplexity:.4f}")
     return perplexity
 
-def calculate_kl_divergence(original_model, quantized_model, tokenizer, dataset_name="wikitext", dataset_config="wikitext-2-raw-v1", split="test", num_samples=200, **kwargs):
+def calculate_kl_divergence(original_model, quantized_model, tokenizer, 
+                            dataset_name="wikitext", dataset_config="wikitext-2-raw-v1", 
+                            split="test", num_samples=200, **kwargs):
     """
-    Calculates the average KL-Divergence between the output distributions of two models.
+    Calculates both batch-mean KL and per-token KL divergence between the outputs of two models.
     """
-    original_model.eval().to('cuda' if torch.cuda.is_available() else 'cpu')
-    quantized_model.eval().to('cuda' if torch.cuda.is_available() else 'cpu')
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    original_model.eval().to(device)
+    quantized_model.eval().to(device)
 
     dataset = load_dataset(dataset_name, dataset_config, split=split)
     text_samples = dataset['text'][:num_samples]
-    
-    total_kl_div = 0
+
+    total_kl_div = 0.0
     num_batches = 0
-    
+
+    total_kl = 0.0
+    total_tokens = 0
+
     print(f"Calculating KL-Divergence on {num_samples} samples...")
     for text in tqdm(text_samples):
-        if not text:
+        if not text.strip():
             continue
-            
-        encodings = tokenizer(text, return_tensors="pt", truncation=True, max_length=1024)
-        input_ids = encodings.input_ids.to(original_model.device)
-        
-        with torch.no_grad():
-            logits1 = original_model(input_ids).logits
-            logits2 = quantized_model(input_ids).logits
 
-        if logits1.ndim == 2:
-            logits1 = logits1.unsqueeze(1)
-        if logits2.ndim == 2:
-            logits2 = logits2.unsqueeze(1)
+        encodings = tokenizer(text, return_tensors="pt", truncation=True, max_length=1024)
+        input_ids = encodings.input_ids.to(device)
+
+        with torch.no_grad():
+            logits1 = original_model(input_ids).logits  # shape: [1, seq_len, vocab]
+            logits2 = quantized_model(input_ids).logits
 
         min_len = min(logits1.shape[1], logits2.shape[1])
         logits1 = logits1[:, :min_len, :]
         logits2 = logits2[:, :min_len, :]
 
-        prob2 = F.softmax(logits2, dim=-1)
         log_prob1 = F.log_softmax(logits1, dim=-1)
-        
+        prob2 = F.softmax(logits2, dim=-1)
+
+        # Batch mean KL (for backward compatibility)
         kl_div = F.kl_div(log_prob1, prob2, reduction='batchmean', log_target=False)
-        
         total_kl_div += kl_div.item()
         num_batches += 1
-        
-    avg_kl_div = total_kl_div / num_batches if num_batches > 0 else 0
-    print(f"Average KL-Divergence calculated: {avg_kl_div:.6f}")
-    return avg_kl_div
 
-def print_report(original_ppl, quantized_ppl, kl_div):
+        # Per-token KL divergence
+        per_token_kl = F.kl_div(log_prob1, prob2, reduction='none', log_target=False)  # shape: [1, seq_len, vocab]
+        per_token_kl = per_token_kl.sum(dim=-1)  # sum over vocab dim => shape: [1, seq_len]
+        total_kl += per_token_kl.sum().item()
+        total_tokens += per_token_kl.numel()
+
+    avg_kl_div = total_kl_div / num_batches if num_batches > 0 else 0.0
+    avg_kl_per_token = total_kl / total_tokens if total_tokens > 0 else 0.0
+
+    print(f"Average KL-Divergence (batchmean): {avg_kl_div:.6f}")
+    print(f"Average KL-Divergence per token  : {avg_kl_per_token:.6f}")
+
+    return avg_kl_div, avg_kl_per_token
+
+def print_report(original_ppl, quantized_ppl, kl_div, token_kl_div):
     """
     Prints a formatted report comparing the performance metrics.
     """
@@ -102,4 +113,5 @@ def print_report(original_ppl, quantized_ppl, kl_div):
     
     print("\nKL-Divergence - Lower means more similar to original")
     print(f"  - Average KL-Divergence: {kl_div:.6f}")
+    print(f"  - Average per-token KL-Divergence: {token_kl_div:.6f}")
     print("\n--- End of Report ---")

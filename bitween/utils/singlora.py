@@ -4,11 +4,8 @@ import torch.nn.functional as F
 import math
 import threading
 from bitween.modules import QuantizedLinear
-
-
-# -----------------------------------------------------------------------------
-# 1. SingLoRA Layer Implementation
-# -----------------------------------------------------------------------------
+from torch.cuda.amp import autocast
+ 
 class SingLoRALayer(nn.Module):
     """
     Implements the SingLoRA layer as described in the paper.
@@ -24,6 +21,7 @@ class SingLoRALayer(nn.Module):
         rank: int,
         alpha: float,
         ramp_up_steps: int,
+        training: bool = True,
         device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     ):
         """
@@ -38,6 +36,7 @@ class SingLoRALayer(nn.Module):
         self.original_layer = original_layer
         self.rank = rank
         self.alpha = alpha
+        self.training = training
         self.ramp_up_steps = ramp_up_steps
 
         # Freeze the original layer's parameters
@@ -72,7 +71,6 @@ class SingLoRALayer(nn.Module):
         """
         device = self.A.device  # Always use this device
 
-        # Ramp-up factor: keep it as a tensor on the correct device
         ramp_up_factor = torch.min(
             self.training_step / self.ramp_up_steps, torch.tensor(1.0, device=device)
         )
@@ -96,42 +94,23 @@ class SingLoRALayer(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass for the SingLoRA layer.
-        Computes the output of the original layer and the LoRA update separately,
-        then sums the results. This avoids direct weight manipulation.
+        Uses autocast for speed in both training and inference (safe for training).
         """
         if self.training:
             self.training_step += 1
 
-        # 1. Get the output from the original layer (handles both float and quantized)
-        # This computes (W₀ * x) + b
-        original_output = self.original_layer(x)
+        # Determine best dtype for GPU
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:    
+            autocast_dtype = torch.bfloat16
+        else:
+            autocast_dtype = torch.float16
 
-        # 2. Calculate the LoRA update output
-        # This computes (ΔW * x)
-        update_weight = self._get_update_weight()
-        
-        # Ensure dtype consistency between input and weight
-        if x.dtype != update_weight.dtype:
-            if x.dtype == torch.float32 and update_weight.dtype == torch.float16:
-                update_weight = update_weight.to(torch.float32)
-            elif x.dtype == torch.float16 and update_weight.dtype == torch.float32:
-                x = x.to(torch.float32)  # Promote to higher precision for computation
-        
-        lora_output = F.linear(x, update_weight)  # Bias is already in original_output
-
-        # 3. Ensure dtype consistency for addition
-        if original_output.dtype != lora_output.dtype:
-            # Convert to the higher precision dtype
-            if original_output.dtype == torch.float32:
-                lora_output = lora_output.to(torch.float32)
-            elif lora_output.dtype == torch.float32:
-                original_output = original_output.to(torch.float32)
-            else:
-                # Both are same lower precision, keep as is
-                pass
-
-        # 4. Sum the outputs for the final result
-        return original_output + lora_output
+        # Autocast is safe for training - keeps parameters in fp32, only computations in fp16/bf16
+        with autocast(enabled=torch.cuda.is_available(), dtype=autocast_dtype):
+            original_output = self.original_layer(x)
+            update_weight = self._get_update_weight()
+            lora_output = F.linear(x, update_weight)
+            return original_output + lora_output
 
     def __repr__(self):
         return (
@@ -139,12 +118,7 @@ class SingLoRALayer(nn.Module):
             f"ramp_up_steps={self.ramp_up_steps}, "
             f"original_layer={self.original_layer})"
         )
-
-
-# -----------------------------------------------------------------------------
-# 2. Model Integration Utility
-# -----------------------------------------------------------------------------
-
+ 
 def _get_submodule(model, key):
     """Helper to get a submodule from a model by its dot-separated key."""
     parent = model
@@ -185,3 +159,48 @@ def apply_singlora_to_model(
             # Print a summary
             if print_summary:
                 print(f"Replaced '{name}' with SingLoRA layer.")
+
+
+def set_singlora_training_mode(model: nn.Module, training: bool = True):
+    """
+    Set all SingLoRA layers in the model to training or inference mode.
+    
+    Args:
+        model (nn.Module): The model containing SingLoRA layers.
+        training (bool): If True, set to training mode. If False, set to inference mode.
+    """
+    count = 0
+    for module in model.modules():
+        if isinstance(module, SingLoRALayer):
+            module.train(training)
+            count += 1
+    
+    mode = "training" if training else "inference"
+    print(f"Set {count} SingLoRA layers to {mode} mode")
+
+
+def set_singlora_inference_mode(model: nn.Module):
+    """
+    Set all SingLoRA layers in the model to inference mode for faster execution.
+    
+    Args:
+        model (nn.Module): The model containing SingLoRA layers.
+    """
+    set_singlora_training_mode(model, training=False)
+
+
+def get_singlora_layers(model: nn.Module) -> list[tuple[str, SingLoRALayer]]:
+    """
+    Get all SingLoRA layers in the model with their names.
+    
+    Args:
+        model (nn.Module): The model to search.
+        
+    Returns:
+        List of (name, layer) tuples for all SingLoRA layers.
+    """
+    singlora_layers = []
+    for name, module in model.named_modules():
+        if isinstance(module, SingLoRALayer):
+            singlora_layers.append((name, module))
+    return singlora_layers

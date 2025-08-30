@@ -117,9 +117,9 @@ class Bitween:
             quantized_ppl = calculate_perplexity(quantized_model, self.tokenizer, num_samples=num_samples, **eval_kwargs)
             
             print("\n--- Calculating KL-Divergence ---")
-            kl_div = calculate_kl_divergence(self.model, quantized_model, self.tokenizer, num_samples=num_samples, **eval_kwargs)
+            kl_div, token_kl_div = calculate_kl_divergence(self.model, quantized_model, self.tokenizer, num_samples=num_samples, **eval_kwargs)
             
-            print_report(original_ppl, quantized_ppl, kl_div)
+            print_report(original_ppl, quantized_ppl, kl_div, token_kl_div)
 
         # Restore original settings
         self.ignore_layers = original_ignore_layers
