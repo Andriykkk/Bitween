@@ -1,4 +1,7 @@
+[ ] quantise 70b model to 2 bit
+[ ] add gradual quantisation
 [ ] add evaluation before and after quantisation
+[ ] add quantisation on cpu instead of gpu
 [ ] add outliers to separate matrix
 [ ] some matrices could be quantised with 1.58 bits 
 [ ] add quantisation to 1 bit and perform with two 1 bit linear layers addition using bits functions instead of transforming back to 16bit(look at the pytorch graph for this)
