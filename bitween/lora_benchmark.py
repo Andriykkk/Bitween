@@ -186,7 +186,8 @@ def generate_lora_benchmark_report(model_path, dummy_input, device, text=""):
     # print(f"Throughput Ratio: {throughput_ratio:.2f}x")
     
     # Cleanup
-    del base_model, checkpointed_model
+    del base_model
+    # , checkpointed_model
     gc.collect()
     if device.startswith("cuda"):
         torch.cuda.empty_cache()

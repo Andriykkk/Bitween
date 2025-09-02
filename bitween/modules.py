@@ -21,10 +21,11 @@ class QuantizedLinearFunction(torch.autograd.Function):
         original_shape = x.shape
         
         # Use 16-bit dtype based on GPU capability
-        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
-            target_dtype = torch.bfloat16
-        else:
-            target_dtype = torch.float16
+        # if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
+        #     target_dtype = torch.bfloat16
+        # else:
+        #     target_dtype = torch.float16
+        target_dtype = torch.float16
         
         # Convert input to target dtype before kernel
         x_reshaped = x.reshape(-1, original_shape[-1]).to(target_dtype)
@@ -33,7 +34,6 @@ class QuantizedLinearFunction(torch.autograd.Function):
         N, _ = qweight.shape
         
         c = torch.empty((M, N), device=device, dtype=target_dtype)
-        # c = torch.empty((M, N), device=device, dtype=torch.int32)
 
         DTYPE = {
             torch.float16: tl.float16,
@@ -102,7 +102,7 @@ class QuantizedLinear(nn.Module):
     """
     A quantized linear layer module that supports both 4-bit and 8-bit weights.
     """
-    def __init__(self, in_features, out_features, bits=8, group_size=32, bias=True, dtype=torch.bfloat16):
+    def __init__(self, in_features, out_features, bits=8, group_size=32, bias=True, dtype=torch.float16):
         super().__init__()
 
         self.in_features = in_features
@@ -118,11 +118,11 @@ class QuantizedLinear(nn.Module):
         if group_size < 1:
             raise ValueError("Group size must be at least 1.")
 
-        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 and dtype == torch.bfloat16:
-            # Ampere (SM 8.0+) and newer support bfloat16 natively
-            self.dtype = torch.bfloat16
-        else:
-            self.dtype = torch.float16
+        # if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 and dtype == torch.bfloat16:
+        #     self.dtype = torch.bfloat16
+        # else:
+        #     self.dtype = torch.float16
+        self.dtype = torch.float16
         
         # Determine the shape of the quantized weight tensor
         values_per_int32 = 32 // self.bits
@@ -160,7 +160,7 @@ class QuantizedLinear(nn.Module):
         scale = scale.to(device)
         zero_point = zero_point.to(device)
 
-        q_layer = cls(float_layer.in_features, float_layer.out_features, bits, group_size, bias=float_layer.bias is not None, dtype=torch.bfloat16)
+        q_layer = cls(float_layer.in_features, float_layer.out_features, bits, group_size, bias=float_layer.bias is not None, dtype=torch.float16)
 
         q_layer.qweight.copy_(qweight)
         q_layer.scale.copy_(scale)

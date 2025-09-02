@@ -120,7 +120,7 @@ def quantized_linear_kernel(
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)  # col indices
 
     # 3. Accumulator for result
-    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=DTYPE)
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float16)
 
     values_per_int32 = 32 // bits  # e.g. 8 for 4-bit
 
@@ -132,7 +132,7 @@ def quantized_linear_kernel(
         x_block = tl.load(x_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] < K), other=0.0)
 
         # 5. Prepare unpacked weight buffer
-        deq_w_block = tl.zeros((BLOCK_SIZE_K, BLOCK_SIZE_N), dtype=DTYPE)
+        deq_w_block = tl.zeros((BLOCK_SIZE_K, BLOCK_SIZE_N), dtype=tl.float16)
 
         # 6. Get group index per input feature
         group_idx = offs_k // GROUP_SIZE  # shape: [BLOCK_SIZE_K]
@@ -147,7 +147,7 @@ def quantized_linear_kernel(
 
         # 9. Unpack and dequantize
         q_vals = (packed_vals >> shift[:, None]) & maxq  # extract bits
-        q_vals = q_vals.to(DTYPE)
+        q_vals = q_vals.to(tl.float16)
 
         # 10. Load scale and zp using group indices
         scale_ptrs = scale_ptr + offs_n[None, :] * stride_scale_row + group_idx[:, None] * stride_scale_group
@@ -156,10 +156,10 @@ def quantized_linear_kernel(
         zp = tl.load(zp_ptrs)
 
         # 11. Dequantize
-        deq_w_block = (q_vals - zp.to(DTYPE)) * scale
+        deq_w_block = (q_vals - zp.to(tl.float16)) * scale
         
         # 12. Matrix multiplication (force 16-bit output)
-        dot_result = tl.dot(x_block, deq_w_block, out_dtype=DTYPE)
+        dot_result = tl.dot(x_block, deq_w_block, out_dtype=tl.float16)
         acc += dot_result
 
     # 13. Add bias if needed
