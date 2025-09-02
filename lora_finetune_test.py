@@ -40,7 +40,7 @@ def run_singlora_finetune_test():
 
     # --- 2. Load Model and Tokenizer ---
     print("Loading model and tokenizer...")
-    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32)
+    model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.float32)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
