@@ -42,7 +42,7 @@ def main():
         num_samples=5,
         rtn=True,
         # trainable=True,
-        nsamples=128,
+        nsamples=32,
         batch_size=2,
         seqlen=256,
         cache_to_disk=True,
