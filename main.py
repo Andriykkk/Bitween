@@ -29,7 +29,7 @@ def main():
     print("GPU devices:", torch.cuda.device_count())
 
     model_dtype = torch.float32
-    model = AutoModelForCausalLM.from_pretrained(model_name, dtype=model_dtype).to(device)
+    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=model_dtype).to(device)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     
     # --- 2. Initialize the quantizer ---
@@ -39,10 +39,10 @@ def main():
     quantized_model = quantizer.quantize(
         evaluate_perplexity=True,
         # calculate_parameters_memory=True,
-        num_samples=5,
-        rtn=True,
-        # trainable=True,
-        nsamples=32,
+        eval_samples=5,
+        # rtn=True,
+        trainable=True,
+        nsamples=8,
         batch_size=2,
         seqlen=256,
         cache_to_disk=True,

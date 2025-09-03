@@ -41,14 +41,14 @@ class Bitween:
 
         assert group_size > 0, "Group size must be greater than 0."
 
-    def quantize(self, evaluate_perplexity=False, num_samples=100, rtn=False, trainable=False, calib_dataset="pile-10k", nsamples=None, 
+    def quantize(self, evaluate_perplexity=False, eval_samples=100, rtn=False, trainable=False, calib_dataset="pile-10k", nsamples=None, 
                  cache_to_disk=None, max_memory_mb=None, ignore_layers=None, batch_size=None, chunk_size=None, **eval_kwargs):
         """
         Quantizes the linear layers of the model.
 
         Args:
             evaluate_perplexity (bool): If True, run a full performance evaluation.
-            num_samples (int): Number of samples to use for evaluation.
+            eval_samples (int): Number of samples to use for evaluation.
             rtn (bool): If True, use RTN quantization (fast, lower quality).
             trainable (bool): If True, use trainable quantization (slower, higher quality).
             calib_dataset (str): Dataset name for calibration ('pile-10k', etc.).
@@ -75,11 +75,11 @@ class Bitween:
             self.chunk_size = chunk_size
             
         original_ppl = None
-        if evaluate_perplexity and self.tokenizer is not None and num_samples > 0:
+        if evaluate_perplexity and self.tokenizer is not None and eval_samples > 0:
             if self.tokenizer is None:
                 raise ValueError("Tokenizer must be provided for evaluation.")
             print("\n--- Evaluating original model ---")
-            original_ppl = calculate_perplexity(self.model, self.tokenizer, num_samples=num_samples, **eval_kwargs)
+            original_ppl = calculate_perplexity(self.model, self.tokenizer, eval_samples=eval_samples, **eval_kwargs)
 
         print("\n--- Starting quantization ---")
 
@@ -117,12 +117,12 @@ class Bitween:
                 
         print("--- Quantization complete ---")
 
-        if evaluate_perplexity and self.tokenizer is not None and num_samples > 0:
+        if evaluate_perplexity and self.tokenizer is not None and eval_samples > 0:
             print("\n--- Evaluating quantized model ---")
-            quantized_ppl = calculate_perplexity(quantized_model, self.tokenizer, num_samples=num_samples, **eval_kwargs)
+            quantized_ppl = calculate_perplexity(quantized_model, self.tokenizer, eval_samples=eval_samples, **eval_kwargs)
             
             print("\n--- Calculating KL-Divergence ---")
-            kl_div, token_kl_div = calculate_kl_divergence(self.model, quantized_model, self.tokenizer, num_samples=num_samples, **eval_kwargs)
+            kl_div, token_kl_div = calculate_kl_divergence(self.model, quantized_model, self.tokenizer, eval_samples=eval_samples, **eval_kwargs)
             
             print_report(original_ppl, quantized_ppl, kl_div, token_kl_div)
 

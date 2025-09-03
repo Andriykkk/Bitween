@@ -3,7 +3,7 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from tqdm import tqdm
 
-def calculate_perplexity(model, tokenizer, dataset_name="wikitext", dataset_config="wikitext-2-raw-v1", split="test", num_samples=200, **kwargs):
+def calculate_perplexity(model, tokenizer, dataset_name="wikitext", dataset_config="wikitext-2-raw-v1", split="test", eval_samples=200, **kwargs):
     """
     Calculates the perplexity of a model on a given dataset.
     """
@@ -12,12 +12,12 @@ def calculate_perplexity(model, tokenizer, dataset_name="wikitext", dataset_conf
     
     # Load the dataset
     dataset = load_dataset(dataset_name, dataset_config, split=split)
-    text_samples = dataset['text'][:num_samples]
+    text_samples = dataset['text'][:eval_samples]
     
     total_neg_log_likelihood = 0
     total_tokens = 0
     
-    print(f"Calculating perplexity on {num_samples} samples...")
+    print(f"Calculating perplexity on {eval_samples} samples...")
     for text in tqdm(text_samples):
         if not text:
             continue
@@ -43,7 +43,7 @@ def calculate_perplexity(model, tokenizer, dataset_name="wikitext", dataset_conf
 
 def calculate_kl_divergence(original_model, quantized_model, tokenizer, 
                             dataset_name="wikitext", dataset_config="wikitext-2-raw-v1", 
-                            split="test", num_samples=200, **kwargs):
+                            split="test", eval_samples=200, **kwargs):
     """
     Calculates both batch-mean KL and per-token KL divergence between the outputs of two models.
     """
@@ -52,7 +52,7 @@ def calculate_kl_divergence(original_model, quantized_model, tokenizer,
     quantized_model.eval().to(device)
 
     dataset = load_dataset(dataset_name, dataset_config, split=split)
-    text_samples = dataset['text'][:num_samples]
+    text_samples = dataset['text'][:eval_samples]
 
     total_kl_div = 0.0
     num_batches = 0
@@ -60,7 +60,7 @@ def calculate_kl_divergence(original_model, quantized_model, tokenizer,
     total_kl = 0.0
     total_tokens = 0
 
-    print(f"Calculating KL-Divergence on {num_samples} samples...")
+    print(f"Calculating KL-Divergence on {eval_samples} samples...")
     for text in tqdm(text_samples):
         if not text.strip():
             continue
