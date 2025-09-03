@@ -236,41 +236,67 @@ class WrapperLinear(nn.Module):
             return q_layer
 
 
-def wrapper_block(block, enable_minmax_tuning=True, enable_round_tuning=True, bits=8, group_size=32, device="cpu", 
-                  ignore_layers=None, block_prefix=""):
+def unified_wrapper(module, enable_minmax_tuning=True, enable_round_tuning=True, bits=8, group_size=32, 
+                    device="cpu", ignore_layers=None, module_prefix=""):
     """
-    Wrap all linear layers in a block with WrapperLinear for training.
+    Unified wrapper that handles both individual linear layers and blocks containing linear layers.
+    Prevents nested wrapping and provides consistent interface.
     
     Args:
-        block: The block containing linear layers to wrap
+        module: Either a single nn.Linear layer or a block containing linear layers
         enable_minmax_tuning: Enable min/max scale tuning
         enable_round_tuning: Enable rounding value tuning  
         bits: Number of quantization bits
         group_size: Group size for quantization
         device: Device to place tensors on
         ignore_layers: Set of layer names to skip during wrapping
-        block_prefix: Prefix to add to layer names when checking ignore_layers
+        module_prefix: Prefix to add to layer names when checking ignore_layers
     
     Returns:
-        tuple: (quantized_layer_names, unquantized_layer_names)
+        tuple: (wrapped_module, quantized_layer_names) where wrapped_module is the input module 
+               (potentially modified) and quantized_layer_names is list of layer names that were wrapped
     """
-    quantized_layer_names = []
-    unquantized_layer_names = []
     ignore_layers = ignore_layers or set()
+    quantized_layer_names = []
     
-    for name, module in block.named_modules():
-        if isinstance(module, nn.Linear):
+    # Check if already wrapped
+    if isinstance(module, WrapperLinear):
+        print(f"Module already wrapped, skipping: {module_prefix}")
+        return module, []
+    
+    # Case 1: Single linear layer
+    if isinstance(module, nn.Linear):
+        if module_prefix in ignore_layers:
+            print(f"  Skipping ignored layer: {module_prefix}")
+            return module, []
+        
+        wrapper = WrapperLinear(
+            module,
+            bits=bits,
+            group_size=group_size,
+            enable_minmax_tuning=enable_minmax_tuning,
+            enable_round_tuning=enable_round_tuning,
+            device=device
+        )
+        return wrapper, ["single_layer"]
+    
+    # Case 2: Block containing linear layers
+    for name, submodule in module.named_modules():
+        if isinstance(submodule, nn.Linear):
+            # Check if already wrapped
+            if isinstance(submodule, WrapperLinear):
+                continue
+                
             # Construct full layer name for ignore check
-            full_layer_name = f"{block_prefix}.{name}" if block_prefix and name else (block_prefix or name)
+            full_layer_name = f"{module_prefix}.{name}" if module_prefix and name else (module_prefix or name)
             
             if full_layer_name in ignore_layers:
                 print(f"  Skipping ignored layer: {full_layer_name}")
-                unquantized_layer_names.append(name)
                 continue
-                
+            
             # Create wrapper
             wrapper = WrapperLinear(
-                module,
+                submodule,
                 bits=bits,
                 group_size=group_size,
                 enable_minmax_tuning=enable_minmax_tuning,
@@ -279,29 +305,54 @@ def wrapper_block(block, enable_minmax_tuning=True, enable_round_tuning=True, bi
             )
             
             # Replace the module
-            _set_module(block, name, wrapper)
+            _set_module(module, name, wrapper)
             quantized_layer_names.append(name)
-        else:
-            unquantized_layer_names.append(name)
     
-    return quantized_layer_names, unquantized_layer_names
+    return module, quantized_layer_names
+
+
+def unified_unwrapper(module, apply_quantization=True):
+    """
+    Unified unwrapper that handles both individual WrapperLinear layers and blocks containing them.
+    
+    Args:
+        module: Either a WrapperLinear or a block containing WrapperLinear layers
+        apply_quantization: If True, convert to QuantizedLinear. If False, restore original layers.
+    
+    Returns:
+        The unwrapped module (QuantizedLinear, original layer, or modified block)
+    """
+    # Case 1: Single WrapperLinear
+    if isinstance(module, WrapperLinear):
+        if apply_quantization:
+            return module.to_quantized_linear()
+        else:
+            return module.orig_layer
+    
+    # Case 2: Block containing WrapperLinear layers
+    for name, submodule in list(module.named_modules()):
+        if isinstance(submodule, WrapperLinear):
+            if apply_quantization:
+                quantized_layer = submodule.to_quantized_linear()
+                _set_module(module, name, quantized_layer)
+            else:
+                _set_module(module, name, submodule.orig_layer)
+    
+    return module
+
+
+# Legacy functions for backward compatibility
+def wrapper_block(block, enable_minmax_tuning=True, enable_round_tuning=True, bits=8, group_size=32, device="cpu", 
+                  ignore_layers=None, block_prefix=""):
+    """Legacy function - use unified_wrapper instead."""
+    _, quantized_names = unified_wrapper(block, enable_minmax_tuning, enable_round_tuning, bits, group_size, device, ignore_layers, block_prefix)
+    unquantized_names = [name for name, module in block.named_modules() if not isinstance(module, WrapperLinear)]
+    return quantized_names, unquantized_names
 
 
 def unwrapper_block(block, apply_quantization=True):
-    """
-    Unwrap all WrapperLinear layers in a block, converting them to QuantizedLinear.
-    
-    Args:
-        block: The block containing wrapped layers
-        apply_quantization: If True, convert to QuantizedLinear. If False, restore original layers.
-    """
-    for name, module in list(block.named_modules()):
-        if isinstance(module, WrapperLinear):
-            if apply_quantization:
-                quantized_layer = module.to_quantized_linear()
-                _set_module(block, name, quantized_layer)
-            else:
-                _set_module(block, name, module.orig_layer)
+    """Legacy function - use unified_unwrapper instead."""
+    unified_unwrapper(block, apply_quantization)
 
 
 def _set_module(model, submodule_key, module):

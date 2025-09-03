@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from ..modules import QuantizedLinear
-from ..wrapper import WrapperLinear, wrapper_block, unwrapper_block
+from ..wrapper import WrapperLinear, unified_wrapper, unified_unwrapper
 from ..calib_dataset import get_calibration_dataset
 from ..utils.sign_sgd import SignSGD, CombinedScheduler
 from ..utils.evaluation import calculate_perplexity, calculate_kl_divergence, print_report
@@ -18,7 +18,7 @@ class Bitween:
     A simple quantizer class that takes a model and quantization configuration.
     """
     def __init__(self, model, tokenizer=None, bits=8, group_size=32, iters=1, lr=0.005, enable_minmax_tuning=True, seqlen=2048, 
-                 cache_to_disk=False, max_memory_mb=512, ignore_layers=None, batch_size=32, chunk_size=10):
+                 cache_to_disk=False, max_memory_mb=512, ignore_layers=None, batch_size=32):
         self.model = model
         self.tokenizer = tokenizer
         self.bits = bits
@@ -33,7 +33,6 @@ class Bitween:
         # Memory management parameters
         self.cache_to_disk = cache_to_disk  # Save cache tensors to filesystem
         self.max_memory_mb = max_memory_mb  # Maximum memory for caching (MB)
-        self.chunk_size = chunk_size  # Number of samples to process at once during training
         
         # Layers to ignore during quantization
         self.ignore_layers = set(ignore_layers) if ignore_layers else set()
@@ -42,7 +41,7 @@ class Bitween:
         assert group_size > 0, "Group size must be greater than 0."
 
     def quantize(self, evaluate_perplexity=False, eval_samples=100, rtn=False, trainable=False, calib_dataset="pile-10k", nsamples=None, 
-                 cache_to_disk=None, max_memory_mb=None, ignore_layers=None, batch_size=None, chunk_size=None, **eval_kwargs):
+                 cache_to_disk=None, max_memory_mb=None, ignore_layers=None, batch_size=None, **eval_kwargs):
         """
         Quantizes the linear layers of the model.
 
@@ -57,7 +56,6 @@ class Bitween:
             max_memory_mb (int): Override instance setting for memory limit. If None, uses instance setting.
             ignore_layers (list): List of layer names to skip during quantization (e.g., ['lm_head', 'embed_tokens']).
             batch_size (int): Override batch size for training mini-batches. If None, uses instance setting.
-            chunk_size (int): Override chunk size for chunked processing. If None, uses instance setting.
             **eval_kwargs: Additional arguments for the evaluation functions.
         
         Returns:
@@ -65,14 +63,11 @@ class Bitween:
         """
         # Handle override parameters - temporarily update instance variables
         original_ignore_layers = self.ignore_layers
-        original_chunk_size = self.chunk_size
         
         if ignore_layers is not None:
             self.ignore_layers = set(ignore_layers)
         if batch_size is not None:
             self.batch_size = batch_size
-        if chunk_size is not None:
-            self.chunk_size = chunk_size
             
         original_ppl = None
         if evaluate_perplexity and self.tokenizer is not None and eval_samples > 0:
@@ -128,21 +123,16 @@ class Bitween:
 
         # Restore original settings
         self.ignore_layers = original_ignore_layers
-        self.chunk_size = original_chunk_size
         return quantized_model
 
     def _trainable_quantize(self, calib_dataset: str, nsamples: Optional[int], batch_size: int):
         """
-        Performs trainable quantization using calibration dataset with chunked processing.
-        
-        This method implements chunk-based quantization workflow:
-        1. Load calibration data
-        2. For each block: process samples in chunks, train incrementally
-        3. Return model with optimized QuantizedLinear layers
+        Performs trainable quantization using calibration dataset.
         
         Args:
             calib_dataset (str): Name of calibration dataset
             nsamples (Optional[int]): Number of calibration samples. If None, uses all available.
+            batch_size (int): Training batch size
             
         Returns:
             Quantized model with optimized parameters
@@ -159,8 +149,7 @@ class Bitween:
         
         # Step 2: Load calibration dataset 
         print(f"Loading calibration dataset: {calib_dataset}")
-        # If nsamples is None, load all available samples from dataset
-        dataset_nsamples = nsamples if nsamples is not None else 10000  # Default pile-10k size
+        dataset_nsamples = nsamples if nsamples is not None else 10000
         calib_data = get_calibration_dataset(
             dataset_name=calib_dataset,
             tokenizer=self.tokenizer,
@@ -168,97 +157,44 @@ class Bitween:
             nsamples=dataset_nsamples
         )
         
-        # Use all loaded samples for training
         actual_nsamples = len(calib_data)
+        print(f"Using {actual_nsamples} calibration samples for training")
         
-        # Validate and adjust chunk_size
-        effective_chunk_size = self._validate_chunk_size(actual_nsamples, batch_size)
-        use_chunking = effective_chunk_size is not None
+        # Step 3: Cache inputs and quantize each module
+        cached_inputs = CacheManager.cache_block_inputs(
+            quantized_model, calib_data, block_names, actual_nsamples,
+            cache_to_disk=self.cache_to_disk, max_memory_mb=self.max_memory_mb
+        )
         
-        if use_chunking:
-            print(f"Using {actual_nsamples} calibration samples for chunked training (chunk_size={effective_chunk_size})")
-        else:
-            print(f"Using {actual_nsamples} calibration samples for full caching training")
-        
-        # Step 3: Quantize each block/layer 
-        if use_chunking:
-            # Use chunked processing
-            for block_name in block_names:
-                print(f"\n--- Quantizing: {block_name} ---")
-                block_or_layer = self._get_module(quantized_model, block_name)
+        try:
+            for module_name in block_names:
+                print(f"\n--- Quantizing: {module_name} ---")
+                module = self._get_module(quantized_model, module_name)
                 
-                result = self._quantize_block_chunked(block_or_layer, calib_data, block_name, actual_nsamples, batch_size, effective_chunk_size)
+                # Load cached inputs for this module
+                block_inputs = CacheManager.load_block_cache(cached_inputs, module_name, cache_to_disk=self.cache_to_disk)
                 
-                if isinstance(block_or_layer, nn.Linear) and result is not None:
-                    _set_module(quantized_model, block_name, result)
-                    print(f"Replaced {block_name} with quantized version")
-        else:
-            # Use original full caching method
-            cached_inputs = CacheManager.cache_block_inputs(
-                quantized_model, calib_data, block_names, actual_nsamples,
-                cache_to_disk=self.cache_to_disk, max_memory_mb=self.max_memory_mb
-            )
-            
-            try:
-                for block_name in block_names:
-                    print(f"\n--- Quantizing: {block_name} ---")
-                    block_or_layer = self._get_module(quantized_model, block_name)
-                    
-                    # Load cached inputs for this block/layer
-                    block_inputs = CacheManager.load_block_cache(cached_inputs, block_name, cache_to_disk=self.cache_to_disk)
-                    
-                    if not block_inputs:
-                        print(f"Warning: No cached inputs found for {block_name}, skipping...")
-                        continue
-                    
-                    # Quantize the block or individual layer
-                    result = self._quantize_block(block_or_layer, block_inputs, block_name, batch_size)
-                    
-                    # If it's a single layer, we need to replace it in the model
-                    if isinstance(block_or_layer, nn.Linear) and result is not None:
-                        _set_module(quantized_model, block_name, result)
-                        print(f"Replaced {block_name} with quantized version")
-                    
-                    # Clean up cache for this block to free memory
-                    CacheManager.cleanup_block_cache(cached_inputs, block_name, cache_to_disk=self.cache_to_disk)
-            
-            finally:
-                # Always clean up all cache files when done
-                CacheManager.cleanup_all_cache(cached_inputs, cache_to_disk=self.cache_to_disk)
+                if not block_inputs:
+                    print(f"Warning: No cached inputs found for {module_name}, skipping...")
+                    continue
+                
+                # Quantize the module using unified approach
+                result = self._quantize_block(module, block_inputs, module_name, batch_size)
+                
+                # If it's a single layer, we need to replace it in the model
+                if isinstance(module, nn.Linear) and result is not None:
+                    _set_module(quantized_model, module_name, result)
+                    print(f"Replaced {module_name} with quantized version")
+                
+                # Clean up cache for this module to free memory
+                CacheManager.cleanup_block_cache(cached_inputs, module_name, cache_to_disk=self.cache_to_disk)
+        
+        finally:
+            # Always clean up all cache files when done
+            CacheManager.cleanup_all_cache(cached_inputs, cache_to_disk=self.cache_to_disk)
         
         return quantized_model
     
-    def _validate_chunk_size(self, nsamples: int, batch_size: int) -> Optional[int]:
-        """
-        Validate and adjust chunk_size based on constraints.
-        
-        Args:
-            nsamples: Total number of samples
-            batch_size: Training batch size
-            
-        Returns:
-            Valid chunk_size or None if chunking should be disabled
-        """
-        # If chunk_size is None or 0, disable chunking
-        if self.chunk_size is None or self.chunk_size <= 0:
-            return None
-        
-        # If chunk_size >= nsamples, disable chunking (process all at once)
-        if self.chunk_size >= nsamples:
-            return None
-        
-        # Ensure chunk_size is at least as large as batch_size
-        effective_chunk_size = max(self.chunk_size, batch_size)
-        
-        # Make chunk_size divisible by batch_size
-        if effective_chunk_size % batch_size != 0:
-            effective_chunk_size = ((effective_chunk_size + batch_size - 1) // batch_size) * batch_size
-        
-        # Final check: if adjusted chunk_size >= nsamples, disable chunking
-        if effective_chunk_size >= nsamples:
-            return None
-            
-        return effective_chunk_size
     
     def _get_block_names(self, model) -> List[str]:
         """
@@ -359,330 +295,66 @@ class Bitween:
         
         return block_names
     
-    def _quantize_block_chunked(self, block_or_layer, calib_data, block_name: str, total_nsamples: int, batch_size: int, chunk_size: int):
+    
+    def _quantize_block(self, module, block_inputs: List[torch.Tensor], module_name: str, batch_size: int):
         """
-        Memory-efficient chunked quantization of a single block or individual layer.
-        
-        Processes samples in small chunks, caching only chunk_size samples at a time:
-        1. Run model on chunk_size samples to get inputs/outputs for this block
-        2. Train on this chunk
-        3. Repeat for next chunk
+        Memory-efficient quantization using unified wrapper approach.
         
         Args:
-            block_or_layer: Either a transformer block module or a single linear layer
-            calib_data: Calibration dataset 
-            block_name: Name of the block/layer for logging
-            total_nsamples: Total number of samples to process
+            module: Module to quantize (block or individual layer)
+            block_inputs: List of ALL input tensors cached for this module
+            module_name: Name of the module for logging and ignore checking
             batch_size: Training batch size
         """
-        # Detect if this is a single linear layer or a block
-        is_single_layer = isinstance(block_or_layer, nn.Linear)
-        item_type = "linear layer" if is_single_layer else "block"
-        
-        # Step 1: Setup wrappers
-        if is_single_layer:
-            # Check if this single layer should be ignored
-            if block_name in self.ignore_layers:
-                print(f"Skipping ignored standalone layer: {block_name}")
-                return None
-                
-            # For individual linear layers, create a temporary wrapper
-            wrapper = WrapperLinear(
-                block_or_layer,
-                bits=self.bits,
-                group_size=self.group_size,
-                enable_minmax_tuning=self.enable_minmax_tuning,
-                enable_round_tuning=True,
-                device=next(block_or_layer.parameters()).device
-            )
-            quantized_names = ["single_layer"]
-            wrappers = [wrapper]
-        else:
-            # For blocks, wrap all linear layers inside
-            quantized_names, unquantized_names = wrapper_block(
-                block_or_layer, 
-                enable_minmax_tuning=self.enable_minmax_tuning,
-                enable_round_tuning=True,
-                bits=self.bits,
-                group_size=self.group_size,
-                device=next(block_or_layer.parameters()).device,
-                ignore_layers=self.ignore_layers,
-                block_prefix=block_name
-            )
-            
-            # Collect wrappers
-            wrappers = []
-            for name, module in block_or_layer.named_modules():
-                if isinstance(module, WrapperLinear):
-                    wrappers.append(module)
-        
-        if not quantized_names:
-            print(f"No linear layers found in this {item_type}")
-            return None
-        
-        # Step 2: Setup optimizer parameters
-        learnable_params = []
-        for wrapper in wrappers:
-            if wrapper.value is not None:
-                learnable_params.append(wrapper.value)
-            if wrapper.min_scale is not None:
-                learnable_params.append(wrapper.min_scale)
-            if wrapper.max_scale is not None:
-                learnable_params.append(wrapper.max_scale)
-        
-        if not learnable_params:
-            print("Warning: No learnable parameters found")
-            return None
-        
-        # Setup SignSGD optimizer
-        optimizer = SignSGD(learnable_params, lr=self.lr, momentum=0.9)
-        
-        # Calculate training parameters
-        num_chunks = (total_nsamples + chunk_size - 1) // chunk_size
-        total_steps = self.iters * num_chunks
-        warmup_steps = total_steps // 10
-        
-        scheduler = CombinedScheduler(
-            optimizer, 
-            target_lr=self.lr,
-            warmup_steps=warmup_steps,
-            patience=total_steps // 20,
-            factor=0.8,
-            min_lr=self.lr * 0.01,
-            verbose=True
-        )
-        
-        print(f"Chunked training: {self.iters} epochs × {num_chunks} chunks = {total_steps} total steps")
-        print(f"Chunk size: {chunk_size}, Total samples: {total_nsamples}")
-        
-        # Step 3: Training loop with chunked processing
-        best_loss = float('inf')
-        dataloader = calib_data.get_dataloader(batch_size=1)
-        global_step = 0
-        
-        for epoch in range(self.iters):
-            epoch_loss = 0.0
-            chunk_count = 0
-            
-            # Process data in chunks
-            data_iterator = iter(dataloader)
-            
-            for chunk_start in range(0, total_nsamples, chunk_size):
-                chunk_end = min(chunk_start + chunk_size, total_nsamples)
-                actual_chunk_size = chunk_end - chunk_start
-                
-                print(f"Processing chunk {chunk_count + 1}/{num_chunks} (samples {chunk_start}-{chunk_end-1})")
-                
-                # Step 3a: Cache inputs and outputs for this chunk
-                chunk_inputs = []
-                chunk_outputs = []
-                
-                # Register hook to capture inputs
-                inputs_captured = []
-                def capture_hook(module, input, output):
-                    if isinstance(input, tuple):
-                        tensor = input[0].detach().cpu()
-                    else:
-                        tensor = input.detach().cpu()
-                    inputs_captured.append(tensor)
-                
-                hook = block_or_layer.register_forward_hook(capture_hook)
-                
-                # Process chunk samples to get inputs/outputs
-                block_or_layer.eval()
-                with torch.no_grad():
-                    for _ in range(actual_chunk_size):
-                        try:
-                            batch = next(data_iterator)
-                            input_ids = batch['input_ids'].to(self.model.device)
-                            
-                            # Forward pass to get input to this block
-                            _ = self.model(input_ids)
-                            
-                            # Get the captured input and original output
-                            if inputs_captured:
-                                inp = inputs_captured[-1].to(next(block_or_layer.parameters()).device)
-                                chunk_inputs.append(inp)
-                                
-                                # Get original output
-                                orig_out = block_or_layer(inp)
-                                if isinstance(orig_out, tuple):
-                                    orig_out = orig_out[0]
-                                chunk_outputs.append(orig_out.detach().cpu())
-                                
-                        except StopIteration:
-                            break
-                        except Exception as e:
-                            print(f"Warning: Failed to process sample: {e}")
-                            continue
-                
-                hook.remove()
-                
-                # Step 3b: Train on this chunk
-                if chunk_inputs and chunk_outputs:
-                    chunk_loss = self._train_on_chunk(
-                        block_or_layer, chunk_inputs, chunk_outputs, 
-                        optimizer, scheduler, is_single_layer, wrapper if is_single_layer else None,
-                        wrappers, batch_size, global_step
-                    )
-                    
-                    epoch_loss += chunk_loss * len(chunk_inputs)
-                    global_step += 1
-                    
-                    if chunk_loss < best_loss:
-                        best_loss = chunk_loss
-                        for w in wrappers:
-                            w.update_best_params(chunk_loss)
-                
-                # Clean up chunk memory
-                del chunk_inputs, chunk_outputs, inputs_captured
-                gc.collect()
-                torch.cuda.empty_cache() if torch.cuda.is_available() else None
-                
-                chunk_count += 1
-            
-            # Epoch statistics
-            avg_epoch_loss = epoch_loss / total_nsamples if total_nsamples > 0 else 0
-            current_lr = scheduler.get_lr()[0]
-            print(f"Epoch {epoch + 1}/{self.iters}: Avg Loss={avg_epoch_loss:.6f}, LR={current_lr:.6f}")
-        
-        print(f"Chunked optimization complete. Best loss: {best_loss:.6f}")
-        
-        # Step 4: Apply best parameters and convert to QuantizedLinear
-        for wrapper_inst in wrappers:
-            wrapper_inst.apply_best_params()
-        
-        if is_single_layer:
-            quantized_layer = wrapper.to_quantized_linear()
-            del wrapper
-            return quantized_layer
-        else:
-            unwrapper_block(block_or_layer, apply_quantization=True)
-            return None
-    
-    def _train_on_chunk(self, block_or_layer, chunk_inputs, chunk_outputs, optimizer, scheduler, 
-                       is_single_layer, wrapper, wrappers, batch_size, global_step):
-        """Train on a single chunk of data."""
-        optimizer.zero_grad()
-        total_loss = 0.0
-        num_samples = len(chunk_inputs)
-        
-        # Process mini-batches within this chunk
-        for batch_start in range(0, num_samples, batch_size):
-            batch_end = min(batch_start + batch_size, num_samples)
-            batch_loss = 0.0
-            
-            for i in range(batch_start, batch_end):
-                inp = chunk_inputs[i].to(next(block_or_layer.parameters()).device)
-                orig_out = chunk_outputs[i].to(inp.device)
-                
-                # Forward pass through quantized block/layer
-                if is_single_layer:
-                    quant_out = wrapper(inp)
-                else:
-                    quant_out = block_or_layer(inp)
-                
-                # Handle tuple outputs
-                if isinstance(quant_out, tuple):
-                    quant_out = quant_out[0]
-                
-                # MSE loss
-                loss = F.mse_loss(quant_out, orig_out)
-                batch_loss += loss.item()
-                loss.backward()
-            
-            total_loss += batch_loss
-        
-        # Update parameters
-        optimizer.step()
-        avg_loss = total_loss / num_samples
-        scheduler.step(avg_loss, global_step)
-        
-        return avg_loss
-    
-    
-    def _quantize_block(self, block_or_layer, block_inputs: List[torch.Tensor], block_name: str, batch_size: int):
-        """
-        Memory-efficient quantization of a single block or individual layer.
-        
-        This method handles both:
-        1. Transformer blocks (containing multiple linear layers)
-        2. Individual linear layers (standalone layers not in blocks)
-        
-        Args:
-            block_or_layer: Either a transformer block module or a single linear layer
-            block_inputs: List of ALL input tensors cached for this block/layer
-            block_name: Name of the block/layer for logging and ignore checking
-        """
         if not block_inputs:
-            print("Warning: No cached inputs for this block, skipping...")
+            print("Warning: No cached inputs for this module, skipping...")
             return
         
         num_samples = len(block_inputs)
         
-        # Detect if this is a single linear layer or a block
-        is_single_layer = isinstance(block_or_layer, nn.Linear)
-        item_type = "linear layer" if is_single_layer else "block"
-        
+        # Cache original outputs
         original_outputs = []
-        block_or_layer.eval()
+        module.eval()
         
         with torch.no_grad():
             for inp in tqdm(block_inputs, desc="Caching original outputs", leave=False):
-                inp = inp.to(next(block_or_layer.parameters()).device)
+                inp = inp.to(next(module.parameters()).device)
                 try:
-                    orig_out = block_or_layer(inp)
+                    orig_out = module(inp)
                     
                     # Handle different output formats (tensor vs tuple)
                     if isinstance(orig_out, tuple):
-                        # Take the first element (usually the main output tensor)
                         orig_out = orig_out[0]
                     
-                    original_outputs.append(orig_out.detach().cpu())  # Store on CPU to save GPU memory
+                    original_outputs.append(orig_out.detach().cpu())
                 except Exception as e:
                     print(f"Warning: Failed to cache output: {e}")
                     continue
         
-        # Step 2: Handle wrapping based on type
-        if is_single_layer:
-            # Check if this single layer should be ignored
-            if block_name in self.ignore_layers:
-                print(f"Skipping ignored standalone layer: {block_name}")
-                return  # Skip this layer entirely
-                
-            # For individual linear layers, create a temporary wrapper
-            wrapper = WrapperLinear(
-                block_or_layer,
-                bits=self.bits,
-                group_size=self.group_size,
-                enable_minmax_tuning=self.enable_minmax_tuning,
-                enable_round_tuning=True,
-                device=next(block_or_layer.parameters()).device
-            )
-            quantized_names = ["single_layer"]
-            wrappers = [wrapper]
-        else:
-            # For blocks, wrap all linear layers inside
-            quantized_names, unquantized_names = wrapper_block(
-                block_or_layer, 
-                enable_minmax_tuning=self.enable_minmax_tuning,
-                enable_round_tuning=True,
-                bits=self.bits,
-                group_size=self.group_size,
-                device=next(block_or_layer.parameters()).device,
-                ignore_layers=self.ignore_layers,
-                block_prefix=block_name
-            )
-            
-            # Collect wrappers
-            wrappers = []
-            for name, module in block_or_layer.named_modules():
-                if isinstance(module, WrapperLinear):
-                    wrappers.append(module)
+        # Step 2: Wrap using unified wrapper
+        wrapped_module, quantized_names = unified_wrapper(
+            module,
+            enable_minmax_tuning=self.enable_minmax_tuning,
+            enable_round_tuning=True,
+            bits=self.bits,
+            group_size=self.group_size,
+            device=next(module.parameters()).device,
+            ignore_layers=self.ignore_layers,
+            module_prefix=module_name
+        )
         
         if not quantized_names:
-            print(f"No linear layers found in this {item_type}")
+            print(f"No linear layers found to quantize in: {module_name}")
             return
+        
+        # Collect wrappers
+        wrappers = []
+        if isinstance(wrapped_module, WrapperLinear):
+            wrappers = [wrapped_module]
+        else:
+            for name, submodule in wrapped_module.named_modules():
+                if isinstance(submodule, WrapperLinear):
+                    wrappers.append(submodule)
         
         # Step 3: Setup optimizer parameters
         learnable_params = []
@@ -716,7 +388,7 @@ class Bitween:
             patience=total_steps // 20,  # Patience for 5% of steps  
             factor=0.8,
             min_lr=self.lr * 0.01,
-            verbose=True
+            verbose=False
         )
         
         print(f"Training setup: {self.iters} epochs × {steps_per_epoch} steps/epoch = {total_steps} total steps")
@@ -740,16 +412,11 @@ class Bitween:
                 
                 # Process mini-batch and accumulate gradients
                 for i in range(batch_start, batch_end):
-                    inp = block_inputs[i].to(next(block_or_layer.parameters()).device)
+                    inp = block_inputs[i].to(next(wrapped_module.parameters()).device)
                     orig_out = original_outputs[i].to(inp.device)
                     
-                    # Forward pass through quantized block/layer
-                    if is_single_layer:
-                        # For single layer, use the wrapper directly
-                        quant_out = wrapper(inp)
-                    else:
-                        # For blocks, use the block with wrapped layers
-                        quant_out = block_or_layer(inp)
+                    # Forward pass through quantized module
+                    quant_out = wrapped_module(inp)
                     
                     # Handle tuple outputs (extract main tensor)
                     if isinstance(quant_out, tuple):
@@ -793,21 +460,16 @@ class Bitween:
         for wrapper_inst in wrappers:
             wrapper_inst.apply_best_params()
         
-        if is_single_layer:
-            quantized_layer = wrapper.to_quantized_linear()
-        else:
-            unwrapper_block(block_or_layer, apply_quantization=True)
+        # Unwrap using unified unwrapper
+        result = unified_unwrapper(wrapped_module, apply_quantization=True)
         
         # Step 6: Clean up memory aggressively
         del original_outputs, learnable_params, wrappers, optimizer, scheduler
-        if is_single_layer:
-            del wrapper  # Clean up the wrapper reference
         gc.collect()
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
         
-        # Return quantized layer for single layer case
-        if is_single_layer:
-            return quantized_layer
+        # Return quantized layer for single layer case, None for block case
+        return result if isinstance(wrapped_module, WrapperLinear) else None
     
     def _get_module(self, model, module_name: str):
         """Get a module by its dotted name."""
