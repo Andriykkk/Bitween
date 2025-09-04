@@ -33,7 +33,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     
     # --- 2. Initialize the quantizer ---
-    quantizer = Bitween(model, tokenizer=tokenizer, bits=4, group_size=128)
+    quantizer = Bitween(model, tokenizer=tokenizer, bits=4, group_size=64)
 
     # # --- 3. Perform quantization and evaluation ---
     quantized_model = quantizer.quantize(
@@ -42,8 +42,8 @@ def main():
         eval_samples=5,
         # rtn=True,
         trainable=True,
-        nsamples=64,
-        batch_size=1,
+        nsamples=128,
+        batch_size=2,
         seqlen=256,
         cache_to_disk=True,
         max_memory_mb=2048,

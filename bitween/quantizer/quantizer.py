@@ -104,7 +104,7 @@ class Bitween:
             if max_memory_mb is not None:
                 self.max_memory_mb = max_memory_mb
                 
-            print(f"Trainable mode: iters={self.iters}, lr={self.lr}, minmax_tuning={self.enable_minmax_tuning}")
+            print(f"Trainable mode: lr={self.lr}, minmax_tuning={self.enable_minmax_tuning}")
             print(f"Cache mode: {'disk' if self.cache_to_disk else 'memory'} (max: {self.max_memory_mb}MB)")
             # Trainable quantization: Use calibration data to optimize quantization parameters
             print(f"Using trainable quantization with {calib_dataset} dataset")
@@ -347,6 +347,10 @@ class Bitween:
             print(f"No linear layers found to quantize in: {module_name}")
             return
         
+        # Check perplexity after wrapping (before training) to verify wrapper effect
+        print(f"Checking {module_name} after wrapping...")
+        self._check_module_output_similarity(module, wrapped_module, block_inputs[:min(5, len(block_inputs))])
+        
         # Collect wrappers
         wrappers = []
         if isinstance(wrapped_module, WrapperLinear):
@@ -358,49 +362,47 @@ class Bitween:
         
         # Step 3: Setup optimizer parameters
         learnable_params = []
-        for wrapper in wrappers:
+        param_info = []
+        for i, wrapper in enumerate(wrappers):
             if wrapper.value is not None:
                 learnable_params.append(wrapper.value)
+                param_info.append(f"wrapper{i}_value: {wrapper.value.numel()} params")
             if wrapper.min_scale is not None:
                 learnable_params.append(wrapper.min_scale)
+                param_info.append(f"wrapper{i}_min_scale: {wrapper.min_scale.numel()} params")
             if wrapper.max_scale is not None:
                 learnable_params.append(wrapper.max_scale)
+                param_info.append(f"wrapper{i}_max_scale: {wrapper.max_scale.numel()} params")
         
         if not learnable_params:
             print("Warning: No learnable parameters found")
             return
         
-        # Setup SignSGD optimizer with adaptive learning rate scheduling
         optimizer = SignSGD(learnable_params, lr=self.lr, momentum=0.9)
         
-        # Calculate total optimizer steps: epochs × samples_per_epoch
-        # Each epoch processes all samples in mini-batches, then updates parameters
         batch_size = min(batch_size, num_samples)  # Process in mini-batches to avoid memory issues
         steps_per_epoch = (num_samples + batch_size - 1) // batch_size
         total_steps = self.iters * steps_per_epoch
         
-        # Setup combined scheduler based on actual optimizer steps
-        warmup_steps = total_steps // 10  # Warmup for 10% of steps
-        scheduler = CombinedScheduler(
-            optimizer, 
-            target_lr=self.lr,
-            warmup_steps=warmup_steps,
-            patience=total_steps // 20,  # Patience for 5% of steps  
-            factor=0.8,
-            min_lr=self.lr * 0.01,
-            verbose=False
+        # Use LinearLR scheduler like AutoRound (1.0 -> 0.0 over total_steps)
+        scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=1.0, end_factor=0.0, total_iters=total_steps
         )
         
         print(f"Training setup: {self.iters} epochs × {steps_per_epoch} steps/epoch = {total_steps} total steps")
-        print(f"Batch size: {batch_size}, Warmup: {warmup_steps} steps, Patience: {max(steps_per_epoch, total_steps // 20)} steps")
+        # print(f"Batch size: {batch_size}, Warmup: {warmup_steps} steps, Patience: {max(steps_per_epoch, total_steps // 20)} steps")
         
         # Step 4: Training loop - Process samples in mini-batches
         best_loss = float('inf')
         loss_history = []
         global_step = 0
+        step_losses = []  # Track loss at each step
+        
+        print(f"Starting training loop: {self.iters} epochs, {steps_per_epoch} steps/epoch")
         
         for epoch in range(self.iters):
             epoch_loss = 0.0
+            epoch_step_losses = []
             
             # Process all samples in mini-batches for this epoch
             for batch_start in range(0, num_samples, batch_size):
@@ -424,37 +426,54 @@ class Bitween:
                     
                     # MSE loss between original and quantized outputs
                     loss = F.mse_loss(quant_out, orig_out)
-                    batch_loss += loss.item()
+                    
+                    # AutoRound approach: Scale loss by 1000 for better gradients
+                    scaled_loss = loss * 1000
+                    batch_loss += scaled_loss.item()  # Store scaled loss for reporting
                     
                     # Backward pass - accumulate gradients for this mini-batch
-                    loss.backward()
+                    scaled_loss.backward()
+                
+                # Check gradient magnitudes before optimizer step
+                grad_info = []
+                for i, param in enumerate(learnable_params):
+                    if param.grad is not None:
+                        grad_norm = param.grad.norm().item()
+                        grad_info.append(f"param{i}: {grad_norm:.6f}")
+                    else:
+                        grad_info.append(f"param{i}: NO_GRAD")
                 
                 # Update parameters using SignSGD with accumulated gradients
                 optimizer.step()
                 global_step += 1
                 
-                # Update learning rate scheduler
-                avg_batch_loss = batch_loss / (batch_end - batch_start)
-                scheduler.step(avg_batch_loss, global_step)
-                epoch_loss += batch_loss
+                # Update learning rate scheduler (AutoRound style)
+                scheduler.step()
                 
-                # Track best parameters
-                if avg_batch_loss < best_loss:
-                    best_loss = avg_batch_loss
-                    for wrapper in wrappers:
-                        wrapper.update_best_params(avg_batch_loss)
+                avg_batch_loss = batch_loss / (batch_end - batch_start)
+                epoch_loss += batch_loss
+                step_losses.append(avg_batch_loss)
+                epoch_step_losses.append(avg_batch_loss)
+                
+                # Print step-by-step progress every few steps
+                if global_step % max(1, steps_per_epoch // 4) == 0 or global_step <= 3:
+                    current_lr = scheduler.get_lr()[0]
+                    print(f"  Step {global_step}/{total_steps}: loss={avg_batch_loss:.6f}, lr={current_lr:.6f}")
             
             # Epoch statistics
             avg_epoch_loss = epoch_loss / num_samples
             loss_history.append(avg_epoch_loss)
             
-            # Progress reporting
+            # Detailed epoch reporting
+            epoch_min = min(epoch_step_losses) if epoch_step_losses else 0
+            epoch_max = max(epoch_step_losses) if epoch_step_losses else 0
             current_lr = scheduler.get_lr()[0]
-            print(f"Epoch {epoch + 1}/{self.iters}: Avg Loss={avg_epoch_loss:.6f}, LR={current_lr:.6f}, Steps={global_step}")
-        
-        # Final statistics
-        improvement = (loss_history[0] - best_loss) / loss_history[0] * 100 if loss_history else 0
-        print(f"Block optimization complete. Best loss: {best_loss:.6f} ({improvement:.1f}% improvement)")
+            
+            print(f"Epoch {epoch + 1}/{self.iters}: Avg={avg_epoch_loss:.6f}, Min={epoch_min:.6f}, Max={epoch_max:.6f}, LR={current_lr:.6f}")
+            
+        best_loss = avg_batch_loss
+        # Final statistics with more detail
+        print(f"Training complete. Final loss: {best_loss:.6f}")
         
         # Step 5: Apply best parameters and convert to QuantizedLinear
         for wrapper_inst in wrappers:
@@ -470,6 +489,45 @@ class Bitween:
         
         # Return quantized layer for single layer case, None for block case
         return result if isinstance(wrapped_module, WrapperLinear) else None
+    
+    def _check_module_output_similarity(self, orig_module, wrapped_module, sample_inputs):
+        """Check output similarity between original and wrapped module."""
+        if not sample_inputs:
+            return
+            
+        orig_module.eval()
+        wrapped_module.eval()
+        
+        total_error = 0.0
+        max_error = 0.0
+        
+        with torch.no_grad():
+            for i, inp in enumerate(sample_inputs):
+                inp = inp.to(next(orig_module.parameters()).device)
+                
+                orig_out = orig_module(inp)
+                wrapped_out = wrapped_module(inp)
+                
+                if isinstance(orig_out, tuple):
+                    orig_out = orig_out[0]
+                if isinstance(wrapped_out, tuple):
+                    wrapped_out = wrapped_out[0]
+                
+                error = (orig_out - wrapped_out).abs()
+                sample_max_error = error.max().item()
+                sample_mean_error = error.mean().item()
+                
+                total_error += sample_mean_error
+                max_error = max(max_error, sample_max_error)
+                
+                if i < 2:  # Show first 2 samples
+                    print(f"  Sample {i}: max_err={sample_max_error:.6f}, mean_err={sample_mean_error:.6f}")
+        
+        avg_error = total_error / len(sample_inputs)
+        print(f"  Wrapped module error: max={max_error:.6f}, avg={avg_error:.6f}")
+        
+        if avg_error > 1.0:
+            print(f"  WARNING: Large error after wrapping - quantization may be unstable!")
     
     def _get_module(self, model, module_name: str):
         """Get a module by its dotted name."""

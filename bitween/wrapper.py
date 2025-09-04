@@ -91,8 +91,8 @@ class WrapperLinear(nn.Module):
         
         # Learnable rounding parameter (value)
         if self.enable_round_tuning:
-            # Initialize with small random values around zero
-            value_param = torch.zeros_like(self.orig_weight) * 0.01
+            # Initialize with zeros like AutoRound
+            value_param = torch.zeros_like(self.orig_weight)
             self.value = nn.Parameter(value_param)
         else:
             self.value = None
@@ -113,38 +113,40 @@ class WrapperLinear(nn.Module):
         """Apply quantization using learnable parameters."""
         weight = self.orig_weight.clone()
         
-        # Apply learnable rounding adjustment
-        if self.value is not None:
-            weight = weight + self.value
-        
-        # Use the base quantization approach with learnable adjustments
+        # AutoRound approach: Apply learnable parameters during quantization process
         out_features, in_features = weight.shape
         num_groups = in_features // self.group_size
         
-        # Reshape for group-wise quantization
+        # Reshape for group-wise quantization 
         weight_grouped = weight.view(out_features, num_groups, self.group_size)
         
-        # Calculate quantization parameters per group
+        # Calculate base quantization parameters per group
         max_val = (1 << self.bits) - 1
-        w_min = weight_grouped.min(dim=-1, keepdim=True)[0]  # Shape: (out_features, num_groups, 1)
-        w_max = weight_grouped.max(dim=-1, keepdim=True)[0]  # Shape: (out_features, num_groups, 1)
+        w_min = weight_grouped.min(dim=-1, keepdim=True)[0]
+        w_max = weight_grouped.max(dim=-1, keepdim=True)[0]
         
-        # Base scale and zero_point calculation
-        scale = (w_max - w_min) / max_val  # Shape: (out_features, num_groups, 1)
-        zero_point = -w_min / scale        # Shape: (out_features, num_groups, 1)
-        
-        # Apply learnable min/max scaling adjustments
+        # Apply learnable min/max scale adjustments to the range
         if self.min_scale is not None and self.max_scale is not None:
-            # min_scale and max_scale have shape (out_features, num_groups)
-            # We need to add a dimension for broadcasting
-            scale_adjustment = self.min_scale.unsqueeze(-1) * self.max_scale.unsqueeze(-1)  # (out_features, num_groups, 1)
-            scale = scale * scale_adjustment
+            min_scale_expanded = self.min_scale.unsqueeze(-1)  # (out_features, num_groups, 1)
+            max_scale_expanded = self.max_scale.unsqueeze(-1)  # (out_features, num_groups, 1)
+            w_min = w_min * min_scale_expanded
+            w_max = w_max * max_scale_expanded
+        
+        # Calculate scale and zero_point
+        scale = (w_max - w_min) / max_val
+        scale = torch.clamp(scale, min=1e-8)  # Prevent division by zero
+        zero_point = -w_min / scale
+        
+        # Scale weights to quantized range
+        weight_scaled = weight_grouped / scale + zero_point
+        
+        # AutoRound key innovation: Add learnable rounding perturbation AFTER scaling
+        if self.value is not None:
+            value_grouped = self.value.view(out_features, num_groups, self.group_size)
+            weight_scaled = weight_scaled + value_grouped
         
         # Apply quantization
-        weight_q = torch.clamp(
-            torch.round(weight_grouped / scale + zero_point),
-            0, max_val
-        )
+        weight_q = torch.clamp(torch.round(weight_scaled), 0, max_val)
         
         # Dequantize for forward pass
         weight_dq = scale * (weight_q - zero_point)
@@ -157,8 +159,8 @@ class WrapperLinear(nn.Module):
         return weight_dq, weight_q, scale_flat, zero_point_flat
     
     def forward(self, x):
-        """Forward pass with learnable quantization."""
-        # Get quantized weight using learnable parameters
+        """Forward pass always using learnable quantization."""
+        # Always use learnable parameters (even if they're zeros initially)
         weight_dq, _, _, _ = self._quantize_weight_with_learnable_params()
         
         # Apply linear transformation
