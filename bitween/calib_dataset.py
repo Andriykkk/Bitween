@@ -79,8 +79,6 @@ class CalibrationDataset:
     
     def _tokenize_texts(self, texts: List[str]):
         """Tokenize the text samples."""
-        print("Tokenizing texts...")
-        
         tokenized_samples = []
         
         for text in texts:

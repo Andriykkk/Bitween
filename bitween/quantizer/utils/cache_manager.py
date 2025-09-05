@@ -162,7 +162,6 @@ class CacheManager:
                     print(f"Warning: No cache chunks found for block {block_name}")
             
             print(f"Cached {len(block_names)} blocks to disk ({total_size_mb:.1f}MB total in chunks)")
-            print(f"Memory freed, using chunked disk storage")
             return cached_paths
         else:
             print(f"Cached inputs for {len(block_names)} blocks in memory")

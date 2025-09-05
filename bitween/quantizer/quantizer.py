@@ -64,15 +64,6 @@ class Bitween:
         if batch_size is not None:
             self.batch_size = batch_size
             
-        original_ppl = None
-        if evaluate_perplexity and self.tokenizer is not None and eval_samples > 0:
-            if self.tokenizer is None:
-                raise ValueError("Tokenizer must be provided for evaluation.")
-            print("\n--- Evaluating original model ---")
-            original_ppl = calculate_perplexity(self.model, self.tokenizer, eval_samples=eval_samples, **eval_kwargs)
-
-        print("\n--- Starting quantization ---")
-
         if not trainable:        
             # Create a deepcopy for quantization to keep the original model intact for KL-divergence
             quantized_model = copy.deepcopy(self.model)
@@ -107,6 +98,12 @@ class Bitween:
                 
         print("--- Quantization complete ---")
 
+        original_ppl = None
+        if evaluate_perplexity and self.tokenizer is not None and eval_samples > 0:
+            if self.tokenizer is None:
+                raise ValueError("Tokenizer must be provided for evaluation.")
+            original_ppl = calculate_perplexity(self.model, self.tokenizer, eval_samples=eval_samples, **eval_kwargs)
+
         if evaluate_perplexity and self.tokenizer is not None and eval_samples > 0:
             print("\n--- Evaluating quantized model ---")
             quantized_ppl = calculate_perplexity(quantized_model, self.tokenizer, eval_samples=eval_samples, **eval_kwargs)
@@ -135,6 +132,9 @@ class Bitween:
         if self.tokenizer is None:
             raise ValueError("Tokenizer is required for trainable quantization")
         
+        # Keep reference to original model for comparison
+        self._original_model = self.model
+        
         # Create a copy of the model for quantization
         quantized_model = copy.deepcopy(self.model)
         
@@ -143,7 +143,6 @@ class Bitween:
         print(f"Detected {len(block_names)} blocks: {block_names}")
         
         # Step 2: Load calibration dataset 
-        print(f"Loading calibration dataset: {calib_dataset}")
         dataset_nsamples = nsamples if nsamples is not None else 10000
         calib_data = get_calibration_dataset(
             dataset_name=calib_dataset,
@@ -153,7 +152,6 @@ class Bitween:
         )
         
         actual_nsamples = len(calib_data)
-        print(f"Using {actual_nsamples} calibration samples for training")
         
         # Step 3: Cache inputs for all modules
         cached_inputs = CacheManager.cache_block_inputs(
@@ -173,46 +171,127 @@ class Bitween:
                 ignore_layers=self.ignore_layers
             )
             
-            # Step 5: PHASE 2 - Train each wrapped module individually
-            from ..wrapper import train_individual_wrapper
+            # Store wrapped info for user access
+            self._wrapped_info = wrapped_info
+            self._cached_inputs = cached_inputs
             
-            print(f"\n=== Training Phase ===")
-            for module_name, wrapper_info in wrapped_info.items():
-                print(f"\nPreparing training for: {module_name}")
-                
-                # Load cached inputs for this module
-                block_inputs = CacheManager.load_block_cache(
-                    cached_inputs, module_name, cache_to_disk=self.cache_to_disk
-                )
-                
-                if not block_inputs:
-                    print(f"Warning: No cached inputs found for {module_name}, skipping...")
-                    continue
-                
-                # Train this wrapper individually
-                result = train_individual_wrapper(
-                    module_name=module_name,
-                    wrapped_module=wrapper_info['wrapped_module'],
-                    block_inputs=block_inputs,
-                    iters=self.iters,
-                    lr=self.lr,
-                    batch_size=batch_size,
-                    is_single_layer=wrapper_info['is_single_layer']
-                )
-                
-                # If it's a single layer, replace it in the model
-                if wrapper_info['is_single_layer'] and result is not None:
-                    _set_module(quantized_model, module_name, result)
-                    print(f"Replaced {module_name} with quantized version")
-                
-                # Clean up cache for this module to free memory
-                CacheManager.cleanup_block_cache(cached_inputs, module_name, cache_to_disk=self.cache_to_disk)
+            self.model = quantized_model
+            
+            self.train_all()
+            
+            # Return the trained model
+            return quantized_model
         
-        finally:
-            # Always clean up all cache files when done
+        except Exception as e:
+            # Always clean up on error
             CacheManager.cleanup_all_cache(cached_inputs, cache_to_disk=self.cache_to_disk)
+            raise e
+    
+    def quick_eval(self, eval_samples=50, **eval_kwargs):
+        """Quick evaluation of wrapped model vs original."""
+        if not hasattr(self, '_wrapped_info'):
+            raise ValueError("Model not wrapped yet. Call quantize() first.")
+            
+        from ..wrapper import quick_eval_during_training
+        return quick_eval_during_training(
+            model=self.model, 
+            original_model=self._original_model,
+            tokenizer=self.tokenizer,
+            eval_samples=eval_samples
+        )
+    
+    def train_module(self, module_name: str, additional_iters: Optional[int] = None, auto_eval=True, eval_samples=50):
+        """Train a specific wrapped module."""
+        if not hasattr(self, '_wrapped_info'):
+            raise ValueError("Model not wrapped yet. Call quantize() first.")
+            
+        if module_name not in self._wrapped_info:
+            raise ValueError(f"Module {module_name} not found in wrapped modules")
         
-        return quantized_model
+        from ..wrapper import train_individual_wrapper
+        
+        wrapper_info = self._wrapped_info[module_name]
+        
+        # Load cached inputs
+        block_inputs = CacheManager.load_block_cache(
+            self._cached_inputs, module_name, cache_to_disk=self.cache_to_disk
+        )
+        
+        if not block_inputs:
+            print(f"Warning: No cached inputs found for {module_name}")
+            return
+        
+        iters = additional_iters if additional_iters is not None else self.iters
+        
+        # Train the module
+        result = train_individual_wrapper(
+            module_name=module_name,
+            wrapped_module=wrapper_info['wrapped_module'],
+            block_inputs=block_inputs,
+            iters=iters,
+            lr=self.lr,
+            batch_size=self.batch_size,
+            is_single_layer=wrapper_info['is_single_layer']
+        )
+        
+        if wrapper_info['is_single_layer'] and result is not None:
+            _set_module(self.model, module_name, result)
+            print(f"Applied trained quantization to {module_name}")
+        else:
+            from ..wrapper import WrapperLinear
+            wrappers = []
+            wrapped_module = wrapper_info['wrapped_module']
+            for name, submodule in wrapped_module.named_modules():
+                if isinstance(submodule, WrapperLinear):
+                    wrappers.append(submodule)
+            
+            for wrapper in wrappers:
+                wrapper.apply_best_params()
+            print(f"Applied trained parameters to {len(wrappers)} wrappers in {module_name}")
+        
+        # Auto-evaluate after training
+        if auto_eval and self.tokenizer is not None:
+            self.quick_eval(eval_samples=eval_samples)
+    
+    def train_all(self, auto_eval=True, eval_samples=5):
+        """Train all wrapped modules."""
+        if not hasattr(self, '_wrapped_info'):
+            raise ValueError("Model not wrapped yet. Call quantize() first.")
+        
+        for i, module_name in enumerate(self._wrapped_info.keys()):
+            print(f"\n Training module {i+1}/{len(self._wrapped_info)}: {module_name}")
+            self.train_module(module_name, auto_eval=auto_eval, eval_samples=eval_samples)
+        
+        print("\n✅ All modules trained!")
+        
+        # Final evaluation
+        if auto_eval and self.tokenizer is not None:
+            self.quick_eval(eval_samples=eval_samples)
+    
+    def finalize(self):
+        """Convert wrapped model to final QuantizedLinear model."""
+        if not hasattr(self, '_wrapped_info'):
+            raise ValueError("Model not wrapped yet. Call quantize() first.")
+        
+        from ..wrapper import finalize_wrapped_model
+        
+        try:
+            quantized_model = finalize_wrapped_model(self.model, self._wrapped_info)
+            
+            # Clean up cache
+            CacheManager.cleanup_all_cache(self._cached_inputs, cache_to_disk=self.cache_to_disk)
+            
+            # Clean up wrapper info
+            delattr(self, '_wrapped_info')
+            delattr(self, '_cached_inputs')
+            
+            print("✅ Model finalized and ready for inference!")
+            return quantized_model
+            
+        finally:
+            # Always cleanup
+            if hasattr(self, '_cached_inputs'):
+                CacheManager.cleanup_all_cache(self._cached_inputs, cache_to_disk=self.cache_to_disk)
     
     
     def _get_block_names(self, model) -> List[str]:
