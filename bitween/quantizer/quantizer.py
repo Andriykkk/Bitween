@@ -1,15 +1,10 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from ..modules import QuantizedLinear
-from ..wrapper import WrapperLinear, unified_wrapper, unified_unwrapper
 from ..calib_dataset import get_calibration_dataset
-from ..utils.sign_sgd import SignSGD, CombinedScheduler
 from ..utils.evaluation import calculate_perplexity, calculate_kl_divergence, print_report
 import copy
-import gc
-from tqdm import tqdm
-from typing import Dict, List, Optional
+from typing import List, Optional
 from .func import _set_module
 from .utils.cache_manager import CacheManager
 
@@ -298,7 +293,7 @@ class Bitween:
     
     def _quantize_block(self, module, block_inputs: List[torch.Tensor], module_name: str, batch_size: int):
         """
-        Memory-efficient quantization using unified wrapper approach.
+        Simplified quantization function that delegates training to wrapper.py.
         
         Args:
             module: Module to quantize (block or individual layer)
@@ -306,228 +301,22 @@ class Bitween:
             module_name: Name of the module for logging and ignore checking
             batch_size: Training batch size
         """
-        if not block_inputs:
-            print("Warning: No cached inputs for this module, skipping...")
-            return
+        from ..wrapper import train_wrapped_module
         
-        num_samples = len(block_inputs)
-        
-        # Cache original outputs
-        original_outputs = []
-        module.eval()
-        
-        with torch.no_grad():
-            for inp in tqdm(block_inputs, desc="Caching original outputs", leave=False):
-                inp = inp.to(next(module.parameters()).device)
-                try:
-                    orig_out = module(inp)
-                    
-                    # Handle different output formats (tensor vs tuple)
-                    if isinstance(orig_out, tuple):
-                        orig_out = orig_out[0]
-                    
-                    original_outputs.append(orig_out.detach().cpu())
-                except Exception as e:
-                    print(f"Warning: Failed to cache output: {e}")
-                    continue
-        
-        # Step 2: Wrap using unified wrapper
-        wrapped_module, quantized_names = unified_wrapper(
-            module,
+        # Delegate all training logic to wrapper.py
+        return train_wrapped_module(
+            module=module,
+            block_inputs=block_inputs,
+            module_name=module_name,
+            iters=self.iters,
+            lr=self.lr,
+            batch_size=batch_size,
             enable_minmax_tuning=self.enable_minmax_tuning,
-            enable_round_tuning=True,
             bits=self.bits,
             group_size=self.group_size,
-            device=next(module.parameters()).device,
-            ignore_layers=self.ignore_layers,
-            module_prefix=module_name
+            ignore_layers=self.ignore_layers
         )
-        
-        if not quantized_names:
-            print(f"No linear layers found to quantize in: {module_name}")
-            return
-        
-        # Check perplexity after wrapping (before training) to verify wrapper effect
-        print(f"Checking {module_name} after wrapping...")
-        self._check_module_output_similarity(module, wrapped_module, block_inputs[:min(5, len(block_inputs))])
-        
-        # Collect wrappers
-        wrappers = []
-        if isinstance(wrapped_module, WrapperLinear):
-            wrappers = [wrapped_module]
-        else:
-            for name, submodule in wrapped_module.named_modules():
-                if isinstance(submodule, WrapperLinear):
-                    wrappers.append(submodule)
-        
-        # Step 3: Setup optimizer parameters
-        learnable_params = []
-        param_info = []
-        for i, wrapper in enumerate(wrappers):
-            if wrapper.value is not None:
-                learnable_params.append(wrapper.value)
-                param_info.append(f"wrapper{i}_value: {wrapper.value.numel()} params")
-            if wrapper.min_scale is not None:
-                learnable_params.append(wrapper.min_scale)
-                param_info.append(f"wrapper{i}_min_scale: {wrapper.min_scale.numel()} params")
-            if wrapper.max_scale is not None:
-                learnable_params.append(wrapper.max_scale)
-                param_info.append(f"wrapper{i}_max_scale: {wrapper.max_scale.numel()} params")
-        
-        if not learnable_params:
-            print("Warning: No learnable parameters found")
-            return
-        
-        optimizer = SignSGD(learnable_params, lr=self.lr, momentum=0.9)
-        
-        batch_size = min(batch_size, num_samples)  # Process in mini-batches to avoid memory issues
-        steps_per_epoch = (num_samples + batch_size - 1) // batch_size
-        total_steps = self.iters * steps_per_epoch
-        
-        # Use LinearLR scheduler like AutoRound (1.0 -> 0.0 over total_steps)
-        scheduler = torch.optim.lr_scheduler.LinearLR(
-            optimizer, start_factor=1.0, end_factor=0.0, total_iters=total_steps
-        )
-        
-        print(f"Training setup: {self.iters} epochs × {steps_per_epoch} steps/epoch = {total_steps} total steps")
-        # print(f"Batch size: {batch_size}, Warmup: {warmup_steps} steps, Patience: {max(steps_per_epoch, total_steps // 20)} steps")
-        
-        # Step 4: Training loop - Process samples in mini-batches
-        best_loss = float('inf')
-        loss_history = []
-        global_step = 0
-        step_losses = []  # Track loss at each step
-        
-        print(f"Starting training loop: {self.iters} epochs, {steps_per_epoch} steps/epoch")
-        
-        for epoch in range(self.iters):
-            epoch_loss = 0.0
-            epoch_step_losses = []
-            
-            # Process all samples in mini-batches for this epoch
-            for batch_start in range(0, num_samples, batch_size):
-                batch_end = min(batch_start + batch_size, num_samples)
-                
-                # Clear gradients once per mini-batch
-                optimizer.zero_grad()
-                batch_loss = 0.0
-                
-                # Process mini-batch and accumulate gradients
-                for i in range(batch_start, batch_end):
-                    inp = block_inputs[i].to(next(wrapped_module.parameters()).device)
-                    orig_out = original_outputs[i].to(inp.device)
-                    
-                    # Forward pass through quantized module
-                    quant_out = wrapped_module(inp)
-                    
-                    # Handle tuple outputs (extract main tensor)
-                    if isinstance(quant_out, tuple):
-                        quant_out = quant_out[0]
-                    
-                    # MSE loss between original and quantized outputs
-                    loss = F.mse_loss(quant_out, orig_out)
-                    
-                    # AutoRound approach: Scale loss by 1000 for better gradients
-                    scaled_loss = loss * 1000
-                    batch_loss += scaled_loss.item()  # Store scaled loss for reporting
-                    
-                    # Backward pass - accumulate gradients for this mini-batch
-                    scaled_loss.backward()
-                
-                # Check gradient magnitudes before optimizer step
-                grad_info = []
-                for i, param in enumerate(learnable_params):
-                    if param.grad is not None:
-                        grad_norm = param.grad.norm().item()
-                        grad_info.append(f"param{i}: {grad_norm:.6f}")
-                    else:
-                        grad_info.append(f"param{i}: NO_GRAD")
-                
-                # Update parameters using SignSGD with accumulated gradients
-                optimizer.step()
-                global_step += 1
-                
-                # Update learning rate scheduler (AutoRound style)
-                scheduler.step()
-                
-                avg_batch_loss = batch_loss / (batch_end - batch_start)
-                epoch_loss += batch_loss
-                step_losses.append(avg_batch_loss)
-                epoch_step_losses.append(avg_batch_loss)
-                
-                # Print step-by-step progress every few steps
-                if global_step % max(1, steps_per_epoch // 4) == 0 or global_step <= 3:
-                    current_lr = scheduler.get_lr()[0]
-                    print(f"  Step {global_step}/{total_steps}: loss={avg_batch_loss:.6f}, lr={current_lr:.6f}")
-            
-            # Epoch statistics
-            avg_epoch_loss = epoch_loss / num_samples
-            loss_history.append(avg_epoch_loss)
-            
-            # Detailed epoch reporting
-            epoch_min = min(epoch_step_losses) if epoch_step_losses else 0
-            epoch_max = max(epoch_step_losses) if epoch_step_losses else 0
-            current_lr = scheduler.get_lr()[0]
-            
-            print(f"Epoch {epoch + 1}/{self.iters}: Avg={avg_epoch_loss:.6f}, Min={epoch_min:.6f}, Max={epoch_max:.6f}, LR={current_lr:.6f}")
-            
-        best_loss = avg_batch_loss
-        # Final statistics with more detail
-        print(f"Training complete. Final loss: {best_loss:.6f}")
-        
-        # Step 5: Apply best parameters and convert to QuantizedLinear
-        for wrapper_inst in wrappers:
-            wrapper_inst.apply_best_params()
-        
-        # Unwrap using unified unwrapper
-        result = unified_unwrapper(wrapped_module, apply_quantization=True)
-        
-        # Step 6: Clean up memory aggressively
-        del original_outputs, learnable_params, wrappers, optimizer, scheduler
-        gc.collect()
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
-        
-        # Return quantized layer for single layer case, None for block case
-        return result if isinstance(wrapped_module, WrapperLinear) else None
     
-    def _check_module_output_similarity(self, orig_module, wrapped_module, sample_inputs):
-        """Check output similarity between original and wrapped module."""
-        if not sample_inputs:
-            return
-            
-        orig_module.eval()
-        wrapped_module.eval()
-        
-        total_error = 0.0
-        max_error = 0.0
-        
-        with torch.no_grad():
-            for i, inp in enumerate(sample_inputs):
-                inp = inp.to(next(orig_module.parameters()).device)
-                
-                orig_out = orig_module(inp)
-                wrapped_out = wrapped_module(inp)
-                
-                if isinstance(orig_out, tuple):
-                    orig_out = orig_out[0]
-                if isinstance(wrapped_out, tuple):
-                    wrapped_out = wrapped_out[0]
-                
-                error = (orig_out - wrapped_out).abs()
-                sample_max_error = error.max().item()
-                sample_mean_error = error.mean().item()
-                
-                total_error += sample_mean_error
-                max_error = max(max_error, sample_max_error)
-                
-                if i < 2:  # Show first 2 samples
-                    print(f"  Sample {i}: max_err={sample_max_error:.6f}, mean_err={sample_mean_error:.6f}")
-        
-        avg_error = total_error / len(sample_inputs)
-        print(f"  Wrapped module error: max={max_error:.6f}, avg={avg_error:.6f}")
-        
-        if avg_error > 1.0:
-            print(f"  WARNING: Large error after wrapping - quantization may be unstable!")
     
     def _get_module(self, model, module_name: str):
         """Get a module by its dotted name."""
