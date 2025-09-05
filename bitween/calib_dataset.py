@@ -69,8 +69,6 @@ class CalibrationDataset:
                 break
             texts.append(sample['text'])
         
-        print(f"Loaded {len(texts)} text samples")
-        
         if self.tokenizer is not None:
             self._tokenize_texts(texts)
         else:

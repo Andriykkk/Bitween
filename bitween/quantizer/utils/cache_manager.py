@@ -31,12 +31,9 @@ class CacheManager:
         Returns:
             Dictionary mapping block names to cache file paths or memory cache keys
         """
-        print("Caching intermediate activations...")
-        
         # Setup cache storage
         if cache_to_disk:
             cache_dir = tempfile.mkdtemp(prefix="bitween_cache_")
-            print(f"Using disk cache directory: {cache_dir}")
             cached_paths = {'_cache_dir': cache_dir}
         else:
             cached_inputs = {name: [] for name in block_names}

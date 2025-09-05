@@ -405,7 +405,7 @@ def wrap_model_for_training(model, block_names: List[str], enable_minmax_tuning:
     
     return wrapped_info
  
-def quick_eval_during_training(model, original_model, tokenizer, eval_samples=50):
+def quick_eval_during_training(model, original_model, tokenizer, eval_samples=5, verbose=False):
     """
     Quick evaluation function to check perplexity and KL divergence during training.
     Can be called anytime with the wrapped model.
@@ -415,6 +415,7 @@ def quick_eval_during_training(model, original_model, tokenizer, eval_samples=50
         original_model: Original model for comparison
         tokenizer: Tokenizer
         eval_samples: Number of samples (small for quick eval)
+        verbose: If True, show tqdm progress bars. If False, calculate silently.
     
     Returns:
         Dict with perplexity and KL divergence
@@ -424,14 +425,10 @@ def quick_eval_during_training(model, original_model, tokenizer, eval_samples=50
     model.eval()
     original_model.eval()
     
-    print(f"Quick eval ({eval_samples} samples)...")
-    
-    # Calculate perplexity
-    wrapped_ppl = calculate_perplexity(model, tokenizer, eval_samples=eval_samples)
-    original_ppl = calculate_perplexity(original_model, tokenizer, eval_samples=eval_samples)
-    
-    # Calculate KL divergence
-    kl_div, token_kl_div = calculate_kl_divergence(original_model, model, tokenizer, eval_samples=eval_samples)
+    # Calculate perplexity with optional verbose output
+    wrapped_ppl = calculate_perplexity(model, tokenizer, eval_samples=eval_samples, verbose=verbose)
+    original_ppl = calculate_perplexity(original_model, tokenizer, eval_samples=eval_samples, verbose=verbose)
+    kl_div, token_kl_div = calculate_kl_divergence(original_model, model, tokenizer, eval_samples=eval_samples, verbose=verbose)
     
     results = {
         'wrapped_ppl': wrapped_ppl,
@@ -440,8 +437,8 @@ def quick_eval_during_training(model, original_model, tokenizer, eval_samples=50
         'kl_div': kl_div
     }
     
-    print(f"  Original PPL: {original_ppl:.4f} | Wrapped PPL: {wrapped_ppl:.4f} | Diff: {results['ppl_diff']:+.4f}")
-    print(f"  KL Divergence: {kl_div:.6f}")
+    # Clean, concise output with per-token KL
+    print(f"PPL: {original_ppl:.4f} → {wrapped_ppl:.4f} ({results['ppl_diff']:+.4f}) | KL: {kl_div:.6f} | Per-token KL: {token_kl_div:.6f}")
     
     return results
 
@@ -531,16 +528,16 @@ def train_individual_wrapper(module_name: str, wrapped_module, block_inputs: Lis
         optimizer, start_factor=1.0, end_factor=0.0, total_iters=total_steps
     )
     
-    print(f"Training: {iters} epochs × {steps_per_epoch} steps = {total_steps} total steps")
-    
-    # Training loop
+    # Training loop with tqdm
     wrapped_module.train()
+    
+    progress_bar = tqdm(range(total_steps), desc=f"{module_name}", 
+                       bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}')
+    
     global_step = 0
+    current_loss = 0.0
     
     for epoch in range(iters):
-        epoch_loss = 0.0
-        epoch_step_losses = []
-        
         for batch_start in range(0, num_samples, batch_size):
             batch_end = min(batch_start + batch_size, num_samples)
             
@@ -570,22 +567,14 @@ def train_individual_wrapper(module_name: str, wrapped_module, block_inputs: Lis
             scheduler.step()
             global_step += 1
             
-            avg_batch_loss = batch_loss / (batch_end - batch_start)
-            epoch_loss += batch_loss
-            epoch_step_losses.append(avg_batch_loss)
+            current_loss = batch_loss / (batch_end - batch_start)
+            current_lr = scheduler.get_lr()[0]
             
-            # Progress reporting
-            if global_step % max(1, steps_per_epoch // 4) == 0 or global_step <= 3:
-                current_lr = scheduler.get_lr()[0]
-                print(f"  Step {global_step}/{total_steps}: loss={avg_batch_loss:.6f}, lr={current_lr:.6f}")
-        
-        # Epoch summary
-        avg_epoch_loss = epoch_loss / num_samples
-        epoch_min = min(epoch_step_losses) if epoch_step_losses else 0
-        epoch_max = max(epoch_step_losses) if epoch_step_losses else 0
-        current_lr = scheduler.get_lr()[0]
-        
-        print(f"Epoch {epoch + 1}/{iters}: Avg={avg_epoch_loss:.6f}, Min={epoch_min:.6f}, Max={epoch_max:.6f}, LR={current_lr:.6f}")
+            # Update progress bar
+            progress_bar.set_postfix_str(f"Loss: {current_loss:.4f} | LR: {current_lr:.6f}")
+            progress_bar.update(1)
+    
+    progress_bar.close()
     
     # Apply best parameters and unwrap
     for wrapper in wrappers:

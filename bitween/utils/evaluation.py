@@ -3,7 +3,7 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from tqdm import tqdm
 
-def calculate_perplexity(model, tokenizer, dataset_name="wikitext", dataset_config="wikitext-2-raw-v1", split="test", eval_samples=200, **kwargs):
+def calculate_perplexity(model, tokenizer, dataset_name="wikitext", dataset_config="wikitext-2-raw-v1", split="test", eval_samples=200, verbose=True, **kwargs):
     """
     Calculates the perplexity of a model on a given dataset.
     """
@@ -17,8 +17,10 @@ def calculate_perplexity(model, tokenizer, dataset_name="wikitext", dataset_conf
     total_neg_log_likelihood = 0
     total_tokens = 0
     
-    print(f"Calculating perplexity on {eval_samples} samples...")
-    for text in tqdm(text_samples):
+    # Use tqdm only if verbose
+    iterator = tqdm(text_samples, desc=f"Calculating perplexity on {eval_samples} samples") if verbose else text_samples
+    
+    for text in iterator:
         if not text:
             continue
             
@@ -38,12 +40,13 @@ def calculate_perplexity(model, tokenizer, dataset_name="wikitext", dataset_conf
     avg_neg_log_likelihood = total_neg_log_likelihood / total_tokens
     perplexity = torch.exp(torch.tensor(avg_neg_log_likelihood)).item()
     
-    print(f"Perplexity calculated: {perplexity:.4f}")
+    if verbose:
+        print(f"Perplexity calculated: {perplexity:.4f}")
     return perplexity
 
 def calculate_kl_divergence(original_model, quantized_model, tokenizer, 
                             dataset_name="wikitext", dataset_config="wikitext-2-raw-v1", 
-                            split="test", eval_samples=200, **kwargs):
+                            split="test", eval_samples=200, verbose=True, **kwargs):
     """
     Calculates both batch-mean KL and per-token KL divergence between the outputs of two models.
     """
@@ -60,8 +63,13 @@ def calculate_kl_divergence(original_model, quantized_model, tokenizer,
     total_kl = 0.0
     total_tokens = 0
 
-    print(f"Calculating KL-Divergence on {eval_samples} samples...")
-    for text in tqdm(text_samples):
+    if verbose:
+        print(f"Calculating KL-Divergence on {eval_samples} samples...")
+    
+    # Use tqdm only if verbose
+    iterator = tqdm(text_samples) if verbose else text_samples
+    
+    for text in iterator:
         if not text.strip():
             continue
 
@@ -93,8 +101,9 @@ def calculate_kl_divergence(original_model, quantized_model, tokenizer,
     avg_kl_div = total_kl_div / num_batches if num_batches > 0 else 0.0
     avg_kl_per_token = total_kl / total_tokens if total_tokens > 0 else 0.0
 
-    print(f"Average KL-Divergence (batchmean): {avg_kl_div:.6f}")
-    print(f"Average KL-Divergence per token  : {avg_kl_per_token:.6f}")
+    if verbose:
+        print(f"Average KL-Divergence (batchmean): {avg_kl_div:.6f}")
+        print(f"Average KL-Divergence per token  : {avg_kl_per_token:.6f}")
 
     return avg_kl_div, avg_kl_per_token
 

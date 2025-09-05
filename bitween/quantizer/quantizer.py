@@ -187,7 +187,7 @@ class Bitween:
             CacheManager.cleanup_all_cache(cached_inputs, cache_to_disk=self.cache_to_disk)
             raise e
     
-    def quick_eval(self, eval_samples=50, **eval_kwargs):
+    def quick_eval(self, eval_samples=50, verbose=False, **eval_kwargs):
         """Quick evaluation of wrapped model vs original."""
         if not hasattr(self, '_wrapped_info'):
             raise ValueError("Model not wrapped yet. Call quantize() first.")
@@ -197,7 +197,8 @@ class Bitween:
             model=self.model, 
             original_model=self._original_model,
             tokenizer=self.tokenizer,
-            eval_samples=eval_samples
+            eval_samples=eval_samples,
+            verbose=verbose
         )
     
     def train_module(self, module_name: str, additional_iters: Optional[int] = None, auto_eval=True, eval_samples=50):
@@ -247,7 +248,6 @@ class Bitween:
             
             for wrapper in wrappers:
                 wrapper.apply_best_params()
-            print(f"Applied trained parameters to {len(wrappers)} wrappers in {module_name}")
         
         # Auto-evaluate after training
         if auto_eval and self.tokenizer is not None:
@@ -259,12 +259,8 @@ class Bitween:
             raise ValueError("Model not wrapped yet. Call quantize() first.")
         
         for i, module_name in enumerate(self._wrapped_info.keys()):
-            print(f"\n Training module {i+1}/{len(self._wrapped_info)}: {module_name}")
             self.train_module(module_name, auto_eval=auto_eval, eval_samples=eval_samples)
         
-        print("\n✅ All modules trained!")
-        
-        # Final evaluation
         if auto_eval and self.tokenizer is not None:
             self.quick_eval(eval_samples=eval_samples)
     
