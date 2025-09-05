@@ -122,7 +122,7 @@ class Bitween:
 
     def _trainable_quantize(self, calib_dataset: str, nsamples: Optional[int], batch_size: int):
         """
-        Performs trainable quantization using calibration dataset.
+        Performs trainable quantization using new wrap-then-train approach.
         
         Args:
             calib_dataset (str): Name of calibration dataset
@@ -155,29 +155,53 @@ class Bitween:
         actual_nsamples = len(calib_data)
         print(f"Using {actual_nsamples} calibration samples for training")
         
-        # Step 3: Cache inputs and quantize each module
+        # Step 3: Cache inputs for all modules
         cached_inputs = CacheManager.cache_block_inputs(
             quantized_model, calib_data, block_names, actual_nsamples,
             cache_to_disk=self.cache_to_disk, max_memory_mb=self.max_memory_mb
         )
         
         try:
-            for module_name in block_names:
-                print(f"\n--- Quantizing: {module_name} ---")
-                module = self._get_module(quantized_model, module_name)
+            # Step 4: PHASE 1 - Wrap all modules
+            from ..wrapper import wrap_model_for_training
+            wrapped_info = wrap_model_for_training(
+                model=quantized_model,
+                block_names=block_names,
+                enable_minmax_tuning=self.enable_minmax_tuning,
+                bits=self.bits,
+                group_size=self.group_size,
+                ignore_layers=self.ignore_layers
+            )
+            
+            # Step 5: PHASE 2 - Train each wrapped module individually
+            from ..wrapper import train_individual_wrapper
+            
+            print(f"\n=== Training Phase ===")
+            for module_name, wrapper_info in wrapped_info.items():
+                print(f"\nPreparing training for: {module_name}")
                 
                 # Load cached inputs for this module
-                block_inputs = CacheManager.load_block_cache(cached_inputs, module_name, cache_to_disk=self.cache_to_disk)
+                block_inputs = CacheManager.load_block_cache(
+                    cached_inputs, module_name, cache_to_disk=self.cache_to_disk
+                )
                 
                 if not block_inputs:
                     print(f"Warning: No cached inputs found for {module_name}, skipping...")
                     continue
                 
-                # Quantize the module using unified approach
-                result = self._quantize_block(module, block_inputs, module_name, batch_size)
+                # Train this wrapper individually
+                result = train_individual_wrapper(
+                    module_name=module_name,
+                    wrapped_module=wrapper_info['wrapped_module'],
+                    block_inputs=block_inputs,
+                    iters=self.iters,
+                    lr=self.lr,
+                    batch_size=batch_size,
+                    is_single_layer=wrapper_info['is_single_layer']
+                )
                 
-                # If it's a single layer, we need to replace it in the model
-                if isinstance(module, nn.Linear) and result is not None:
+                # If it's a single layer, replace it in the model
+                if wrapper_info['is_single_layer'] and result is not None:
                     _set_module(quantized_model, module_name, result)
                     print(f"Replaced {module_name} with quantized version")
                 
@@ -291,31 +315,6 @@ class Bitween:
         return block_names
     
     
-    def _quantize_block(self, module, block_inputs: List[torch.Tensor], module_name: str, batch_size: int):
-        """
-        Simplified quantization function that delegates training to wrapper.py.
-        
-        Args:
-            module: Module to quantize (block or individual layer)
-            block_inputs: List of ALL input tensors cached for this module
-            module_name: Name of the module for logging and ignore checking
-            batch_size: Training batch size
-        """
-        from ..wrapper import train_wrapped_module
-        
-        # Delegate all training logic to wrapper.py
-        return train_wrapped_module(
-            module=module,
-            block_inputs=block_inputs,
-            module_name=module_name,
-            iters=self.iters,
-            lr=self.lr,
-            batch_size=batch_size,
-            enable_minmax_tuning=self.enable_minmax_tuning,
-            bits=self.bits,
-            group_size=self.group_size,
-            ignore_layers=self.ignore_layers
-        )
     
     
     def _get_module(self, model, module_name: str):

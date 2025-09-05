@@ -566,6 +566,229 @@ def train_wrapped_module(module, block_inputs: List[torch.Tensor], module_name: 
     return result if isinstance(wrapped_module, WrapperLinear) else None
 
 
+def wrap_model_for_training(model, block_names: List[str], enable_minmax_tuning: bool, 
+                           bits: int, group_size: int, ignore_layers: set):
+    """
+    First phase: Wrap all blocks/layers with WrapperLinear for training.
+    
+    Args:
+        model: The model to wrap
+        block_names: List of block/layer names to wrap
+        enable_minmax_tuning: Whether to enable min/max scale tuning
+        bits: Quantization bits
+        group_size: Group size for quantization
+        ignore_layers: Set of layer names to ignore
+    
+    Returns:
+        Dictionary mapping block names to their wrapper info
+    """
+    wrapped_info = {}
+    
+    print("=== Wrapping Phase ===")
+    for module_name in block_names:
+        print(f"Wrapping: {module_name}")
+        
+        # Get the module
+        module = _get_module(model, module_name)
+        
+        # Wrap the module
+        wrapped_module, quantized_names = unified_wrapper(
+            module,
+            enable_minmax_tuning=enable_minmax_tuning,
+            enable_round_tuning=True,
+            bits=bits,
+            group_size=group_size,
+            device=next(module.parameters()).device,
+            ignore_layers=ignore_layers,
+            module_prefix=module_name
+        )
+        
+        if quantized_names:
+            wrapped_info[module_name] = {
+                'wrapped_module': wrapped_module,
+                'quantized_names': quantized_names,
+                'is_single_layer': isinstance(wrapped_module, WrapperLinear)
+            }
+            print(f"  Wrapped {len(quantized_names)} layers in {module_name}")
+        else:
+            print(f"  No layers to wrap in {module_name}")
+    
+    print(f"Wrapped {len(wrapped_info)} modules total")
+    return wrapped_info
+
+
+def train_individual_wrapper(module_name: str, wrapped_module, block_inputs: List[torch.Tensor],
+                           iters: int, lr: float, batch_size: int, is_single_layer: bool):
+    """
+    Second phase: Train an individual wrapped module.
+    
+    Args:
+        module_name: Name of the module being trained
+        wrapped_module: The wrapped module to train
+        block_inputs: Cached inputs for this module
+        iters: Number of training epochs
+        lr: Learning rate
+        batch_size: Training batch size
+        is_single_layer: Whether this is a single layer or block
+        
+    Returns:
+        Trained module result or None for blocks
+    """
+    print(f"\n=== Training: {module_name} ===")
+    
+    if not block_inputs:
+        print("Warning: No cached inputs for this module, skipping...")
+        return None
+    
+    num_samples = len(block_inputs)
+    device = next(wrapped_module.parameters()).device
+    
+    # Cache original outputs (before training)
+    print("Caching original outputs...")
+    original_outputs = []
+    wrapped_module.eval()
+    
+    with torch.no_grad():
+        for inp in tqdm(block_inputs, desc="Caching outputs", leave=False):
+            inp = inp.to(device)
+            try:
+                # Get output from the original module (before wrapping)
+                # We need to temporarily unwrap to get clean baseline
+                if is_single_layer:
+                    orig_out = wrapped_module.orig_layer(inp)
+                else:
+                    # For blocks, we need the original module - create temporary unwrapped version
+                    temp_unwrapped = unified_unwrapper(copy.deepcopy(wrapped_module), apply_quantization=False)
+                    orig_out = temp_unwrapped(inp)
+                    del temp_unwrapped
+                
+                # Handle different output formats
+                if isinstance(orig_out, tuple):
+                    orig_out = orig_out[0]
+                
+                original_outputs.append(orig_out.detach().cpu())
+            except Exception as e:
+                print(f"Warning: Failed to cache output: {e}")
+                continue
+    
+    # Collect wrappers for training
+    wrappers = []
+    if is_single_layer:
+        wrappers = [wrapped_module]
+    else:
+        for name, submodule in wrapped_module.named_modules():
+            if isinstance(submodule, WrapperLinear):
+                wrappers.append(submodule)
+    
+    print(f"Found {len(wrappers)} wrappers to train")
+    
+    # Setup optimizer parameters
+    learnable_params = []
+    for i, wrapper in enumerate(wrappers):
+        if wrapper.value is not None:
+            learnable_params.append(wrapper.value)
+        if wrapper.min_scale is not None:
+            learnable_params.append(wrapper.min_scale)
+        if wrapper.max_scale is not None:
+            learnable_params.append(wrapper.max_scale)
+    
+    if not learnable_params:
+        print("Warning: No learnable parameters found")
+        return None
+    
+    optimizer = SignSGD(learnable_params, lr=lr, momentum=0.9)
+    
+    batch_size = min(batch_size, num_samples)
+    steps_per_epoch = (num_samples + batch_size - 1) // batch_size
+    total_steps = iters * steps_per_epoch
+    
+    # Learning rate scheduler
+    scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=1.0, end_factor=0.0, total_iters=total_steps
+    )
+    
+    print(f"Training: {iters} epochs × {steps_per_epoch} steps = {total_steps} total steps")
+    
+    # Training loop
+    wrapped_module.train()
+    global_step = 0
+    
+    for epoch in range(iters):
+        epoch_loss = 0.0
+        epoch_step_losses = []
+        
+        for batch_start in range(0, num_samples, batch_size):
+            batch_end = min(batch_start + batch_size, num_samples)
+            
+            optimizer.zero_grad()
+            batch_loss = 0.0
+            
+            # Process mini-batch
+            for i in range(batch_start, batch_end):
+                inp = block_inputs[i].to(device)
+                orig_out = original_outputs[i].to(device)
+                
+                # Forward pass through wrapped module
+                quant_out = wrapped_module(inp)
+                
+                if isinstance(quant_out, tuple):
+                    quant_out = quant_out[0]
+                
+                # MSE loss
+                loss = F.mse_loss(quant_out, orig_out)
+                scaled_loss = loss * 1000  # AutoRound scaling
+                batch_loss += scaled_loss.item()
+                
+                scaled_loss.backward()
+            
+            # Update parameters
+            optimizer.step()
+            scheduler.step()
+            global_step += 1
+            
+            avg_batch_loss = batch_loss / (batch_end - batch_start)
+            epoch_loss += batch_loss
+            epoch_step_losses.append(avg_batch_loss)
+            
+            # Progress reporting
+            if global_step % max(1, steps_per_epoch // 4) == 0 or global_step <= 3:
+                current_lr = scheduler.get_lr()[0]
+                print(f"  Step {global_step}/{total_steps}: loss={avg_batch_loss:.6f}, lr={current_lr:.6f}")
+        
+        # Epoch summary
+        avg_epoch_loss = epoch_loss / num_samples
+        epoch_min = min(epoch_step_losses) if epoch_step_losses else 0
+        epoch_max = max(epoch_step_losses) if epoch_step_losses else 0
+        current_lr = scheduler.get_lr()[0]
+        
+        print(f"Epoch {epoch + 1}/{iters}: Avg={avg_epoch_loss:.6f}, Min={epoch_min:.6f}, Max={epoch_max:.6f}, LR={current_lr:.6f}")
+    
+    # Apply best parameters and unwrap
+    for wrapper in wrappers:
+        wrapper.apply_best_params()
+    
+    # Convert to quantized
+    result = unified_unwrapper(wrapped_module, apply_quantization=True)
+    
+    # Cleanup
+    del original_outputs, learnable_params, optimizer, scheduler
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    print(f"Training complete for {module_name}")
+    return result if is_single_layer else None
+
+
+def _get_module(model, module_name: str):
+    """Get a module by its dotted name."""
+    tokens = module_name.split('.')
+    cur_mod = model
+    for token in tokens:
+        cur_mod = getattr(cur_mod, token)
+    return cur_mod
+
+
 def _check_module_output_similarity(orig_module, wrapped_module, sample_inputs):
     """Check output similarity between original and wrapped module."""
     if not sample_inputs:
