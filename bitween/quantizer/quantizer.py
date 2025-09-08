@@ -389,9 +389,6 @@ class Bitween:
         
         return block_names
     
-    
-    
-    
     def _get_module(self, model, module_name: str):
         """Get a module by its dotted name."""
         return CacheManager._get_module(model, module_name)

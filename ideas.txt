@@ -1,5 +1,8 @@
-[ ] quantise 70b model to 2 bit
 [ ] add gradual quantisation
+    [ ] make usual algorithm that remove layers that have too high error and could not learn and some layers learn to lover bits
+    [ ] later think about quantising with separate model look for outliers and model that find hyperparameters and look what layers to train (check usual model and hyerarhical reasoning model)
+[ ] quantise 70b model to 2 bit
+[ ] quantise several neighbor blocks and move by one everytime like this blocks could learn to work with each other instead of blindly quantise each block
 [ ] add evaluation before and after quantisation
 [ ] add quantisation on cpu instead of gpu
 [ ] add outliers to separate matrix
