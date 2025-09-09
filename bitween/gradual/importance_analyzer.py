@@ -73,26 +73,28 @@ class ImportanceAnalyzer:
         # Run noise injection test first
         noise_scores = self._run_noise_injection_test()
         
-        # TODO: Add other importance methods
-        # rtn_scores = self._run_rtn_sensitivity_test() 
+        # Run RTN sensitivity test
+        rtn_scores = self._run_rtn_sensitivity_test()
+        
+        # TODO: Add layer upgrade test
         # layer_scores = self._run_layer_upgrade_test()
         
-        # Use separate noise injection scores
+        # Combine noise injection and RTN scores
         importance_scores = {}
         for block_name in self.block_names:
             block_noise_scores = noise_scores.get(block_name, {'ppl_recovery': 0.0, 'kl_recovery': 0.0})
+            block_rtn_scores = rtn_scores.get(block_name, {'8bit': 0.0, '4bit': 0.0, '2bit': 0.0})
             
-            # For now, use PPL recovery as main noise sensitivity
+            # Extract scores
             ppl_score = block_noise_scores['ppl_recovery']
             kl_score = block_noise_scores['kl_recovery']
             
             importance_scores[block_name] = ImportanceScore(
                 block_name=block_name,
                 noise_sensitivity=ppl_score,
-                rtn_8bit_impact=0.0,  # TODO
-                rtn_4bit_impact=0.0,  # TODO  
-                rtn_2bit_impact=0.0,  # TODO
-                disable_impact=0.0,   # TODO
+                rtn_8bit_impact=block_rtn_scores['8bit'],
+                rtn_4bit_impact=block_rtn_scores['4bit'],  
+                rtn_2bit_impact=block_rtn_scores['2bit'],
                 combined_score=ppl_score,  # Use PPL recovery as primary score for now
                 confidence=1.0
             )
@@ -155,6 +157,128 @@ class ImportanceAnalyzer:
         self._remove_all_wrappers(block_wrappers)
         
         return recovery_scores
+        
+    def _run_rtn_sensitivity_test(self) -> Dict[str, Dict[str, float]]:
+        """
+        Run RTN sensitivity test to measure block importance at different bit precisions.
+        
+        Tests 8-bit, 4-bit, and 2-bit quantization impact, then measures recovery
+        when each block is restored to full precision.
+        
+        Returns:
+            Dictionary mapping block names to dict with recovery scores for each precision
+        """
+        print("🔢 Running RTN sensitivity test...")
+        
+        # Get fixed calibration data (same as noise test)
+        fixed_input_tokens = self._get_fixed_calibration_data()
+        
+        rtn_results = {}
+        
+        # Test each precision level
+        for bits in [8, 4, 2]:
+            print(f"📊 Testing {bits}-bit RTN quantization...")
+            
+            # Phase 1: Wrap all blocks with RTN quantization
+            block_wrappers = {}
+            for block_name in self.block_names:
+                block_wrappers[block_name] = self._wrap_block_with_rtn(
+                    block_name, 
+                    bits=bits,
+                    group_size=32  # Standard group size
+                )
+                
+            # Phase 2: All blocks quantized baseline
+            for wrapper in block_wrappers.values():
+                wrapper.enable()
+                
+            print(f"📊 Measuring degraded baseline (all blocks {bits}-bit RTN)...")
+            degraded_baseline_ppl = self._evaluate_with_fixed_input(fixed_input_tokens)
+            degraded_baseline_logits = self._calculate_kl_between_states(fixed_input_tokens, f"all_{bits}bit", "baseline")
+            
+            print(f"🔻 Degraded baseline ({bits}-bit) - PPL: {degraded_baseline_ppl:.4f}")
+            
+            # Phase 3: Sequential recovery test
+            for target_block in self.block_names:
+                print(f"🎯 Testing recovery for {target_block} from {bits}-bit")
+                
+                # Restore this block to full precision
+                block_wrappers[target_block].disable()
+                
+                # Measure recovery
+                recovered_ppl = self._evaluate_with_fixed_input(fixed_input_tokens)
+                recovered_logits = self._calculate_kl_between_states(fixed_input_tokens, f"target_recovered_{bits}bit", target_block)
+                
+                # Calculate KL divergence between quantized and recovered states
+                kl_recovery = self._compare_logits_for_kl(degraded_baseline_logits, recovered_logits)
+                
+                # Calculate recovery scores
+                ppl_recovery = degraded_baseline_ppl - recovered_ppl
+                
+                print(f"Recovery for {target_block} ({bits}-bit): PPL: {ppl_recovery:.4f}, KL: {kl_recovery:.6f}")
+                
+                # Store results
+                if target_block not in rtn_results:
+                    rtn_results[target_block] = {}
+                    
+                rtn_results[target_block][f'{bits}bit'] = {
+                    'ppl_recovery': ppl_recovery,
+                    'kl_recovery': kl_recovery
+                }
+                
+                # Re-enable quantization for next iteration
+                block_wrappers[target_block].enable()
+                
+            # Phase 4: Cleanup - remove all wrappers for this precision
+            self._remove_all_rtn_wrappers(block_wrappers)
+            
+        # Convert to expected format for ImportanceScore
+        final_results = {}
+        for block_name in self.block_names:
+            final_results[block_name] = {
+                '8bit': rtn_results.get(block_name, {}).get('8bit', {}).get('ppl_recovery', 0.0),
+                '4bit': rtn_results.get(block_name, {}).get('4bit', {}).get('ppl_recovery', 0.0),
+                '2bit': rtn_results.get(block_name, {}).get('2bit', {}).get('ppl_recovery', 0.0)
+            }
+            
+        print("✅ RTN sensitivity test completed")
+        return final_results
+        
+    def _wrap_block_with_rtn(self, block_name: str, bits: int, group_size: int = 32):
+        """Wrap a block with RTN quantization wrapper."""
+        from .base_wrapper import RTNWrapper
+        from .utils import get_module_by_name, set_module_by_name
+        
+        # Get the original block
+        original_block = get_module_by_name(self.model, block_name)
+        
+        # Create RTN wrapper
+        wrapper = RTNWrapper(
+            wrapped_block=original_block,
+            bits=bits,
+            group_size=group_size,
+            storage_device=self.wrapper_storage_device,
+            block_name=block_name
+        )
+        
+        # Replace the block with wrapper
+        set_module_by_name(self.model, block_name, wrapper)
+        
+        return wrapper
+        
+    def _remove_all_rtn_wrappers(self, block_wrappers: Dict):
+        """Remove all RTN wrappers and restore original blocks."""
+        from .utils import set_module_by_name
+        
+        for block_name, wrapper in block_wrappers.items():
+            # Clean up quantization first
+            wrapper.cleanup()
+            
+            # Get original block from wrapper
+            original_block = wrapper.get_wrapped_block()
+            
+            # Restore original block
+            set_module_by_name(self.model, block_name, original_block)
         
     def analyze_layer_importance(self) -> Dict[str, float]:
         """

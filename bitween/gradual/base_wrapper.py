@@ -63,7 +63,22 @@ class BaseBlockWrapper(nn.Module):
             
         # Device management: move block to GPU if stored on CPU
         if self.storage_device == "cpu":
-            self.wrapped_block.to(x.device)
+            # Move the entire module to the target device
+            # This should handle all parameters and buffers automatically
+            self.wrapped_block = self.wrapped_block.to(x.device)
+            
+            # Double check that quantized layers have their buffers on the right device
+            for module in self.wrapped_block.modules():
+                if hasattr(module, 'qweight'):
+                    # Verify device alignment - if misaligned, fix it
+                    if module.qweight.device != x.device:
+                        module.qweight = module.qweight.to(x.device)
+                    if module.scale.device != x.device:
+                        module.scale = module.scale.to(x.device)
+                    if module.zero_point.device != x.device:
+                        module.zero_point = module.zero_point.to(x.device)
+                    if module.bias is not None and module.bias.device != x.device:
+                        module.bias = module.bias.to(x.device)
             
         try:
             # Pre-forward hook for modifications (noise, quantization, etc.)
@@ -78,7 +93,8 @@ class BaseBlockWrapper(nn.Module):
         finally:
             # Always return block to storage device to save memory
             if self.storage_device == "cpu":
-                self.wrapped_block.to("cpu")
+                # Move the entire module back to CPU
+                self.wrapped_block = self.wrapped_block.to("cpu")
                 
         return output
         
@@ -252,3 +268,134 @@ class NoiseWrapper(BaseBlockWrapper):
         """Change the noise seed."""
         self.seed = seed
         self.noise_generator.manual_seed(seed)
+
+
+class RTNWrapper(BaseBlockWrapper):
+    """
+    Wrapper that applies RTN quantization to all linear layers in a block.
+    Used for RTN sensitivity analysis.
+    """
+    
+    def __init__(
+        self,
+        wrapped_block: nn.Module,
+        bits: int = 8,
+        group_size: int = 32,
+        storage_device: str = "cpu",
+        block_name: str = None
+    ):
+        """
+        Initialize RTN wrapper.
+        
+        Args:
+            wrapped_block: Block to wrap
+            bits: Quantization bits (8, 4, or 2)
+            group_size: Group size for quantization
+            storage_device: Device management setting
+            block_name: Name for identification
+        """
+        super().__init__(wrapped_block, storage_device, block_name)
+        
+        self.bits = bits
+        self.group_size = group_size
+        
+        # Store original linear layers for restoration
+        self.original_layers = {}
+        self.quantized_layers = {}
+        self.quantization_applied = False
+        
+    def _pre_forward_hook(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply RTN quantization before forward pass."""
+        if self.enabled and not self.quantization_applied:
+            # Ensure we're applying quantization when the block is on the right device
+            target_device = x.device
+            self._apply_rtn_quantization(target_device)
+        return x
+        
+    def _post_forward_hook(self, output: torch.Tensor) -> torch.Tensor:
+        """Clean up after forward pass."""
+        return output
+        
+    def _apply_rtn_quantization(self, target_device=None):
+        """Apply RTN quantization to all linear layers in the block."""
+        if self.quantization_applied:
+            return
+            
+        from ..modules import QuantizedLinear
+        
+        # Find and quantize all linear layers
+        for name, module in self.wrapped_block.named_modules():
+            if isinstance(module, nn.Linear):
+                # Store original layer
+                full_name = f"{name}" if name else "root"
+                self.original_layers[full_name] = module
+                
+                # Create quantized version - ensure it's created on the right device
+                device_for_quantization = target_device if target_device is not None else module.weight.device
+                
+                # Temporarily move module to target device if needed for quantization
+                original_device = module.weight.device
+                if device_for_quantization != original_device:
+                    module = module.to(device_for_quantization)
+                
+                quantized_layer = QuantizedLinear.from_float(
+                    module, 
+                    bits=self.bits, 
+                    group_size=self.group_size
+                )
+                
+                # Ensure quantized layer is on the target device
+                quantized_layer = quantized_layer.to(device_for_quantization)
+                
+                # Replace the layer
+                self._set_submodule(self.wrapped_block, name, quantized_layer)
+                self.quantized_layers[full_name] = quantized_layer
+                
+        self.quantization_applied = True
+        
+    def _remove_rtn_quantization(self):
+        """Restore original linear layers."""
+        if not self.quantization_applied:
+            return
+            
+        # Restore all original layers
+        for name, original_layer in self.original_layers.items():
+            if name == "root":
+                # Handle root level replacement if needed
+                continue
+            else:
+                self._set_submodule(self.wrapped_block, name, original_layer)
+                
+        self.quantization_applied = False
+        
+    def _set_submodule(self, parent_module, module_name, new_module):
+        """Set submodule by name."""
+        if not module_name:  # Root level
+            return
+            
+        parts = module_name.split('.')
+        current = parent_module
+        
+        # Navigate to parent
+        for part in parts[:-1]:
+            current = getattr(current, part)
+            
+        # Set the new module
+        setattr(current, parts[-1], new_module)
+        
+    def enable(self):
+        """Enable RTN quantization."""
+        super().enable()
+        if not self.quantization_applied:
+            self._apply_rtn_quantization()
+            
+    def disable(self):
+        """Disable RTN quantization and restore original layers."""
+        super().disable()
+        self._remove_rtn_quantization()
+        
+    def cleanup(self):
+        """Clean up and restore original state."""
+        self._remove_rtn_quantization()
+        self.original_layers.clear()
+        self.quantized_layers.clear()
