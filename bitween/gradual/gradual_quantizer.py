@@ -10,6 +10,9 @@ import copy
 from .importance_analyzer import ImportanceAnalyzer
 from .precision_optimizer import PrecisionOptimizer  
 from .evaluator import GradualEvaluator
+from .utils import get_transformer_block_names
+from ..utils.evaluation import calculate_perplexity
+
 
 
 class GradualQuantizer:
@@ -31,7 +34,9 @@ class GradualQuantizer:
         max_per_token_kl_divergence: float = 0.01,
         safety_multiplier: float = 2.0,
         calibration_samples: int = 128,
-        evaluation_samples: int = 5
+        evaluation_samples: int = 5,
+        ignore_layers: Optional[List[str]] = None,
+        cpu_offload: bool = False
     ):
         """
         Initialize gradual quantizer.
@@ -44,6 +49,8 @@ class GradualQuantizer:
             safety_multiplier: Multiply budget by this for working room
             calibration_samples: Samples for importance analysis
             evaluation_samples: Samples for final evaluation (kept small for speed)
+            ignore_layers: List of layer names to exclude from quantization
+            cpu_offload: Enable CPU offloading for memory efficiency (requires GPU)
         """
         self.model = model
         self.tokenizer = tokenizer
@@ -52,12 +59,34 @@ class GradualQuantizer:
         self.safety_multiplier = safety_multiplier
         self.calibration_samples = calibration_samples
         self.evaluation_samples = evaluation_samples
+
+        self.ignore_layers = ignore_layers
+        
+        # Device management - detect model's current device
+        self.gpu_available = torch.cuda.is_available()
+        self.model_device = next(self.model.parameters()).device
+        self.cpu_offload = cpu_offload if self.gpu_available and self.model_device.type == 'cuda' else False
+        
+        # Determine storage and working devices
+        if self.cpu_offload:
+            self.wrapper_storage_device = "cpu"
+            self.working_device = "cuda"
+            print("💾 CPU offload enabled - blocks will be stored on CPU and loaded to GPU for forward pass")
+        else:
+            self.wrapper_storage_device = str(self.model_device)
+            self.working_device = str(self.model_device)
+            if not self.gpu_available:
+                print("⚠️  No GPU available - running on CPU only")
         
         # Working budget with safety margin
         self.working_budget = max_perplexity_increase * safety_multiplier
         
-        # Initialize components
-        self.importance_analyzer = ImportanceAnalyzer(model, tokenizer, calibration_samples)
+        # Initialize components with device settings
+        self.importance_analyzer = ImportanceAnalyzer(
+            model, tokenizer, calibration_samples, 
+            wrapper_storage_device=self.wrapper_storage_device,
+            working_device=self.working_device
+        )
         self.precision_optimizer = PrecisionOptimizer(model, tokenizer)
         self.evaluator = GradualEvaluator(model, tokenizer)
         
@@ -92,12 +121,35 @@ class GradualQuantizer:
         return quantized_model
         
     def _establish_baseline(self):
-        """Measure original model performance and memory usage."""
-        pass
+        """Measure original model performance including perplexity and KL divergence baseline."""
+        # Calculate baseline perplexity
+        baseline_ppl = calculate_perplexity(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            eval_samples=self.evaluation_samples,
+            verbose=False
+        )
+        
+        self.baseline_metrics = {
+            'perplexity': baseline_ppl,
+            'perplexity_budget_absolute': baseline_ppl * (self.max_perplexity_increase / 100.0),
+            'working_budget_absolute': baseline_ppl * (self.working_budget / 100.0),
+            'kl_token_budget': self.max_per_token_kl_divergence
+        }
+        
+        return self.baseline_metrics
         
     def _discover_importance(self):
         """Run all importance discovery methods and aggregate results."""
-        pass
+        block_names = get_transformer_block_names(self.model, ignore_layers=self.ignore_layers)
+
+        print(f"Discovering importance for {len(block_names)} blocks: {block_names}")
+        
+        # Pass block names to analyzer to avoid duplicate detection
+        self.importance_scores = self.importance_analyzer.analyze_block_importance(block_names)
+        print("Block importance analysis complete: ", self.importance_scores)
+        
+        return self.importance_scores
         
     def _progressive_quantization(self):
         """Apply quantization progressively based on importance scores."""

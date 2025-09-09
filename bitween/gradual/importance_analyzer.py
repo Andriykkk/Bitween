@@ -34,10 +34,12 @@ class ImportanceAnalyzer:
     4. Layer upgrade benefit analysis
     """
     
-    def __init__(self, model: nn.Module, tokenizer, calibration_samples: int = 100):
+    def __init__(self, model: nn.Module, tokenizer, calibration_samples: int = 100, wrapper_storage_device: str = "cpu", working_device: str = "cuda"):
         self.model = model
         self.tokenizer = tokenizer
         self.calibration_samples = calibration_samples
+        self.wrapper_storage_device = wrapper_storage_device
+        self.working_device = working_device
         
         # Discover model structure
         self.block_names = self._detect_transformer_blocks()
@@ -47,7 +49,6 @@ class ImportanceAnalyzer:
         self.methods = [
             NoiseInjectionTest(),
             RTNSensitivityTest(),
-            BlockDisableTest(),
             LayerUpgradeTest()
         ]
         
@@ -56,14 +57,95 @@ class ImportanceAnalyzer:
         self.layer_importance_scores = {}
         self.analysis_cache = {}
         
-    def analyze_block_importance(self) -> Dict[str, ImportanceScore]:
+    def analyze_block_importance(self, block_names: List[str] = None) -> Dict[str, ImportanceScore]:
         """
         Run all block importance discovery methods and aggregate results.
+        
+        Args:
+            block_names: List of block names to analyze (avoids duplicate detection)
         
         Returns:
             Dictionary mapping block names to ImportanceScore objects
         """
-        pass
+        # Use provided block names or detect them
+        self.block_names = block_names
+        
+        # Run noise injection test first
+        noise_scores = self._run_noise_injection_test()
+        
+        # TODO: Add other importance methods
+        # rtn_scores = self._run_rtn_sensitivity_test() 
+        # layer_scores = self._run_layer_upgrade_test()
+        
+        # For now, just use noise injection scores
+        importance_scores = {}
+        for block_name in self.block_names:
+            importance_scores[block_name] = ImportanceScore(
+                block_name=block_name,
+                noise_sensitivity=noise_scores.get(block_name, 0.0),
+                rtn_8bit_impact=0.0,  # TODO
+                rtn_4bit_impact=0.0,  # TODO  
+                rtn_2bit_impact=0.0,  # TODO
+                disable_impact=0.0,   # TODO
+                combined_score=noise_scores.get(block_name, 0.0),  # Just noise for now
+                confidence=1.0
+            )
+            
+        return importance_scores
+        
+    def _run_noise_injection_test(self) -> Dict[str, float]:
+        """
+        Run noise injection test to measure block importance.
+        
+        Returns:
+            Dictionary mapping block names to importance scores
+        """
+        # Get fixed calibration data
+        fixed_input_tokens = self._get_fixed_calibration_data()
+        base_seed = 42
+        
+        # Phase 1: Wrap all blocks with noise
+        block_wrappers = {}
+        for i, block_name in enumerate(self.block_names):
+            block_wrappers[block_name] = self._wrap_block_with_noise(
+                block_name, 
+                seed=base_seed + i
+            )
+            
+        # Phase 2: All blocks noisy baseline
+        for wrapper in block_wrappers.values():
+            wrapper.enable()
+            
+        degraded_baseline_ppl = self._evaluate_with_fixed_input(fixed_input_tokens)
+        degraded_baseline_kl = self._calculate_kl_with_fixed_input(fixed_input_tokens)
+        
+        # Phase 3: Sequential recovery test
+        recovery_scores = {}
+        
+        for i, target_block in enumerate(self.block_names):
+            # Disable noise for this block only
+            block_wrappers[target_block].disable()
+            
+            # Measure recovery
+            recovered_ppl = self._evaluate_with_fixed_input(fixed_input_tokens)
+            recovered_kl = self._calculate_kl_with_fixed_input(fixed_input_tokens)
+            
+            # Calculate recovery scores
+            ppl_recovery = degraded_baseline_ppl - recovered_ppl
+            kl_recovery = degraded_baseline_kl - recovered_kl
+            
+            # Combined score (weighted)
+            combined_score = 0.7 * ppl_recovery + 0.3 * kl_recovery
+            
+            recovery_scores[target_block] = combined_score
+            
+            # Re-enable noise for next iteration
+            block_wrappers[target_block].enable()
+            
+        # Phase 4: Cleanup - remove all wrappers
+        self._remove_all_wrappers(block_wrappers)
+        
+        return recovery_scores
         
     def analyze_layer_importance(self) -> Dict[str, float]:
         """
@@ -115,6 +197,85 @@ class ImportanceAnalyzer:
     def _aggregate_scores(self, method_results: Dict[str, Dict[str, float]]) -> Dict[str, ImportanceScore]:
         """Aggregate results from all methods into final importance scores."""
         pass
+        
+    def _get_fixed_calibration_data(self):
+        """Get fixed calibration data for consistent testing."""
+        from ..calib_dataset import get_calibration_dataset
+        
+        # Get small, fixed dataset for testing
+        calib_dataset = get_calibration_dataset(
+            dataset_name="pile-10k",
+            tokenizer=self.tokenizer,
+            seqlen=512,  # Shorter sequences for speed
+            nsamples=10,  # Very small for noise testing
+            seed=123  # Fixed seed for consistency
+        )
+        
+        # Get the tokenized samples
+        samples = calib_dataset.get_samples(num_samples=5)  # Even smaller for speed
+        return samples
+        
+    def _wrap_block_with_noise(self, block_name: str, seed: int):
+        """Wrap a block with noise wrapper."""
+        from .base_wrapper import NoiseWrapper
+        from .utils import get_module_by_name, set_module_by_name
+        
+        # Get the original block
+        original_block = get_module_by_name(self.model, block_name)
+        
+        # Create noise wrapper
+        wrapper = NoiseWrapper(
+            wrapped_block=original_block,
+            noise_std=0.1,  # 10% noise relative to weight std
+            seed=seed,
+            storage_device=self.wrapper_storage_device,
+            block_name=block_name
+        )
+        
+        # Replace the block with wrapper
+        set_module_by_name(self.model, block_name, wrapper)
+        
+        return wrapper
+        
+    def _remove_all_wrappers(self, block_wrappers: Dict):
+        """Remove all wrappers and restore original blocks."""
+        from .utils import set_module_by_name
+        
+        for block_name, wrapper in block_wrappers.items():
+            # Get original block from wrapper
+            original_block = wrapper.get_wrapped_block()
+            
+            # Restore original block
+            set_module_by_name(self.model, block_name, original_block)
+            
+    def _evaluate_with_fixed_input(self, fixed_input_tokens) -> float:
+        """Evaluate perplexity with fixed input tokens."""
+        self.model.eval()
+        device = next(self.model.parameters()).device
+        
+        total_loss = 0.0
+        total_tokens = 0
+        
+        with torch.no_grad():
+            for sample in fixed_input_tokens:
+                input_ids = sample["input_ids"].unsqueeze(0).to(device)
+                
+                # Forward pass
+                outputs = self.model(input_ids, labels=input_ids)
+                loss = outputs.loss
+                
+                total_loss += loss.item() * input_ids.size(1)
+                total_tokens += input_ids.size(1)
+                
+        avg_loss = total_loss / total_tokens
+        perplexity = torch.exp(torch.tensor(avg_loss)).item()
+        return perplexity
+        
+    def _calculate_kl_with_fixed_input(self, fixed_input_tokens) -> float:
+        """Calculate KL divergence with fixed input tokens."""
+        # For now, return a placeholder since we need original model for KL
+        # TODO: Implement proper KL calculation with original model reference
+        return 0.001  # Placeholder
         
     def save_analysis_results(self, path: str):
         """Save importance analysis results for later reuse."""

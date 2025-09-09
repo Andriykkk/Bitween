@@ -37,7 +37,9 @@ def get_module_by_name(model: nn.Module, module_name: str) -> nn.Module:
     Returns:
         The requested module
     """
-    pass
+    # Use existing implementation from CacheManager
+    from ..quantizer.utils.cache_manager import CacheManager
+    return CacheManager._get_module(model, module_name)
 
 
 def set_module_by_name(model: nn.Module, module_name: str, new_module: nn.Module):
@@ -49,7 +51,15 @@ def set_module_by_name(model: nn.Module, module_name: str, new_module: nn.Module
         module_name: Dotted path to module
         new_module: Replacement module
     """
-    pass
+    parts = module_name.split('.')
+    parent = model
+    
+    # Navigate to parent module
+    for part in parts[:-1]:
+        parent = getattr(parent, part)
+        
+    # Set the new module
+    setattr(parent, parts[-1], new_module)
 
 
 def calculate_model_memory(model: nn.Module, include_gradients: bool = False) -> Dict[str, float]:
@@ -277,6 +287,109 @@ def estimate_quantization_time(model: nn.Module, config: Dict) -> Dict[str, floa
         Dictionary with time estimates for each phase
     """
     pass
+
+
+def get_transformer_block_names(model: nn.Module, ignore_layers: set = None) -> List[str]:
+    """
+    Detect transformer blocks and standalone layers in the model architecture.
+    Moved from quantizer.py for reuse across modules.
+    
+    Args:
+        model: The model to analyze
+        ignore_layers: Set of layer names to ignore (optional)
+        
+    Returns:
+        List of block names and standalone layer names
+    """
+    if ignore_layers is None:
+        ignore_layers = set()
+        
+    block_names = []
+    all_linear_layers = set()
+    layers_in_blocks = set()
+    
+    # Collect all linear layers first, excluding ignored layers
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear) and name not in ignore_layers:
+            all_linear_layers.add(name)
+    
+    # Common patterns for transformer blocks
+    patterns = [
+        'layers',      # LLaMA, Mistral: model.layers.0, model.layers.1, ...
+        'h',           # GPT: transformer.h.0, transformer.h.1, ...
+        'blocks',      # Some models: model.blocks.0, model.blocks.1, ...
+        'decoder',     # T5: decoder.block.0, decoder.block.1, ...
+    ]
+    
+    # Find transformer blocks
+    for name, module in model.named_modules():
+        # Look for numbered blocks (e.g., layers.0, h.1, blocks.2, etc.)
+        for pattern in patterns:
+            if pattern in name and any(c.isdigit() for c in name):
+                # Extract the full block path (e.g., "model.layers.0")
+                parts = name.split('.')
+                for i, part in enumerate(parts):
+                    if pattern in part and i + 1 < len(parts) and parts[i + 1].isdigit():
+                        block_path = '.'.join(parts[:i + 2])
+                        if block_path not in block_names:
+                            block_names.append(block_path)
+                            
+                            # Mark all linear layers in this block as "covered"
+                            block_module = get_module_by_name(model, block_path)
+                            for sub_name, sub_module in block_module.named_modules():
+                                if isinstance(sub_module, nn.Linear):
+                                    full_layer_name = f"{block_path}.{sub_name}" if sub_name else block_path
+                                    if full_layer_name not in ignore_layers:
+                                        layers_in_blocks.add(full_layer_name)
+                        break
+                break
+    
+    # Filter out blocks that contain only ignored layers
+    filtered_block_names = []
+    for block_name in block_names:
+        block_module = get_module_by_name(model, block_name)
+        has_quantizable_layers = False
+        
+        for sub_name, sub_module in block_module.named_modules():
+            if isinstance(sub_module, nn.Linear):
+                full_layer_name = f"{block_name}.{sub_name}" if sub_name else block_name
+                if full_layer_name not in ignore_layers:
+                    has_quantizable_layers = True
+                    break
+        
+        if has_quantizable_layers:
+            filtered_block_names.append(block_name)
+        else:
+            print(f"Skipping block '{block_name}' - all linear layers are in ignore list")
+    
+    block_names = filtered_block_names
+    
+    # Sort block names to ensure consistent processing order
+    block_names.sort()
+    
+    # Find standalone linear layers (not covered by any block)
+    standalone_layers = all_linear_layers - layers_in_blocks
+    standalone_layers = sorted(list(standalone_layers))
+    
+    # Add standalone layers to the processing list
+    if standalone_layers:
+        for layer_name in standalone_layers:
+            print(f"  - {layer_name}")
+            block_names.append(layer_name)
+    
+    # Print ignored layers summary
+    if ignore_layers:
+        print(f"Ignoring {len(ignore_layers)} layers from quantization:")
+        for ignored_layer in sorted(ignore_layers):
+            print(f"  - {ignored_layer}")
+    
+    if block_names:
+        transformer_blocks = [name for name in block_names if name not in standalone_layers]
+        print(f"Found {len(transformer_blocks)} transformer blocks and {len(standalone_layers)} standalone layers")
+    else:
+        print("Warning: No transformer blocks or linear layers detected.")
+    
+    return block_names
 
 
 def check_system_resources() -> Dict[str, Union[float, bool]]:

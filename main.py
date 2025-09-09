@@ -9,6 +9,7 @@ import time
 from bitween.functional import quantize_rtn, dequantize_rtn
 import matplotlib.pyplot as plt
 import numpy as np
+from bitween.gradual import GradualQuantizer
 
 # usual quant
 # def main():
@@ -109,22 +110,15 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     
     # --- 2. Initialize the quantizer ---
-    quantizer = Bitween(model, tokenizer=tokenizer, bits=4, group_size=64)
-
-    # # --- 3. Perform quantization and evaluation ---
-    quantized_model = quantizer.quantize(
-        evaluate_perplexity=True,
-        # calculate_parameters_memory=True,
-        eval_samples=5,
-        # rtn=True,
-        trainable=True,
-        nsamples=12,
-        batch_size=2,
-        seqlen=256,
-        cache_to_disk=True,
-        max_memory_mb=2048,
+    quantizer = GradualQuantizer(
+        model=model,
+        tokenizer=tokenizer, 
+        max_perplexity_increase=5,
         ignore_layers=['lm_head', 'embed_tokens']
     )
+
+    # Run gradual quantization
+    quantized_model = quantizer.quantize()
 
     # --- 4. Save models and run benchmark ---
     print("\n--- Preparing for Benchmark ---")
