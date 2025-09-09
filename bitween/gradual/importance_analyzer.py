@@ -77,28 +77,34 @@ class ImportanceAnalyzer:
         # rtn_scores = self._run_rtn_sensitivity_test() 
         # layer_scores = self._run_layer_upgrade_test()
         
-        # For now, just use noise injection scores
+        # Use separate noise injection scores
         importance_scores = {}
         for block_name in self.block_names:
+            block_noise_scores = noise_scores.get(block_name, {'ppl_recovery': 0.0, 'kl_recovery': 0.0})
+            
+            # For now, use PPL recovery as main noise sensitivity
+            ppl_score = block_noise_scores['ppl_recovery']
+            kl_score = block_noise_scores['kl_recovery']
+            
             importance_scores[block_name] = ImportanceScore(
                 block_name=block_name,
-                noise_sensitivity=noise_scores.get(block_name, 0.0),
+                noise_sensitivity=ppl_score,
                 rtn_8bit_impact=0.0,  # TODO
                 rtn_4bit_impact=0.0,  # TODO  
                 rtn_2bit_impact=0.0,  # TODO
                 disable_impact=0.0,   # TODO
-                combined_score=noise_scores.get(block_name, 0.0),  # Just noise for now
+                combined_score=ppl_score,  # Use PPL recovery as primary score for now
                 confidence=1.0
             )
             
         return importance_scores
         
-    def _run_noise_injection_test(self) -> Dict[str, float]:
+    def _run_noise_injection_test(self) -> Dict[str, Dict[str, float]]:
         """
         Run noise injection test to measure block importance.
         
         Returns:
-            Dictionary mapping block names to importance scores
+            Dictionary mapping block names to dict with separate PPL and KL scores
         """
         # Get fixed calibration data
         fixed_input_tokens = self._get_fixed_calibration_data()
@@ -117,7 +123,7 @@ class ImportanceAnalyzer:
             wrapper.enable()
             
         degraded_baseline_ppl = self._evaluate_with_fixed_input(fixed_input_tokens)
-        degraded_baseline_kl = self._calculate_kl_with_fixed_input(fixed_input_tokens)
+        degraded_baseline_logits = self._calculate_kl_between_states(fixed_input_tokens, "all_noisy", "baseline")
         
         # Phase 3: Sequential recovery test
         recovery_scores = {}
@@ -128,16 +134,19 @@ class ImportanceAnalyzer:
             
             # Measure recovery
             recovered_ppl = self._evaluate_with_fixed_input(fixed_input_tokens)
-            recovered_kl = self._calculate_kl_with_fixed_input(fixed_input_tokens)
+            recovered_logits = self._calculate_kl_between_states(fixed_input_tokens, "target_recovered", target_block)
+            
+            # Calculate KL divergence between degraded and recovered states
+            kl_recovery = self._compare_logits_for_kl(degraded_baseline_logits, recovered_logits)
             
             # Calculate recovery scores
             ppl_recovery = degraded_baseline_ppl - recovered_ppl
-            kl_recovery = degraded_baseline_kl - recovered_kl
-            
-            # Combined score (weighted)
-            combined_score = 0.7 * ppl_recovery + 0.3 * kl_recovery
-            
-            recovery_scores[target_block] = combined_score
+
+            # Store both scores separately for later analysis
+            recovery_scores[target_block] = {
+                'ppl_recovery': ppl_recovery,
+                'kl_recovery': kl_recovery
+            }
             
             # Re-enable noise for next iteration
             block_wrappers[target_block].enable()
@@ -272,10 +281,83 @@ class ImportanceAnalyzer:
         return perplexity
         
     def _calculate_kl_with_fixed_input(self, fixed_input_tokens) -> float:
-        """Calculate KL divergence with fixed input tokens."""
-        # For now, return a placeholder since we need original model for KL
-        # TODO: Implement proper KL calculation with original model reference
+        """
+        Calculate KL divergence with fixed input tokens.
+        Since we can't compare against original model (it's wrapped), 
+        this returns a placeholder for now.
+        """
+        # TODO: Could store original model copy if needed for true KL divergence
         return 0.001  # Placeholder
+        
+    def _calculate_kl_between_states(self, fixed_input_tokens, baseline_state: str, recovered_state: str) -> float:
+        """
+        Calculate KL divergence between two model states for noise injection test.
+        
+        Args:
+            fixed_input_tokens: Fixed calibration samples
+            baseline_state: Description of baseline state (for logging)
+            recovered_state: Description of recovered state (for logging)
+            
+        Returns:
+            KL divergence between the two states
+        """
+        import torch.nn.functional as F
+        
+        self.model.eval()
+        device = next(self.model.parameters()).device
+        
+        total_kl = 0.0
+        total_tokens = 0
+        
+        # Get logits for current state (this should be called at the right time)
+        current_logits = []
+        
+        with torch.no_grad():
+            for sample in fixed_input_tokens:
+                input_ids = sample["input_ids"].unsqueeze(0).to(device)
+                
+                # Get current state logits
+                outputs = self.model(input_ids)
+                logits = outputs.logits  # shape: [1, seq_len, vocab]
+                current_logits.append(logits)
+                
+        return current_logits  # Return logits for comparison later
+        
+    def _compare_logits_for_kl(self, logits1_list, logits2_list) -> float:
+        """
+        Compare two sets of logits and calculate KL divergence.
+        
+        Args:
+            logits1_list: List of logit tensors from first state
+            logits2_list: List of logit tensors from second state
+            
+        Returns:
+            Average KL divergence per token
+        """
+        import torch.nn.functional as F
+        
+        total_kl = 0.0
+        total_tokens = 0
+        
+        for logits1, logits2 in zip(logits1_list, logits2_list):
+            # Ensure same length
+            min_len = min(logits1.shape[1], logits2.shape[1])
+            logits1 = logits1[:, :min_len, :]
+            logits2 = logits2[:, :min_len, :]
+            
+            # Calculate KL divergence
+            log_prob1 = F.log_softmax(logits1, dim=-1)
+            prob2 = F.softmax(logits2, dim=-1)
+            
+            # Per-token KL divergence
+            per_token_kl = F.kl_div(log_prob1, prob2, reduction='none', log_target=False)  
+            per_token_kl = per_token_kl.sum(dim=-1)  # sum over vocab dim
+            
+            total_kl += per_token_kl.sum().item()
+            total_tokens += per_token_kl.numel()
+            
+        avg_kl_per_token = total_kl / total_tokens if total_tokens > 0 else 0.0
+        return avg_kl_per_token
         
     def save_analysis_results(self, path: str):
         """Save importance analysis results for later reuse."""
