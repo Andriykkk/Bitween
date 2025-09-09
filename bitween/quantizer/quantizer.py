@@ -102,11 +102,11 @@ class Bitween:
         if evaluate_perplexity and self.tokenizer is not None and eval_samples > 0:
             if self.tokenizer is None:
                 raise ValueError("Tokenizer must be provided for evaluation.")
-            original_ppl = calculate_perplexity(self.model, self.tokenizer, eval_samples=eval_samples, **eval_kwargs)
+            original_ppl = calculate_perplexity(self.model, self.tokenizer, verbose=False, eval_samples=eval_samples, **eval_kwargs)
 
         if evaluate_perplexity and self.tokenizer is not None and eval_samples > 0:
             print("\n--- Evaluating quantized model ---")
-            quantized_ppl = calculate_perplexity(quantized_model, self.tokenizer, eval_samples=eval_samples, **eval_kwargs)
+            quantized_ppl = calculate_perplexity(quantized_model, self.tokenizer, verbose=False, eval_samples=eval_samples, **eval_kwargs)
             
             print("\n--- Calculating KL-Divergence ---")
             kl_div, token_kl_div = calculate_kl_divergence(self.model, quantized_model, self.tokenizer, eval_samples=eval_samples, **eval_kwargs)

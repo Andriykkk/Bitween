@@ -93,7 +93,7 @@ class QuantizedLinearFunction(torch.autograd.Function):
 
         # Gradient for input x
         if ctx.needs_input_grad[0]:
-            grad_input = grad_output @ weight
+            grad_input = grad_output @ weight.to(grad_output.dtype)
 
         # Return None for all other non-differentiable inputs
         return grad_input, None, None, None, None, None, None
