@@ -8,19 +8,18 @@ from typing import Dict, List, Tuple, Optional, Union
 import numpy as np
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import torch.nn.functional as F
 
 
 @dataclass
 class ImportanceScore:
     """Container for importance analysis results."""
     block_name: str
-    noise_sensitivity: float
+    noise_sensitivity_ppl: float
+    noise_sensitivity_kl: float
     rtn_8bit_impact: float
     rtn_4bit_impact: float
     rtn_2bit_impact: float
-    disable_impact: float
-    combined_score: float
-    confidence: float
 
 
 class ImportanceAnalyzer:
@@ -34,23 +33,18 @@ class ImportanceAnalyzer:
     4. Layer upgrade benefit analysis
     """
     
-    def __init__(self, model: nn.Module, tokenizer, calibration_samples: int = 100, wrapper_storage_device: str = "cpu", working_device: str = "cuda"):
+    def __init__(self, model: nn.Module, tokenizer, calibration_samples: int = 100, wrapper_storage_device: str = "cpu", working_device: str = "cuda", evaluation_samples: int = 2):
         self.model = model
         self.tokenizer = tokenizer
         self.calibration_samples = calibration_samples
         self.wrapper_storage_device = wrapper_storage_device
         self.working_device = working_device
+
+        self.evaluation_samples = evaluation_samples
         
         # Discover model structure
         self.block_names = self._detect_transformer_blocks()
         self.layer_names = self._detect_quantizable_layers()
-        
-        # Analysis methods
-        self.methods = [
-            NoiseInjectionTest(),
-            RTNSensitivityTest(),
-            LayerUpgradeTest()
-        ]
         
         # Results storage
         self.block_importance_scores = {}
@@ -91,14 +85,13 @@ class ImportanceAnalyzer:
             
             importance_scores[block_name] = ImportanceScore(
                 block_name=block_name,
-                noise_sensitivity=ppl_score,
+                noise_sensitivity_ppl=ppl_score,
+                noise_sensitivity_kl=kl_score,
                 rtn_8bit_impact=block_rtn_scores['8bit'],
                 rtn_4bit_impact=block_rtn_scores['4bit'],  
-                rtn_2bit_impact=block_rtn_scores['2bit'],
-                combined_score=ppl_score,  # Use PPL recovery as primary score for now
-                confidence=1.0
+                rtn_2bit_impact=block_rtn_scores['2bit']
             )
-            
+        
         return importance_scores
         
     def _run_noise_injection_test(self) -> Dict[str, Dict[str, float]]:
@@ -168,7 +161,7 @@ class ImportanceAnalyzer:
         Returns:
             Dictionary mapping block names to dict with recovery scores for each precision
         """
-        print("🔢 Running RTN sensitivity test...")
+        print("Running RTN sensitivity test...")
         
         # Get fixed calibration data (same as noise test)
         fixed_input_tokens = self._get_fixed_calibration_data()
@@ -177,7 +170,6 @@ class ImportanceAnalyzer:
         
         # Test each precision level
         for bits in [8, 4, 2]:
-            print(f"📊 Testing {bits}-bit RTN quantization...")
             
             # Phase 1: Wrap all blocks with RTN quantization
             block_wrappers = {}
@@ -192,15 +184,12 @@ class ImportanceAnalyzer:
             for wrapper in block_wrappers.values():
                 wrapper.enable()
                 
-            print(f"📊 Measuring degraded baseline (all blocks {bits}-bit RTN)...")
             degraded_baseline_ppl = self._evaluate_with_fixed_input(fixed_input_tokens)
             degraded_baseline_logits = self._calculate_kl_between_states(fixed_input_tokens, f"all_{bits}bit", "baseline")
             
-            print(f"🔻 Degraded baseline ({bits}-bit) - PPL: {degraded_baseline_ppl:.4f}")
             
             # Phase 3: Sequential recovery test
             for target_block in self.block_names:
-                print(f"🎯 Testing recovery for {target_block} from {bits}-bit")
                 
                 # Restore this block to full precision
                 block_wrappers[target_block].disable()
@@ -215,7 +204,6 @@ class ImportanceAnalyzer:
                 # Calculate recovery scores
                 ppl_recovery = degraded_baseline_ppl - recovered_ppl
                 
-                print(f"Recovery for {target_block} ({bits}-bit): PPL: {ppl_recovery:.4f}, KL: {kl_recovery:.6f}")
                 
                 # Store results
                 if target_block not in rtn_results:
@@ -241,7 +229,7 @@ class ImportanceAnalyzer:
                 '2bit': rtn_results.get(block_name, {}).get('2bit', {}).get('ppl_recovery', 0.0)
             }
             
-        print("✅ RTN sensitivity test completed")
+        print("RTN sensitivity test completed")
         return final_results
         
     def _wrap_block_with_rtn(self, block_name: str, bits: int, group_size: int = 32):
@@ -339,13 +327,13 @@ class ImportanceAnalyzer:
         calib_dataset = get_calibration_dataset(
             dataset_name="pile-10k",
             tokenizer=self.tokenizer,
-            seqlen=512,  # Shorter sequences for speed
-            nsamples=10,  # Very small for noise testing
-            seed=123  # Fixed seed for consistency
+            seqlen=512,
+            nsamples=self.evaluation_samples,
+            seed=123
         )
         
-        # Get the tokenized samples
-        samples = calib_dataset.get_samples(num_samples=5)  # Even smaller for speed
+        # Get the tokenized samples - use evaluation_samples for evaluation (should be small like 2-5)
+        samples = calib_dataset.get_samples(num_samples=self.evaluation_samples)
         return samples
         
     def _wrap_block_with_noise(self, block_name: str, seed: int):
@@ -425,8 +413,6 @@ class ImportanceAnalyzer:
         Returns:
             KL divergence between the two states
         """
-        import torch.nn.functional as F
-        
         self.model.eval()
         device = next(self.model.parameters()).device
         
@@ -458,8 +444,6 @@ class ImportanceAnalyzer:
         Returns:
             Average KL divergence per token
         """
-        import torch.nn.functional as F
-        
         total_kl = 0.0
         total_tokens = 0
         
@@ -483,6 +467,137 @@ class ImportanceAnalyzer:
         avg_kl_per_token = total_kl / total_tokens if total_tokens > 0 else 0.0
         return avg_kl_per_token
         
+    def calculate_block_budget_allocation(
+        self,
+        importance_scores: Dict[str, ImportanceScore],
+        max_ppl_increase: float,
+        max_kl_increase: float,
+        ppl_weight: float = 0.7,
+        kl_weight: float = 0.3,
+        safety_multiplier: float = 2.0
+    ) -> Dict[str, Dict]:
+        """
+        Convert raw importance scores to budget allocation percentages.
+        
+        Args:
+            importance_scores: Raw importance scores from analyze_block_importance
+            max_ppl_increase: Maximum allowed perplexity increase (e.g., 5.0 for 5%)
+            max_kl_increase: Maximum allowed KL divergence increase (e.g., 0.01)
+            ppl_weight: Weight for perplexity in combined score (0.0-1.0)
+            kl_weight: Weight for KL divergence in combined score (0.0-1.0)
+            safety_multiplier: Safety margin multiplier (default 2.0)
+            
+        Returns:
+            Dictionary mapping block names to budget allocation info
+        """
+        # Calculate working budgets with safety margin
+        working_ppl_budget = max_ppl_increase * safety_multiplier
+        working_kl_budget = max_kl_increase * safety_multiplier
+        
+        # print(f"Budget Allocation Analysis:")
+        # print(f"  PPL Budget: {max_ppl_increase:.2f} (working: {working_ppl_budget:.2f})")
+        # print(f"  KL Budget: {max_kl_increase:.4f} (working: {working_kl_budget:.4f})")
+        # print(f"  Weights: PPL={ppl_weight:.1f}, KL={kl_weight:.1f}")
+        
+        # Step 1: Normalize scores by precision level
+        normalized_scores = self._normalize_importance_scores(importance_scores)
+        
+        # Step 2: Calculate combined sensitivity scores
+        combined_scores = {}
+        for block_name, norm_scores in normalized_scores.items():
+            # Combine PPL and KL sensitivities with weights
+            ppl_sensitivity = (
+                norm_scores['noise_ppl_norm'] * 0.3 +  # Noise injection weight
+                norm_scores['rtn_4bit_norm'] * 0.7     # RTN 4-bit weight (most relevant)
+            )
+            
+            kl_sensitivity = (
+                norm_scores['noise_kl_norm'] * 0.4 +   # Noise injection weight
+                norm_scores['rtn_4bit_norm'] * 0.6     # RTN sensitivity affects KL too
+            )
+            
+            # Combined weighted sensitivity score
+            combined_sensitivity = (ppl_weight * ppl_sensitivity + kl_weight * kl_sensitivity)
+            
+            combined_scores[block_name] = {
+                'ppl_sensitivity': ppl_sensitivity,
+                'kl_sensitivity': kl_sensitivity,
+                'combined_sensitivity': combined_sensitivity
+            }
+        
+        # Step 3: Calculate total sensitivity for normalization
+        total_combined_sensitivity = sum(scores['combined_sensitivity'] for scores in combined_scores.values())
+        
+        # Step 4: Allocate budgets proportionally
+        budget_allocations = {}
+        
+        print("Block Budget Allocations:")
+        print("=" * 80)
+        
+        for block_name, scores in combined_scores.items():
+            # Calculate percentage of total budget this block gets
+            budget_percentage = scores['combined_sensitivity'] / total_combined_sensitivity
+            
+            # Allocate actual budget amounts
+            allocated_ppl_budget = working_ppl_budget * budget_percentage
+            allocated_kl_budget = working_kl_budget * budget_percentage
+            
+            budget_allocations[block_name] = {
+                'ppl_budget_percent': budget_percentage * 100,
+                'kl_budget_percent': budget_percentage * 100,
+                'allocated_ppl_budget': allocated_ppl_budget,
+                'allocated_kl_budget': allocated_kl_budget,
+                'ppl_sensitivity': scores['ppl_sensitivity'],
+                'kl_sensitivity': scores['kl_sensitivity'],
+                'combined_sensitivity': scores['combined_sensitivity']
+            }
+            
+        return budget_allocations
+    
+    def _normalize_importance_scores(self, importance_scores: Dict[str, ImportanceScore]) -> Dict[str, Dict]:
+        """
+        Normalize importance scores to 0-1 range for fair comparison.
+        """
+        # Collect all scores by metric
+        all_noise_ppl = [score.noise_sensitivity_ppl for score in importance_scores.values()]
+        all_noise_kl = [score.noise_sensitivity_kl for score in importance_scores.values()]
+        all_rtn_8bit = [score.rtn_8bit_impact for score in importance_scores.values()]
+        all_rtn_4bit = [score.rtn_4bit_impact for score in importance_scores.values()]
+        all_rtn_2bit = [score.rtn_2bit_impact for score in importance_scores.values()]
+        
+        # Calculate normalization ranges (min-max normalization)
+        def safe_normalize(values, scores):
+            """Safely normalize scores, handling edge cases"""
+            values = [max(0, v) for v in values]  # Ensure non-negative
+            if max(values) == min(values):
+                return {block: 0.5 for block in scores.keys()}  # Equal if all same
+            
+            value_range = max(values) - min(values)
+            return {
+                block: (max(0, score) - min(values)) / value_range
+                for block, score in zip(scores.keys(), values)
+            }
+        
+        # Normalize each metric
+        noise_ppl_norm = safe_normalize(all_noise_ppl, importance_scores)
+        noise_kl_norm = safe_normalize(all_noise_kl, importance_scores)
+        rtn_8bit_norm = safe_normalize(all_rtn_8bit, importance_scores)
+        rtn_4bit_norm = safe_normalize(all_rtn_4bit, importance_scores)
+        rtn_2bit_norm = safe_normalize(all_rtn_2bit, importance_scores)
+        
+        # Combine into normalized score dictionary
+        normalized_scores = {}
+        for block_name in importance_scores.keys():
+            normalized_scores[block_name] = {
+                'noise_ppl_norm': noise_ppl_norm[block_name],
+                'noise_kl_norm': noise_kl_norm[block_name],
+                'rtn_8bit_norm': rtn_8bit_norm[block_name],
+                'rtn_4bit_norm': rtn_4bit_norm[block_name],
+                'rtn_2bit_norm': rtn_2bit_norm[block_name]
+            }
+        
+        return normalized_scores
+    
     def save_analysis_results(self, path: str):
         """Save importance analysis results for later reuse."""
         pass
@@ -522,112 +637,4 @@ class ImportanceMethod(ABC):
     @abstractmethod
     def weight(self) -> float:
         """Weight for this method when aggregating scores."""
-        pass
-
-
-class NoiseInjectionTest(ImportanceMethod):
-    """
-    Tests block importance by injecting random noise and measuring impact.
-    Higher impact = more important block.
-    """
-    
-    @property
-    def method_name(self) -> str:
-        return "noise_injection"
-        
-    @property
-    def weight(self) -> float:
-        return 0.15
-        
-    def run_test(self, model: nn.Module, tokenizer, target_names: List[str],
-                 calibration_samples: int) -> Dict[str, float]:
-        """Inject noise into each target and measure perplexity impact."""
-        pass
-        
-    def _inject_noise(self, model: nn.Module, target_name: str, noise_scale: float = 0.1):
-        """Inject random noise into target module weights."""
-        pass
-        
-    def _restore_weights(self, model: nn.Module, target_name: str, original_weights):
-        """Restore original weights after noise injection."""
-        pass
-
-
-class RTNSensitivityTest(ImportanceMethod):
-    """
-    Tests block sensitivity to RTN quantization at different bit precisions.
-    Higher degradation = more sensitive = more important.
-    """
-    
-    @property
-    def method_name(self) -> str:
-        return "rtn_sensitivity"
-        
-    @property  
-    def weight(self) -> float:
-        return 0.40  # Higher weight as RTN directly relates to quantization
-        
-    def run_test(self, model: nn.Module, tokenizer, target_names: List[str],
-                 calibration_samples: int) -> Dict[str, float]:
-        """Test RTN quantization impact at 8/4/2 bits for each target."""
-        pass
-        
-    def _test_rtn_precision(self, model: nn.Module, target_name: str, bits: int) -> float:
-        """Apply RTN quantization to target at specified precision and measure impact."""
-        pass
-
-
-class BlockDisableTest(ImportanceMethod):
-    """
-    Tests block importance by completely disabling/zeroing blocks.
-    Higher impact = more critical block.
-    """
-    
-    @property
-    def method_name(self) -> str:
-        return "block_disable"
-        
-    @property
-    def weight(self) -> float:
-        return 0.20
-        
-    def run_test(self, model: nn.Module, tokenizer, target_names: List[str],
-                 calibration_samples: int) -> Dict[str, float]:
-        """Disable each target block and measure catastrophic impact."""
-        pass
-        
-    def _disable_block(self, model: nn.Module, block_name: str):
-        """Temporarily disable/zero out a transformer block."""
-        pass
-        
-    def _restore_block(self, model: nn.Module, block_name: str, original_state):
-        """Restore block to original state."""
-        pass
-
-
-class LayerUpgradeTest(ImportanceMethod):
-    """
-    Tests layer importance using 4-bit baseline + individual layer upgrade.
-    Higher improvement when upgraded = more important layer.
-    """
-    
-    @property
-    def method_name(self) -> str:
-        return "layer_upgrade"
-        
-    @property
-    def weight(self) -> float:
-        return 0.25
-        
-    def run_test(self, model: nn.Module, tokenizer, target_names: List[str],
-                 calibration_samples: int) -> Dict[str, float]:
-        """Apply 4-bit baseline, then test upgrading each layer to 8-bit."""
-        pass
-        
-    def _apply_4bit_baseline(self, model: nn.Module):
-        """Apply 4-bit RTN quantization to entire model."""
-        pass
-        
-    def _upgrade_layer_to_8bit(self, model: nn.Module, layer_name: str):
-        """Upgrade specific layer from 4-bit to 8-bit."""
         pass
