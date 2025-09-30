@@ -53,7 +53,8 @@ class PrecisionOptimizer:
         baseline_metrics: Dict = None,
         evaluation_samples: int = 5,
         budget_allocations: Dict = None,
-        original_model: nn.Module = None
+        original_model: nn.Module = None,
+        training_batch_size: int = 4
     ):
         """
         Initialize precision optimizer.
@@ -67,6 +68,7 @@ class PrecisionOptimizer:
             evaluation_samples: Number of samples for evaluation
             budget_allocations: Per-block budget allocations from importance analysis
             original_model: Reference to original model for KL divergence calculation
+            training_batch_size: Batch size for trainable quantization (default: 4)
         """
         self.model = model
         self.tokenizer = tokenizer
@@ -76,6 +78,7 @@ class PrecisionOptimizer:
         self.evaluation_samples = evaluation_samples
         self.budget_allocations = budget_allocations or {}
         self.original_model = original_model
+        self.training_batch_size = training_batch_size
         
         # Persistent state for building final quantized model
         self.block_quantizations = {}  # Store best quantization config for each block
@@ -88,6 +91,7 @@ class PrecisionOptimizer:
         print(f"PrecisionOptimizer initialized:")
         print(f"  Budget allocations for {len(self.budget_allocations)} blocks")
         print(f"  Evaluation samples: {self.evaluation_samples}")
+        print(f"  Training batch size: {self.training_batch_size}")
         print(f"  Original model reference: {'Available' if original_model else 'Not available'}")
         
     def progressive_quantize_block(self, block_name: str, cached_data: List, budget_allocation: float) -> Optional[QuantizationConfig]:
@@ -404,37 +408,117 @@ class PrecisionOptimizer:
         }
         
     def _try_trainable_quantization(self, block, bits, group_size, cached_data, budget):
-        """Try trainable quantization with given parameters."""
-        # TODO: Implement trainable quantization
-        # This should:
-        # 1. Apply quantization to all linear layers in block
-        # 2. Train on cached input/output pairs
-        # 3. Use different strategies for attention vs MLP layers
+        """Try trainable quantization with given parameters using existing Bitween training infrastructure."""
+        from ..wrapper import wrap_model_for_training, train_individual_wrapper, finalize_wrapped_model
+        from .utils import get_module_by_name, set_module_by_name
         
-        print(f"        Training block with {len(cached_data)} samples...")
+        block_name = self._find_block_name(block)
+        if not block_name:
+            print(f"        Could not find block name in model")
+            return False, float('inf')
         
-        # Separate attention and MLP layers
-        attention_layers, mlp_layers = self._separate_layer_types(block)
+        print(f"        Training {block_name} with {len(cached_data)} samples...")
         
-        # Phase 1: Train attention layers (usually more sensitive)
-        if attention_layers:
-            print(f"        Training {len(attention_layers)} attention layers...")
-            self._train_layer_group(attention_layers, cached_data, epochs=5, lr=1e-4)
+        try:
+            # Get current block state
+            current_block = get_module_by_name(self.model, block_name)
             
-        # Phase 2: Train MLP layers (usually more robust)  
-        if mlp_layers:
-            print(f"        Training {len(mlp_layers)} MLP layers...")
-            self._train_layer_group(mlp_layers, cached_data, epochs=3, lr=2e-4)
+            # Step 1: Wrap the block for training
+            wrapped_info = wrap_model_for_training(
+                model=self.model,
+                block_names=[block_name],  # Only this block
+                enable_minmax_tuning=True,
+                bits=bits,
+                group_size=group_size,
+                ignore_layers=set()  # Don't ignore any layers within the block
+            )
             
-        # Phase 3: Joint fine-tuning
-        print(f"        Joint fine-tuning entire block...")
-        self._train_entire_block(block, cached_data, epochs=2, lr=5e-5)
-        
-        # Evaluate trained block
-        error = self._evaluate_block_error(block, cached_data)
-        success = error <= budget
-        
-        return success, error
+            if block_name not in wrapped_info:
+                print(f"        Failed to wrap {block_name}")
+                return False, float('inf')
+            
+            wrapper_info = wrapped_info[block_name]
+            
+            # Step 2: Convert cached_data format for training
+            # cached_data is List[(input_dict, output_tensor)]
+            block_inputs = []
+            for input_dict, output_tensor in cached_data:
+                # Extract the input tensor from the input_dict
+                input_tensor = input_dict.get('hidden_states', input_dict.get('input', None))
+                if input_tensor is not None:
+                    block_inputs.append(input_tensor)
+            
+            if not block_inputs:
+                print(f"        No valid inputs found in cached data")
+                return False, float('inf')
+            
+            # Step 3: Train the wrapped block
+            result = train_individual_wrapper(
+                module_name=block_name,
+                wrapped_module=wrapper_info['wrapped_module'],
+                block_inputs=block_inputs,
+                iters=3,  # Number of training epochs
+                lr=1e-4,  # Learning rate 
+                batch_size=self.training_batch_size,  # Configurable batch size
+                is_single_layer=wrapper_info['is_single_layer']
+            )
+            
+            # Step 4: Apply best parameters
+            if not wrapper_info['is_single_layer']:
+                # For blocks, apply best parameters to all wrappers
+                from ..wrapper import WrapperLinear
+                wrapped_module = wrapper_info['wrapped_module']
+                for name, submodule in wrapped_module.named_modules():
+                    if isinstance(submodule, WrapperLinear):
+                        submodule.apply_best_params()
+            
+            # Step 5: Evaluate performance
+            performance = self.evaluate_block_performance(block_name)
+            
+            print(f"        Training result: PPL increase = {performance['ppl_increase']:.4f}")
+            print(f"        Combined sensitivity = {performance['current_combined_sensitivity']:.4f}, threshold = {performance['threshold_combined_sensitivity']:.4f}")
+            
+            if performance['under_threshold']:
+                # Step 6: Convert to final quantized form and save
+                finalized_block = finalize_wrapped_model(self.model, {block_name: wrapper_info})
+                finalized_block_module = get_module_by_name(finalized_block, block_name)
+                
+                # Replace in our model
+                set_module_by_name(self.model, block_name, finalized_block_module)
+                
+                # Save configuration
+                config = QuantizationConfig(
+                    bits=bits,
+                    group_size=group_size,
+                    method="Trained",
+                    error_metric=performance['ppl_increase'],
+                    training_metadata={
+                        'epochs': 3,
+                        'lr': 1e-4,
+                        'batch_size': self.training_batch_size,
+                        'samples': len(block_inputs)
+                    },
+                    memory_savings=self._estimate_memory_savings(bits, group_size)
+                )
+                
+                self._save_block_quantization(block_name, config, finalized_block_module)
+                print(f"        ✓ Saved trained quantization for {block_name}")
+                
+                return True, performance['ppl_increase']
+            else:
+                # Training failed - restore previous state
+                self._restore_block_state(block_name, current_block)
+                
+                return False, performance['ppl_increase']
+                
+        except Exception as e:
+            print(f"        Training quantization failed: {e}")
+            # Restore previous state on error
+            try:
+                self._restore_block_state(block_name, current_block)
+            except:
+                pass
+            return False, float('inf')
         
     def _try_layer_recovery(self, block, bits, group_size, cached_data, budget):
         """Try layer-level recovery for failed quantization."""
@@ -449,23 +533,6 @@ class PrecisionOptimizer:
         success = error <= budget
         return success, error
         
-    def _train_layer_group(self, layers, cached_data, epochs, lr):
-        """Train a group of layers on cached data."""
-        # TODO: Implement layer group training
-        print(f"          Training {len(layers)} layers for {epochs} epochs at lr={lr}")
-        
-        # Simulate training time
-        import time
-        time.sleep(0.05)  # Quick simulation
-        
-    def _train_entire_block(self, block, cached_data, epochs, lr):
-        """Train entire block jointly."""
-        # TODO: Implement block-level training
-        print(f"          Joint training for {epochs} epochs at lr={lr}")
-        
-        # Simulate training time
-        import time
-        time.sleep(0.05)  # Quick simulation
         
     def _get_evaluation_samples(self):
         """Get fixed calibration data for consistent evaluation (reusing ImportanceAnalyzer approach)."""

@@ -37,7 +37,8 @@ class GradualQuantizer:
         ignore_layers: Optional[List[str]] = None,
         cpu_offload: bool = False,
         min_group_size: int = 32,
-        max_group_size: int = 128
+        max_group_size: int = 128,
+        training_batch_size: int = 4
     ):
         """
         Initialize gradual quantizer.
@@ -54,6 +55,7 @@ class GradualQuantizer:
             cpu_offload: Enable CPU offloading for memory efficiency (requires GPU)
             min_group_size: Minimum group size for quantization (default: 32)
             max_group_size: Maximum group size for quantization (default: 128)
+            training_batch_size: Batch size for trainable quantization (default: 4)
         """
         self.model = model
         self.tokenizer = tokenizer
@@ -66,6 +68,7 @@ class GradualQuantizer:
         self.ignore_layers = ignore_layers
         self.min_group_size = min_group_size
         self.max_group_size = max_group_size
+        self.training_batch_size = training_batch_size
         
         # Device management - detect model's current device
         self.gpu_available = torch.cuda.is_available()
@@ -143,7 +146,8 @@ class GradualQuantizer:
             baseline_metrics=self.baseline_metrics,
             evaluation_samples=self.evaluation_samples,
             budget_allocations=budget_allocations,
-            original_model=self.original_model
+            original_model=self.original_model,
+            training_batch_size=self.training_batch_size
         )
         
         """Apply quantization progressively based on importance scores."""
