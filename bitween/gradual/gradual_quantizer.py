@@ -130,7 +130,11 @@ class GradualQuantizer:
         # Store budget allocations for later use
         self.budget_allocations = budget_allocations
         
+        # Store original model reference for KL divergence calculation
+        self.original_model = copy.deepcopy(self.model)
+        
         # Initialize precision optimizer with all required information
+        # Note: budget_allocations already include safety_multiplier from calculate_block_budget_allocation
         self.precision_optimizer = PrecisionOptimizer(
             model=self.model,
             tokenizer=self.tokenizer,
@@ -139,8 +143,7 @@ class GradualQuantizer:
             baseline_metrics=self.baseline_metrics,
             evaluation_samples=self.evaluation_samples,
             budget_allocations=budget_allocations,
-            max_perplexity_increase=self.max_perplexity_increase * self.safety_multiplier,
-            max_per_token_kl_divergence=self.max_per_token_kl_divergence * self.safety_multiplier
+            original_model=self.original_model
         )
         
         """Apply quantization progressively based on importance scores."""

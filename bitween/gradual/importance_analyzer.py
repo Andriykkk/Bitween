@@ -439,11 +439,6 @@ class ImportanceAnalyzer:
         working_ppl_budget = max_ppl_increase * safety_multiplier
         working_kl_budget = max_kl_increase * safety_multiplier
         
-        # print(f"Budget Allocation Analysis:")
-        # print(f"  PPL Budget: {max_ppl_increase:.2f} (working: {working_ppl_budget:.2f})")
-        # print(f"  KL Budget: {max_kl_increase:.4f} (working: {working_kl_budget:.4f})")
-        # print(f"  Weights: PPL={ppl_weight:.1f}, KL={kl_weight:.1f}")
-        
         # Step 1: Normalize scores by precision level
         normalized_scores = self._normalize_importance_scores(importance_scores)
         
@@ -542,3 +537,35 @@ class ImportanceAnalyzer:
             }
         
         return normalized_scores
+        
+    def calculate_combined_sensitivity(
+        self, 
+        ppl_increase: float, 
+        kl_increase: float,
+        max_ppl_increase: float,
+        max_kl_increase: float,
+        ppl_weight: float = 0.7,
+        kl_weight: float = 0.3
+    ) -> float:
+        """
+        Calculate combined sensitivity score from PPL and KL increases.
+        
+        Args:
+            ppl_increase: Perplexity increase from baseline
+            kl_increase: KL divergence increase from baseline
+            max_ppl_increase: Maximum expected perplexity increase for normalization
+            max_kl_increase: Maximum expected KL increase for normalization
+            ppl_weight: Weight for perplexity in combined score
+            kl_weight: Weight for KL divergence in combined score
+            
+        Returns:
+            Combined sensitivity score
+        """
+        # Normalize increases to 0-1 range for comparison
+        ppl_normalized = min(ppl_increase / max_ppl_increase, 1.0) if max_ppl_increase > 0 else 0.0
+        kl_normalized = min(kl_increase / max_kl_increase, 1.0) if max_kl_increase > 0 else 0.0
+        
+        # Calculate weighted combined sensitivity
+        combined_sensitivity = (ppl_weight * ppl_normalized + kl_weight * kl_normalized)
+        
+        return combined_sensitivity

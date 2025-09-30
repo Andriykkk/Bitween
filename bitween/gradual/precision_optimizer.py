@@ -25,6 +25,15 @@ class QuantizationConfig:
     group_size: int
     method: str  # "RTN", "Trained", "Mixed"
     error_metric: float
+    layer_exceptions: Dict = None  # Layers that couldn't be quantized or need higher precision
+    training_metadata: Dict = None  # Training details, epochs, loss curves, etc.
+    memory_savings: float = 0.0    # Estimated memory reduction
+    
+    def __post_init__(self):
+        if self.layer_exceptions is None:
+            self.layer_exceptions = {}
+        if self.training_metadata is None:
+            self.training_metadata = {}
 
 
 class PrecisionOptimizer:
@@ -44,8 +53,7 @@ class PrecisionOptimizer:
         baseline_metrics: Dict = None,
         evaluation_samples: int = 5,
         budget_allocations: Dict = None,
-        max_perplexity_increase: float = 5.0,
-        max_per_token_kl_divergence: float = 0.01
+        original_model: nn.Module = None
     ):
         """
         Initialize precision optimizer.
@@ -58,8 +66,7 @@ class PrecisionOptimizer:
             baseline_metrics: Baseline perplexity and KL metrics from GradualQuantizer
             evaluation_samples: Number of samples for evaluation
             budget_allocations: Per-block budget allocations from importance analysis
-            max_perplexity_increase: Maximum allowed perplexity increase (with safety multiplier applied)
-            max_per_token_kl_divergence: Maximum allowed KL divergence (with safety multiplier applied)
+            original_model: Reference to original model for KL divergence calculation
         """
         self.model = model
         self.tokenizer = tokenizer
@@ -68,16 +75,20 @@ class PrecisionOptimizer:
         self.baseline_metrics = baseline_metrics or {}
         self.evaluation_samples = evaluation_samples
         self.budget_allocations = budget_allocations or {}
-        self.max_perplexity_increase = max_perplexity_increase
-        self.max_per_token_kl_divergence = max_per_token_kl_divergence
+        self.original_model = original_model
+        
+        # Persistent state for building final quantized model
+        self.block_quantizations = {}  # Store best quantization config for each block
+        self.quantized_blocks = {}     # Store actual quantized block instances
+        self.current_model_state = {}  # Track current state of model blocks
         
         # Get fixed calibration data for consistent evaluation (reusing ImportanceAnalyzer approach)
         self.eval_samples = self._get_evaluation_samples()
         
         print(f"PrecisionOptimizer initialized:")
-        print(f"  Max PPL increase (with safety): {self.max_perplexity_increase:.2f}")
-        print(f"  Max KL divergence (with safety): {self.max_per_token_kl_divergence:.4f}")
         print(f"  Budget allocations for {len(self.budget_allocations)} blocks")
+        print(f"  Evaluation samples: {self.evaluation_samples}")
+        print(f"  Original model reference: {'Available' if original_model else 'Not available'}")
         
     def progressive_quantize_block(self, block_name: str, cached_data: List, budget_allocation: float) -> Optional[QuantizationConfig]:
         """
@@ -196,12 +207,201 @@ class PrecisionOptimizer:
         
     def _try_rtn_quantization(self, block, bits, group_size, cached_data, budget):
         """Try RTN quantization with given parameters."""
-        # TODO: Implement RTN quantization using existing Bitween utilities
-        # For now, simulate with random success/failure
-        import random
-        error = random.uniform(0, budget * 2)  # Random error for simulation
-        success = error <= budget
-        return success, error
+        from .base_wrapper import RTNWrapper
+        from .utils import get_module_by_name, set_module_by_name
+        
+        # Get block name from model
+        block_name = self._find_block_name(block)
+        if not block_name:
+            print(f"      Could not find block name in model")
+            return False, float('inf')
+        
+        print(f"      Applying RTN {bits}-bit quantization to {block_name}")
+        
+        try:
+            # Get current block state (original or previously quantized)
+            current_block = get_module_by_name(self.model, block_name)
+            
+            # Create RTN wrapper for this block
+            rtn_wrapper = RTNWrapper(
+                wrapped_block=current_block,
+                bits=bits,
+                group_size=group_size,
+                storage_device="cpu",  # Use CPU storage for memory efficiency
+                block_name=block_name
+            )
+            
+            # Replace block with wrapper in model
+            set_module_by_name(self.model, block_name, rtn_wrapper)
+            
+            # Enable quantization for this block
+            rtn_wrapper.enable()
+            
+            # Evaluate model performance with this block quantized
+            performance = self.evaluate_block_performance(block_name)
+            
+            print(f"        RTN result: PPL increase = {performance['ppl_increase']:.4f}")
+            print(f"        Combined sensitivity = {performance['current_combined_sensitivity']:.4f}, threshold = {performance['threshold_combined_sensitivity']:.4f}")
+            
+            if performance['under_threshold']:
+                # Save this quantization configuration
+                config = QuantizationConfig(
+                    bits=bits,
+                    group_size=group_size,
+                    method="RTN",
+                    error_metric=performance['ppl_increase'],
+                    memory_savings=self._estimate_memory_savings(bits, group_size)
+                )
+                
+                # Store quantized wrapper (keep it in the model)
+                self._save_block_quantization(block_name, config, rtn_wrapper)
+                print(f"        ✓ Saved RTN quantization for {block_name}")
+                
+                return True, performance['ppl_increase']
+            else:
+                # RTN failed - restore previous state
+                self._restore_block_state(block_name, current_block)
+                rtn_wrapper.cleanup()
+                
+                return False, performance['ppl_increase']
+            
+        except Exception as e:
+            print(f"        RTN quantization failed: {e}")
+            # Ensure cleanup on error
+            try:
+                if 'rtn_wrapper' in locals():
+                    rtn_wrapper.cleanup()
+                    self._restore_block_state(block_name, current_block)
+            except:
+                pass
+            return False, float('inf')
+            
+    def _find_block_name(self, target_block):
+        """Find the name of a block in the model."""
+        for name, module in self.model.named_modules():
+            if module is target_block:
+                return name
+        return None
+        
+    def _save_block_quantization(self, block_name: str, config: QuantizationConfig, quantized_block):
+        """Save quantization configuration - if it meets threshold, it's good."""
+        # Update to better config if found (lower bits or smaller group size)
+        if block_name in self.block_quantizations:
+            existing_config = self.block_quantizations[block_name]
+            # Keep better quantization: lower bits first, then smaller group size
+            if (config.bits < existing_config.bits or 
+                (config.bits == existing_config.bits and config.group_size < existing_config.group_size)):
+                print(f"        ↗ Upgrading {block_name}: {existing_config.bits}-bit → {config.bits}-bit")
+                # Clean up previous quantized block
+                if hasattr(self.quantized_blocks[block_name], 'cleanup'):
+                    self.quantized_blocks[block_name].cleanup()
+            else:
+                print(f"        → Keeping existing {existing_config.bits}-bit config for {block_name}")
+                # Clean up current attempt since we're not using it
+                if hasattr(quantized_block, 'cleanup'):
+                    quantized_block.cleanup()
+                return False
+        
+        # Save the configuration and quantized block
+        self.block_quantizations[block_name] = config
+        self.quantized_blocks[block_name] = quantized_block
+        self.current_model_state[block_name] = 'quantized'
+        
+        print(f"        ✓ Saved {config.method} {config.bits}-bit for {block_name}")
+        return True
+        
+    def _restore_block_state(self, block_name: str, previous_block):
+        """Restore block to previous state."""
+        from .utils import set_module_by_name
+        set_module_by_name(self.model, block_name, previous_block)
+        
+    def _estimate_memory_savings(self, bits: int, group_size: int) -> float:
+        """Simple memory savings: lower bits = less memory."""
+        return (1 - bits / 32.0) * 100  # Compare to float32
+        
+    def freeze_layers(self, block_name: str, layer_names: List[str]):
+        """Mark specific layers as frozen (won't be quantized further)."""
+        if block_name not in self.block_quantizations:
+            return
+            
+        config = self.block_quantizations[block_name]
+        for layer_name in layer_names:
+            config.layer_exceptions[layer_name] = "frozen"
+        
+        print(f"        Froze {len(layer_names)} layers in {block_name}")
+        
+    def is_layer_frozen(self, block_name: str, layer_name: str) -> bool:
+        """Check if a layer is frozen from further quantization."""
+        if block_name not in self.block_quantizations:
+            return False
+        
+        config = self.block_quantizations[block_name]
+        return config.layer_exceptions.get(layer_name) == "frozen"
+        
+    def evaluate_block_performance(self, block_name: str) -> Dict[str, float]:
+        """
+        Evaluate if block achieves performance under threshold.
+        Simple: evaluate quantized model, subtract baseline, calculate combined sensitivity.
+        
+        Returns:
+            Dict with evaluation results and threshold check
+        """
+        from ..utils.evaluation import calculate_perplexity, calculate_kl_divergence
+        
+        # Get baseline metrics (already calculated in GradualQuantizer)
+        baseline_ppl = self.baseline_metrics.get('perplexity', 0.0)
+        baseline_kl = self.baseline_metrics.get('kl_divergence', 0.0)
+        
+        # Evaluate current quantized model (with one block quantized)
+        current_ppl = calculate_perplexity(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            eval_samples=self.evaluation_samples,
+            verbose=False
+        )
+        
+        # Calculate KL divergence if we have original model reference
+        current_kl = baseline_kl  # Default to baseline if no original model
+        if self.original_model is not None:
+            _, current_kl = calculate_kl_divergence(
+                original_model=self.original_model,
+                quantized_model=self.model,
+                tokenizer=self.tokenizer,
+                eval_samples=self.evaluation_samples,
+                verbose=False
+            )
+        
+        # Calculate degradation
+        ppl_increase = current_ppl - baseline_ppl
+        kl_increase = current_kl - baseline_kl
+        
+        # Calculate combined sensitivity for current state (using same weights as in budget allocation)
+        from .importance_analyzer import ImportanceAnalyzer
+        analyzer = ImportanceAnalyzer(self.model, self.tokenizer, evaluation_samples=self.evaluation_samples)
+        
+        current_combined_sensitivity = analyzer.calculate_combined_sensitivity(
+            ppl_increase=ppl_increase,
+            kl_increase=kl_increase
+        )
+        
+        # Get budget threshold for this block (already calculated in importance analysis)
+        block_budget = self.budget_allocations.get(block_name, {})
+        threshold_combined_sensitivity = block_budget.get('combined_sensitivity', float('inf'))
+        
+        # Check if under threshold
+        under_threshold = current_combined_sensitivity <= threshold_combined_sensitivity
+        
+        return {
+            'current_ppl': current_ppl,
+            'baseline_ppl': baseline_ppl,
+            'ppl_increase': ppl_increase,
+            'current_kl': current_kl,
+            'baseline_kl': baseline_kl,
+            'kl_increase': kl_increase,
+            'current_combined_sensitivity': current_combined_sensitivity,
+            'threshold_combined_sensitivity': threshold_combined_sensitivity,
+            'under_threshold': under_threshold
+        }
         
     def _try_trainable_quantization(self, block, bits, group_size, cached_data, budget):
         """Try trainable quantization with given parameters."""
@@ -284,28 +484,6 @@ class PrecisionOptimizer:
         samples = calib_dataset.get_samples(num_samples=self.evaluation_samples)
         return samples
         
-    def _evaluate_model_perplexity(self):
-        """Evaluate perplexity with fixed input tokens (reusing ImportanceAnalyzer logic)."""
-        self.model.eval()
-        device = next(self.model.parameters()).device
-        
-        total_loss = 0.0
-        total_tokens = 0
-        
-        with torch.no_grad():
-            for sample in self.eval_samples:
-                input_ids = sample["input_ids"].unsqueeze(0).to(device)
-                
-                # Forward pass
-                outputs = self.model(input_ids, labels=input_ids)
-                loss = outputs.loss
-                
-                total_loss += loss.item() * input_ids.size(1)
-                total_tokens += input_ids.size(1)
-                
-        avg_loss = total_loss / total_tokens
-        perplexity = torch.exp(torch.tensor(avg_loss)).item()
-        return perplexity
         
     def _evaluate_kl_divergence(self, baseline_logits_list):
         """Calculate KL divergence between current model and baseline (reusing ImportanceAnalyzer logic)."""
@@ -409,14 +587,80 @@ class PrecisionOptimizer:
         ppl_increase = current_ppl - baseline_ppl
         return max(0, ppl_increase)  # Ensure non-negative
         
+    def apply_all_quantizations(self):
+        """Apply all saved quantization configurations to build final quantized model."""
+        print(f"\nApplying all quantizations to build final model...")
+        print(f"Total blocks to quantize: {len(self.block_quantizations)}")
+        
+        total_memory_savings = 0.0
+        quantization_summary = []
+        
+        for block_name, config in self.block_quantizations.items():
+            if block_name in self.quantized_blocks:
+                # Block is already quantized with the saved config
+                print(f"  ✓ {block_name}: {config.method} {config.bits}-bit (group_size={config.group_size})")
+                total_memory_savings += config.memory_savings
+                quantization_summary.append({
+                    'block': block_name,
+                    'method': config.method,
+                    'bits': config.bits,
+                    'group_size': config.group_size,
+                    'error': config.error_metric,
+                    'memory_savings': config.memory_savings
+                })
+            else:
+                print(f"  ⚠ {block_name}: Quantized block not found, applying config...")
+                self.apply_quantization_config(block_name, config)
+        
+        print(f"\n📊 Quantization Summary:")
+        print(f"  Blocks quantized: {len(quantization_summary)}")
+        print(f"  Total estimated memory savings: {total_memory_savings:.1f}%")
+        
+        # Print breakdown by method
+        method_counts = {}
+        for summary in quantization_summary:
+            method = summary['method']
+            method_counts[method] = method_counts.get(method, 0) + 1
+        
+        for method, count in method_counts.items():
+            print(f"  {method}: {count} blocks")
+            
+        return quantization_summary
+        
     def apply_quantization_config(self, block_name: str, config: QuantizationConfig):
         """Apply the quantization configuration to the actual model block."""
-        # TODO: Apply the actual quantization to the model
+        from .utils import get_module_by_name, set_module_by_name
+        from .base_wrapper import RTNWrapper
+        
         print(f"  Applying {config.method} quantization: {config.bits}-bit, group_size={config.group_size}")
         
-        # This should:
-        # 1. Get the block from the model
-        # 2. Apply the quantization with specified bits and group_size
-        # 3. Replace the block in the model with the quantized version
+        try:
+            # Get the original block
+            original_block = get_module_by_name(self.model, block_name)
+            
+            if config.method == "RTN":
+                # Create RTN wrapper
+                quantized_wrapper = RTNWrapper(
+                    wrapped_block=original_block,
+                    bits=config.bits,
+                    group_size=config.group_size,
+                    storage_device="cpu",
+                    block_name=block_name
+                )
+                quantized_wrapper.enable()
+                
+                # Replace in model
+                set_module_by_name(self.model, block_name, quantized_wrapper)
+                
+                # Update our tracking
+                self.quantized_blocks[block_name] = quantized_wrapper
+                self.current_model_state[block_name] = 'quantized'
+                
+            elif config.method in ["Trained", "Mixed"]:
+                # TODO: Apply trained quantization
+                print(f"    ⚠ {config.method} quantization application not yet implemented")
+                
+        except Exception as e:
+            print(f"    ✗ Failed to apply {config.method} quantization to {block_name}: {e}")
 
 
