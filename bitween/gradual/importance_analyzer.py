@@ -42,10 +42,6 @@ class ImportanceAnalyzer:
 
         self.evaluation_samples = evaluation_samples
         
-        # Discover model structure
-        self.block_names = self._detect_transformer_blocks()
-        self.layer_names = self._detect_quantizable_layers()
-        
         # Results storage
         self.block_importance_scores = {}
         self.layer_importance_scores = {}
@@ -267,58 +263,7 @@ class ImportanceAnalyzer:
             
             # Restore original block
             set_module_by_name(self.model, block_name, original_block)
-        
-    def analyze_layer_importance(self) -> Dict[str, float]:
-        """
-        Analyze individual layer importance within blocks.
-        Uses 4-bit baseline + selective layer upgrade method.
-        
-        Returns:
-            Dictionary mapping layer names to importance scores
-        """
-        pass
-        
-    def get_block_thresholds(self, global_budget: float) -> Dict[str, float]:
-        """
-        Convert block importance scores to perplexity thresholds.
-        
-        Args:
-            global_budget: Total perplexity increase budget
-            
-        Returns:
-            Dictionary mapping block names to threshold values
-        """
-        pass
-        
-    def get_layer_thresholds(self, block_name: str, block_budget: float) -> Dict[str, float]:
-        """
-        Convert layer importance scores to thresholds within a block.
-        
-        Args:
-            block_name: Name of block to analyze
-            block_budget: Perplexity budget allocated to this block
-            
-        Returns:
-            Dictionary mapping layer names to threshold values
-        """
-        pass
-        
-    def _detect_transformer_blocks(self) -> List[str]:
-        """Detect transformer blocks in model architecture."""
-        pass
-        
-    def _detect_quantizable_layers(self) -> List[str]:
-        """Detect all quantizable linear layers in model."""
-        pass
-        
-    def _run_single_method(self, method: 'ImportanceMethod', target_type: str) -> Dict[str, float]:
-        """Run a single importance analysis method."""
-        pass
-        
-    def _aggregate_scores(self, method_results: Dict[str, Dict[str, float]]) -> Dict[str, ImportanceScore]:
-        """Aggregate results from all methods into final importance scores."""
-        pass
-        
+
     def _get_fixed_calibration_data(self):
         """Get fixed calibration data for consistent testing."""
         from ..calib_dataset import get_calibration_dataset
@@ -597,44 +542,3 @@ class ImportanceAnalyzer:
             }
         
         return normalized_scores
-    
-    def save_analysis_results(self, path: str):
-        """Save importance analysis results for later reuse."""
-        pass
-        
-    def load_analysis_results(self, path: str):
-        """Load previously computed importance analysis results."""
-        pass
-
-
-class ImportanceMethod(ABC):
-    """Base class for different importance discovery methods."""
-    
-    @abstractmethod
-    def run_test(self, model: nn.Module, tokenizer, target_names: List[str], 
-                 calibration_samples: int) -> Dict[str, float]:
-        """
-        Run importance test on specified targets.
-        
-        Args:
-            model: Model to analyze
-            tokenizer: Model tokenizer
-            target_names: List of block/layer names to test
-            calibration_samples: Number of samples for evaluation
-            
-        Returns:
-            Dictionary mapping target names to importance scores
-        """
-        pass
-        
-    @property
-    @abstractmethod
-    def method_name(self) -> str:
-        """Name of this importance method."""
-        pass
-        
-    @property
-    @abstractmethod
-    def weight(self) -> float:
-        """Weight for this method when aggregating scores."""
-        pass

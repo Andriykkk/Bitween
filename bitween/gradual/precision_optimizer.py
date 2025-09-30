@@ -10,25 +10,21 @@ from enum import Enum
 
 
 class OptimizationResult(Enum):
-    """Result codes for optimization attempts."""
+    """Results of quantization optimization attempts."""
     SUCCESS = "success"
-    BUDGET_EXCEEDED = "budget_exceeded"
-    NUMERICAL_INSTABILITY = "numerical_instability" 
-    TRAINING_FAILED = "training_failed"
+    FAILED_RTN = "failed_rtn"
+    FAILED_TRAINING = "failed_training" 
+    FAILED_RECOVERY = "failed_recovery"
     NO_IMPROVEMENT = "no_improvement"
 
 
 @dataclass
-class OptimizationAttempt:
-    """Record of a single optimization attempt."""
-    target_name: str
-    target_bits: int
+class QuantizationConfig:
+    """Configuration for a quantization attempt."""
+    bits: int
     group_size: int
-    actual_impact: float
-    budget_limit: float
-    result: OptimizationResult
-    metrics: Dict
-    training_epochs: int = 0
+    method: str  # "RTN", "Trained", "Mixed"
+    error_metric: float
 
 
 class PrecisionOptimizer:
@@ -39,203 +35,388 @@ class PrecisionOptimizer:
     Manages rollback when optimization fails to meet budget constraints.
     """
     
-    def __init__(self, model: nn.Module, tokenizer):
+    def __init__(
+        self, 
+        model: nn.Module, 
+        tokenizer, 
+        min_group_size: int = 32, 
+        max_group_size: int = 128,
+        baseline_metrics: Dict = None,
+        evaluation_samples: int = 5,
+        budget_allocations: Dict = None,
+        max_perplexity_increase: float = 5.0,
+        max_per_token_kl_divergence: float = 0.01
+    ):
+        """
+        Initialize precision optimizer.
+        
+        Args:
+            model: The model to optimize
+            tokenizer: Tokenizer for the model
+            min_group_size: Minimum group size for quantization
+            max_group_size: Maximum group size for quantization
+            baseline_metrics: Baseline perplexity and KL metrics from GradualQuantizer
+            evaluation_samples: Number of samples for evaluation
+            budget_allocations: Per-block budget allocations from importance analysis
+            max_perplexity_increase: Maximum allowed perplexity increase (with safety multiplier applied)
+            max_per_token_kl_divergence: Maximum allowed KL divergence (with safety multiplier applied)
+        """
         self.model = model
         self.tokenizer = tokenizer
+        self.min_group_size = min_group_size
+        self.max_group_size = max_group_size
+        self.baseline_metrics = baseline_metrics or {}
+        self.evaluation_samples = evaluation_samples
+        self.budget_allocations = budget_allocations or {}
+        self.max_perplexity_increase = max_perplexity_increase
+        self.max_per_token_kl_divergence = max_per_token_kl_divergence
         
-        # Import existing quantization utilities
-        from ..quantizer.quantizer import Bitween
-        self.bitween = Bitween
+        # Get fixed calibration data for consistent evaluation (reusing ImportanceAnalyzer approach)
+        self.eval_samples = self._get_evaluation_samples()
         
-        # Optimization state
-        self.current_state = None  # Will hold QuantizationState
-        self.optimization_history = []
-        self.rollback_points = {}
+        print(f"PrecisionOptimizer initialized:")
+        print(f"  Max PPL increase (with safety): {self.max_perplexity_increase:.2f}")
+        print(f"  Max KL divergence (with safety): {self.max_per_token_kl_divergence:.4f}")
+        print(f"  Budget allocations for {len(self.budget_allocations)} blocks")
+        
+    def progressive_quantize_block(self, block_name: str, cached_data: List, budget_allocation: float) -> Optional[QuantizationConfig]:
+        """
+        Progressive quantization algorithm for a single block.
+        
+        Tries RTN first, then training, with decreasing group sizes and bit precision.
+        Falls back to layer-level recovery if needed.
+        
+        Args:
+            block_name: Name of block to quantize
+            cached_data: List of (input_dict, output_tensor) pairs
+            budget_allocation: Error budget for this block
+            
+        Returns:
+            Best quantization configuration found, or None if nothing works
+        """
+        from .utils import get_module_by_name
         
         # Configuration
-        self.available_precisions = [8, 4, 2]
-        self.available_group_sizes = [128, 64, 32, 16]
-        self.max_training_epochs = 10
-        self.min_group_size = 8
+        precision_levels = [8, 4, 2]  # bits
         
-    def optimize_block(self, block_name: str, target_bits: int, budget_limit: float) -> OptimizationAttempt:
-        """
-        Optimize a block to target precision within budget limit.
+        # Get the block
+        block = get_module_by_name(self.model, block_name)
         
-        Tries different precisions and group sizes, with trainable quantization
-        as fallback when RTN fails.
+        # Separate attention and MLP layers
+        attention_layers, mlp_layers = self._separate_layer_types(block)
         
-        Args:
-            block_name: Name of block to optimize
-            target_bits: Desired bit precision  
-            budget_limit: Maximum perplexity increase allowed
+        best_config = None
+        
+        # Phase 1: Try each precision level
+        for target_bits in precision_levels:
+            print(f"    Trying {target_bits}-bit quantization...")
             
-        Returns:
-            OptimizationAttempt object with results and metrics
-        """
-        pass
-        
-    def optimize_layer(self, layer_name: str, target_bits: int, budget_limit: float) -> OptimizationAttempt:
-        """
-        Optimize a specific layer to target precision within budget limit.
-        
-        Args:
-            layer_name: Name of layer to optimize
-            target_bits: Desired bit precision
-            budget_limit: Maximum perplexity increase allowed
+            # Try different group sizes from large to small
+            group_sizes = self._get_group_size_sequence(self.max_group_size, self.min_group_size)
             
-        Returns:
-            OptimizationAttempt object with results and metrics
-        """
-        pass
-        
-    def progressive_block_quantization(self, block_name: str, budget_limit: float) -> List[OptimizationAttempt]:
-        """
-        Try quantizing block progressively: 8bit -> 4bit -> 2bit.
-        Stop at first precision that exceeds budget.
-        
-        Args:
-            block_name: Block to quantize progressively
-            budget_limit: Perplexity budget for this block
+            for target_group_size in group_sizes:
+                print(f"      Group size: {target_group_size}")
+                
+                # Step 1: Try RTN quantization first
+                rtn_success, rtn_error = self._try_rtn_quantization(
+                    block, target_bits, target_group_size, cached_data, budget_allocation
+                )
+                
+                if rtn_success:
+                    print(f"      ✓ RTN successful (error: {rtn_error:.4f})")
+                    best_config = QuantizationConfig(target_bits, target_group_size, "RTN", rtn_error)
+                    continue  # Try even lower precision
+                    
+                # Step 2: RTN failed, try training
+                print(f"      RTN failed (error: {rtn_error:.4f}), trying training...")
+                
+                train_success, train_error = self._try_trainable_quantization(
+                    block, target_bits, target_group_size, cached_data, budget_allocation
+                )
+                
+                if train_success:
+                    print(f"      ✓ Training successful (error: {train_error:.4f})")
+                    best_config = QuantizationConfig(target_bits, target_group_size, "Trained", train_error)
+                    continue  # Try even lower precision
+                    
+                # Step 3: Training failed, try layer-level recovery
+                print(f"      Training failed (error: {train_error:.4f}), trying layer recovery...")
+                
+                recovery_success, recovery_error = self._try_layer_recovery(
+                    block, target_bits, target_group_size, cached_data, budget_allocation
+                )
+                
+                if recovery_success:
+                    print(f"      ✓ Layer recovery successful (error: {recovery_error:.4f})")
+                    best_config = QuantizationConfig(target_bits, target_group_size, "Mixed", recovery_error)
+                    continue  # Try even lower precision
+                else:
+                    print(f"      ✗ Layer recovery failed (error: {recovery_error:.4f})")
+                    # This precision/group_size combination doesn't work
+                    if best_config is not None:
+                        # Return best previous configuration
+                        print(f"    Using best config: {best_config.bits}-bit, group_size={best_config.group_size}, method={best_config.method}")
+                        return best_config
+                    # Continue to next group_size
+                    
+        # Return best configuration found, or None if nothing worked
+        if best_config is not None:
+            print(f"  Final config: {best_config.bits}-bit, group_size={best_config.group_size}, method={best_config.method}")
+            return best_config
+        else:
+            print(f"  No quantization possible within budget")
+            return None
             
-        Returns:
-            List of optimization attempts, one per precision tried
-        """
-        pass
+    def _separate_layer_types(self, block):
+        """Separate attention and MLP layers in a transformer block."""
+        attention_layers = []
+        mlp_layers = []
         
-    def _try_precision_with_group_optimization(self, target_name: str, bits: int, 
-                                              budget_limit: float, is_layer: bool = False) -> OptimizationAttempt:
-        """Try different group sizes for given precision."""
-        pass
+        for name, module in block.named_modules():
+            if isinstance(module, torch.nn.Linear):
+                # Simple heuristic to identify layer types
+                if any(keyword in name.lower() for keyword in ['attn', 'attention', 'query', 'key', 'value']):
+                    attention_layers.append((name, module))
+                elif any(keyword in name.lower() for keyword in ['mlp', 'fc', 'linear', 'feed_forward']):
+                    mlp_layers.append((name, module))
+                else:
+                    # Default to MLP if unclear
+                    mlp_layers.append((name, module))
+                    
+        return attention_layers, mlp_layers
         
-    def _apply_rtn_quantization(self, target_name: str, bits: int, group_size: int, is_layer: bool = False):
-        """Apply RTN quantization to target with specified parameters."""
-        pass
+    def _get_group_size_sequence(self, max_size, min_size):
+        """Generate sequence of group sizes from max to min."""
+        sizes = []
+        current = max_size
+        while current >= min_size:
+            sizes.append(current)
+            current = current // 2
+        return sizes
         
-    def _apply_trainable_quantization(self, target_name: str, bits: int, group_size: int, 
-                                    epochs: int = 5, is_layer: bool = False):
-        """Apply trainable quantization as fallback when RTN fails."""
-        pass
+    def _try_rtn_quantization(self, block, bits, group_size, cached_data, budget):
+        """Try RTN quantization with given parameters."""
+        # TODO: Implement RTN quantization using existing Bitween utilities
+        # For now, simulate with random success/failure
+        import random
+        error = random.uniform(0, budget * 2)  # Random error for simulation
+        success = error <= budget
+        return success, error
         
-    def _evaluate_quantization_impact(self, target_name: str, sample_size: int = 50) -> float:
-        """Measure perplexity impact of current quantization state."""
-        pass
+    def _try_trainable_quantization(self, block, bits, group_size, cached_data, budget):
+        """Try trainable quantization with given parameters."""
+        # TODO: Implement trainable quantization
+        # This should:
+        # 1. Apply quantization to all linear layers in block
+        # 2. Train on cached input/output pairs
+        # 3. Use different strategies for attention vs MLP layers
         
-    def create_rollback_point(self, checkpoint_name: str):
-        """Save current state as rollback point."""
-        pass
+        print(f"        Training block with {len(cached_data)} samples...")
         
-    def rollback_to_point(self, checkpoint_name: str):
-        """Restore state to saved rollback point.""" 
-        pass
+        # Separate attention and MLP layers
+        attention_layers, mlp_layers = self._separate_layer_types(block)
         
-    def rollback_target(self, target_name: str):
-        """Rollback specific target to previous precision."""
-        pass
-        
-    def get_optimization_summary(self) -> Dict:
-        """Get summary of all optimization attempts."""
-        pass
-
-
-class GroupSizeOptimizer:
-    """
-    Specialized class for finding optimal group sizes.
-    """
-    
-    def __init__(self):
-        self.size_candidates = [128, 64, 32, 16, 8]
-        
-    def find_optimal_group_size(self, layer_weights: torch.Tensor, target_bits: int,
-                               budget_limit: float) -> Tuple[int, float]:
-        """
-        Find optimal group size for layer at target precision.
-        
-        Args:
-            layer_weights: Weight tensor to quantize
-            target_bits: Target bit precision
-            budget_limit: Performance budget
+        # Phase 1: Train attention layers (usually more sensitive)
+        if attention_layers:
+            print(f"        Training {len(attention_layers)} attention layers...")
+            self._train_layer_group(attention_layers, cached_data, epochs=5, lr=1e-4)
             
-        Returns:
-            Tuple of (optimal_group_size, expected_impact)
-        """
-        pass
-        
-    def _estimate_quantization_error(self, weights: torch.Tensor, bits: int, group_size: int) -> float:
-        """Estimate quantization error without full model evaluation."""
-        pass
-        
-    def _calculate_memory_efficiency(self, layer_size: int, bits: int, group_size: int) -> float:
-        """Calculate memory efficiency for given configuration."""
-        pass
-
-
-class PrecisionScheduler:
-    """
-    Manages the schedule for trying different precisions and fallback strategies.
-    """
-    
-    def __init__(self):
-        self.precision_order = [8, 4, 2]  # Conservative to aggressive
-        self.fallback_strategies = [
-            "reduce_group_size",
-            "enable_training", 
-            "partial_quantization",
-            "skip_quantization"
-        ]
-        
-    def get_next_precision_attempt(self, current_precision: int, failure_reason: OptimizationResult) -> Optional[int]:
-        """Get next precision to try based on current failure."""
-        pass
-        
-    def get_fallback_strategy(self, precision: int, attempts_failed: int) -> str:
-        """Get next fallback strategy to try."""
-        pass
-        
-    def should_continue_optimization(self, attempts: List[OptimizationAttempt], 
-                                   global_budget_remaining: float) -> bool:
-        """Decide whether to continue trying optimizations."""
-        pass
-
-
-class QuantizationValidator:
-    """
-    Validates quantization results and checks for common failure modes.
-    """
-    
-    def __init__(self):
-        self.validation_checks = [
-            self._check_numerical_stability,
-            self._check_activation_range,
-            self._check_gradient_flow,
-            self._check_output_quality
-        ]
-        
-    def validate_quantization(self, model: nn.Module, target_name: str) -> Tuple[bool, List[str]]:
-        """
-        Run all validation checks on quantized target.
-        
-        Args:
-            model: Model with quantized target
-            target_name: Name of quantized component
+        # Phase 2: Train MLP layers (usually more robust)  
+        if mlp_layers:
+            print(f"        Training {len(mlp_layers)} MLP layers...")
+            self._train_layer_group(mlp_layers, cached_data, epochs=3, lr=2e-4)
             
-        Returns:
-            Tuple of (is_valid, list_of_issues)
+        # Phase 3: Joint fine-tuning
+        print(f"        Joint fine-tuning entire block...")
+        self._train_entire_block(block, cached_data, epochs=2, lr=5e-5)
+        
+        # Evaluate trained block
+        error = self._evaluate_block_error(block, cached_data)
+        success = error <= budget
+        
+        return success, error
+        
+    def _try_layer_recovery(self, block, bits, group_size, cached_data, budget):
+        """Try layer-level recovery for failed quantization."""
+        # TODO: Implement layer recovery algorithm
+        # This should:
+        # 1. Identify problematic layers
+        # 2. Try reverting each layer to higher precision
+        # 3. Apply best reversions until budget is met
+        
+        import random
+        error = random.uniform(0, budget * 1.2)  # Best chance with recovery
+        success = error <= budget
+        return success, error
+        
+    def _train_layer_group(self, layers, cached_data, epochs, lr):
+        """Train a group of layers on cached data."""
+        # TODO: Implement layer group training
+        print(f"          Training {len(layers)} layers for {epochs} epochs at lr={lr}")
+        
+        # Simulate training time
+        import time
+        time.sleep(0.05)  # Quick simulation
+        
+    def _train_entire_block(self, block, cached_data, epochs, lr):
+        """Train entire block jointly."""
+        # TODO: Implement block-level training
+        print(f"          Joint training for {epochs} epochs at lr={lr}")
+        
+        # Simulate training time
+        import time
+        time.sleep(0.05)  # Quick simulation
+        
+    def _get_evaluation_samples(self):
+        """Get fixed calibration data for consistent evaluation (reusing ImportanceAnalyzer approach)."""
+        from ..calib_dataset import get_calibration_dataset
+        
+        # Get small, fixed dataset for testing (same as ImportanceAnalyzer._get_fixed_calibration_data)
+        calib_dataset = get_calibration_dataset(
+            dataset_name="pile-10k",
+            tokenizer=self.tokenizer,
+            seqlen=512,
+            nsamples=self.evaluation_samples,
+            seed=123  # Same seed as ImportanceAnalyzer
+        )
+        
+        # Get the tokenized samples
+        samples = calib_dataset.get_samples(num_samples=self.evaluation_samples)
+        return samples
+        
+    def _evaluate_model_perplexity(self):
+        """Evaluate perplexity with fixed input tokens (reusing ImportanceAnalyzer logic)."""
+        self.model.eval()
+        device = next(self.model.parameters()).device
+        
+        total_loss = 0.0
+        total_tokens = 0
+        
+        with torch.no_grad():
+            for sample in self.eval_samples:
+                input_ids = sample["input_ids"].unsqueeze(0).to(device)
+                
+                # Forward pass
+                outputs = self.model(input_ids, labels=input_ids)
+                loss = outputs.loss
+                
+                total_loss += loss.item() * input_ids.size(1)
+                total_tokens += input_ids.size(1)
+                
+        avg_loss = total_loss / total_tokens
+        perplexity = torch.exp(torch.tensor(avg_loss)).item()
+        return perplexity
+        
+    def _evaluate_kl_divergence(self, baseline_logits_list):
+        """Calculate KL divergence between current model and baseline (reusing ImportanceAnalyzer logic)."""
+        import torch.nn.functional as F
+        
+        # Get current model logits
+        current_logits_list = self._get_model_logits()
+        
+        total_kl = 0.0
+        total_tokens = 0
+        
+        for logits1, logits2 in zip(baseline_logits_list, current_logits_list):
+            # Ensure same length
+            min_len = min(logits1.shape[1], logits2.shape[1])
+            logits1 = logits1[:, :min_len, :]
+            logits2 = logits2[:, :min_len, :]
+            
+            # Calculate KL divergence
+            log_prob1 = F.log_softmax(logits1, dim=-1)
+            prob2 = F.softmax(logits2, dim=-1)
+            
+            # Per-token KL divergence
+            per_token_kl = F.kl_div(log_prob1, prob2, reduction='none', log_target=False)  
+            per_token_kl = per_token_kl.sum(dim=-1)  # sum over vocab dim
+            
+            total_kl += per_token_kl.sum().item()
+            total_tokens += per_token_kl.numel()
+            
+        avg_kl_per_token = total_kl / total_tokens if total_tokens > 0 else 0.0
+        return avg_kl_per_token
+        
+    def get_block_budget_info(self, block_name: str) -> Dict:
+        """Get budget allocation information for a specific block."""
+        block_budget = self.budget_allocations.get(block_name, {})
+        
+        return {
+            'allocated_ppl_budget': block_budget.get('allocated_ppl_budget', 0.0),
+            'allocated_kl_budget': block_budget.get('allocated_kl_budget', 0.0),
+            'ppl_budget_percent': block_budget.get('ppl_budget_percent', 0.0),
+            'kl_budget_percent': block_budget.get('kl_budget_percent', 0.0),
+            'ppl_sensitivity': block_budget.get('ppl_sensitivity', 0.0),
+            'kl_sensitivity': block_budget.get('kl_sensitivity', 0.0),
+            'combined_sensitivity': block_budget.get('combined_sensitivity', 0.0)
+        }
+        
+    def validate_global_constraints(self) -> Dict[str, bool]:
         """
-        pass
+        Validate that current model meets global perplexity and KL constraints.
         
-    def _check_numerical_stability(self, model: nn.Module, target_name: str) -> Optional[str]:
-        """Check for NaN/Inf values in outputs."""
-        pass
+        Returns:
+            Dictionary with constraint validation results
+        """
+        current_ppl = self._evaluate_model_perplexity()
+        baseline_ppl = self.baseline_metrics.get('perplexity', current_ppl)
         
-    def _check_activation_range(self, model: nn.Module, target_name: str) -> Optional[str]:
-        """Check if activation ranges are preserved."""
-        pass
+        ppl_increase = current_ppl - baseline_ppl
+        ppl_increase_percent = (ppl_increase / baseline_ppl) * 100.0 if baseline_ppl > 0 else 0.0
         
-    def _check_gradient_flow(self, model: nn.Module, target_name: str) -> Optional[str]:
-        """Check if gradients can still flow through quantized layers."""
-        pass
+        # Check if we're within global constraints (safety multiplier already applied)
+        ppl_constraint_met = ppl_increase_percent <= self.max_perplexity_increase
         
-    def _check_output_quality(self, model: nn.Module, target_name: str) -> Optional[str]:
-        """Check output quality with sample inputs.""" 
-        pass
+        # TODO: Add KL divergence validation when baseline logits are available
+        kl_constraint_met = True  # Placeholder
+        
+        return {
+            'perplexity_constraint_met': ppl_constraint_met,
+            'kl_constraint_met': kl_constraint_met,
+            'current_ppl': current_ppl,
+            'baseline_ppl': baseline_ppl,
+            'ppl_increase': ppl_increase,
+            'ppl_increase_percent': ppl_increase_percent,
+            'max_allowed_ppl_increase': self.max_perplexity_increase
+        }
+        
+    def _get_model_logits(self):
+        """Get current model logits on evaluation samples."""
+        self.model.eval()
+        device = next(self.model.parameters()).device
+        
+        current_logits = []
+        
+        with torch.no_grad():
+            for sample in self.eval_samples:
+                input_ids = sample["input_ids"].unsqueeze(0).to(device)
+                
+                # Get current state logits
+                outputs = self.model(input_ids)
+                logits = outputs.logits  # shape: [1, seq_len, vocab]
+                current_logits.append(logits)
+                
+        return current_logits
+        
+    def _evaluate_block_error(self, block, cached_data):
+        """Evaluate reconstruction error on cached data."""
+        # For now, evaluate full model perplexity as proxy for block quality
+        # TODO: Could implement more targeted block-level evaluation
+        current_ppl = self._evaluate_model_perplexity()
+        baseline_ppl = self.baseline_metrics.get('perplexity', current_ppl)
+        
+        # Return perplexity increase as error metric
+        ppl_increase = current_ppl - baseline_ppl
+        return max(0, ppl_increase)  # Ensure non-negative
+        
+    def apply_quantization_config(self, block_name: str, config: QuantizationConfig):
+        """Apply the quantization configuration to the actual model block."""
+        # TODO: Apply the actual quantization to the model
+        print(f"  Applying {config.method} quantization: {config.bits}-bit, group_size={config.group_size}")
+        
+        # This should:
+        # 1. Get the block from the model
+        # 2. Apply the quantization with specified bits and group_size
+        # 3. Replace the block in the model with the quantized version
+
+

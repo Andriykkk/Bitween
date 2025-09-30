@@ -116,7 +116,9 @@ def main():
         max_perplexity_increase=5,
         ignore_layers=['lm_head', 'embed_tokens'],
         nsamples=4,
-        evaluation_samples=2
+        evaluation_samples=2,
+        min_group_size=32,
+        max_group_size=128
     )
 
     # Run gradual quantization

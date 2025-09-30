@@ -8,8 +8,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import copy
 
 from .importance_analyzer import ImportanceAnalyzer
-from .precision_optimizer import PrecisionOptimizer, OptimizationResult
-from .evaluator import GradualEvaluator
+from .precision_optimizer import PrecisionOptimizer, QuantizationConfig
 from .utils import get_transformer_block_names
 from ..utils.evaluation import calculate_perplexity
 
@@ -36,7 +35,9 @@ class GradualQuantizer:
         nsamples: int = 128,
         evaluation_samples: int = 5,
         ignore_layers: Optional[List[str]] = None,
-        cpu_offload: bool = False
+        cpu_offload: bool = False,
+        min_group_size: int = 32,
+        max_group_size: int = 128
     ):
         """
         Initialize gradual quantizer.
@@ -51,6 +52,8 @@ class GradualQuantizer:
             evaluation_samples: Samples for final evaluation (kept small for speed)
             ignore_layers: List of layer names to exclude from quantization
             cpu_offload: Enable CPU offloading for memory efficiency (requires GPU)
+            min_group_size: Minimum group size for quantization (default: 32)
+            max_group_size: Maximum group size for quantization (default: 128)
         """
         self.model = model
         self.tokenizer = tokenizer
@@ -61,6 +64,8 @@ class GradualQuantizer:
         self.evaluation_samples = evaluation_samples
 
         self.ignore_layers = ignore_layers
+        self.min_group_size = min_group_size
+        self.max_group_size = max_group_size
         
         # Device management - detect model's current device
         self.gpu_available = torch.cuda.is_available()
@@ -89,10 +94,8 @@ class GradualQuantizer:
             wrapper_storage_device=self.wrapper_storage_device,
             working_device=self.working_device
         )
-        self.precision_optimizer = PrecisionOptimizer(model, tokenizer)
-        self.evaluator = GradualEvaluator(model, tokenizer)
-        
-        # State tracking
+        self.precision_optimizer = None  # Initialize after importance analysis
+
         self.quantization_state = None
         self.importance_scores = None
         self.baseline_metrics = None
@@ -110,28 +113,47 @@ class GradualQuantizer:
         # Phase 1: Baseline establishment and importance discovery
         self._establish_baseline()
         self._discover_importance()
+        
+        # calculate importance scores
+        if not self.importance_scores:
+            raise ValueError("Must run importance analysis first")
+        
+        # Calculate budget allocation based on importance scores
+        budget_allocations = self.importance_analyzer.calculate_block_budget_allocation(
+            importance_scores=self.importance_scores,
+            max_ppl_increase=self.max_perplexity_increase,
+            max_kl_increase=self.max_per_token_kl_divergence,
+            ppl_weight=0.7,
+            kl_weight=0.3,
+            safety_multiplier=self.safety_multiplier
+        )
+        # Store budget allocations for later use
+        self.budget_allocations = budget_allocations
+        
+        # Initialize precision optimizer with all required information
+        self.precision_optimizer = PrecisionOptimizer(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            min_group_size=self.min_group_size,
+            max_group_size=self.max_group_size,
+            baseline_metrics=self.baseline_metrics,
+            evaluation_samples=self.evaluation_samples,
+            budget_allocations=budget_allocations,
+            max_perplexity_increase=self.max_perplexity_increase * self.safety_multiplier,
+            max_per_token_kl_divergence=self.max_per_token_kl_divergence * self.safety_multiplier
+        )
+        
+        """Apply quantization progressively based on importance scores."""
+        # Set up block training system for block-by-block training
+        self._setup_block_training()
+        
+        # Process all blocks sequentially using training system
+        self._process_blocks_with_training()
 
-                # Print importance scores for each block
-        # print("\n" + "="*60)
-        # print("BLOCK IMPORTANCE SCORES")
-        # print("="*60)
-        # for block_name, score in self.importance_scores.items():
-        #     print(f"{block_name}:")
-        #     print(f"  Noise Sensitivity (PPL):    {score.noise_sensitivity_ppl:.6f}")
-        #     print(f"  Noise Sensitivity (KL):     {score.noise_sensitivity_kl:.6f}")
-        #     print(f"  RTN 8-bit Impact:           {score.rtn_8bit_impact:.6f}")
-        #     print(f"  RTN 4-bit Impact:           {score.rtn_4bit_impact:.6f}")
-        #     print(f"  RTN 2-bit Impact:           {score.rtn_2bit_impact:.6f}")
-        #     print()
-        # print("="*60)
+        # # Phase 3: Global optimization and validation
+        # self._global_optimization()
         
-        # Phase 2: Progressive quantization with budget management
-        self._progressive_quantization()
-        
-        # Phase 3: Global optimization and validation
-        self._global_optimization()
-        
-        # Phase 4: Final evaluation and cleanup
+        # # Phase 4: Final evaluation and cleanup
         quantized_model = self._finalize_quantization()
         
         return quantized_model
@@ -165,78 +187,7 @@ class GradualQuantizer:
         self.importance_scores = self.importance_analyzer.analyze_block_importance(block_names)
         
         return self.importance_scores
-        
-    def _progressive_quantization(self):
-        """Apply quantization progressively based on importance scores."""
-        if not self.importance_scores:
-            raise ValueError("Must run importance analysis first")
-        
-        # Calculate budget allocation based on importance scores
-        budget_allocations = self.importance_analyzer.calculate_block_budget_allocation(
-            importance_scores=self.importance_scores,
-            max_ppl_increase=self.max_perplexity_increase,
-            max_kl_increase=self.max_per_token_kl_divergence,
-            ppl_weight=0.7,  # PPL is more important than KL
-            kl_weight=0.3,
-            safety_multiplier=self.safety_multiplier
-        )
-        
-        # Store budget allocations for later use
-        self.budget_allocations = budget_allocations
-        
-        # Set up block training system for block-by-block training
-        self._setup_block_training()
-        
-        # Process all blocks sequentially using training system
-        self._process_blocks_with_training()
-    
-    def _quantize_block_progressive(self, block_name: str, allocation: Dict):
-        """
-        Quantize a block progressively: 8-bit → 4-bit → 2-bit with group size optimization.
-        """
-        allocated_budget = allocation['allocated_ppl_budget']
-        
-        print(f"  Budget: {allocated_budget:.3f} ({allocation['ppl_budget_percent']:.1f}%)")
-        
-        # Try progressive quantization: 8→4→2 with group size optimization
-        for bits in [4]:  # Start with 4-bit for now
-            print(f"    Trying {bits}-bit quantization...")
-            
-            # Try different group sizes (smaller = better quality)
-            for group_size in [16, 32, 64, 128]:
-                result = self.precision_optimizer.optimize_block(
-                    block_name=block_name,
-                    target_bits=bits,
-                    budget_limit=allocated_budget
-                )
-                
-                if result.result == OptimizationResult.SUCCESS:
-                    print(f"    ✓ Success: {bits}-bit with group_size={group_size}")
-                    break
-                else:
-                    print(f"    ✗ Failed: {bits}-bit with group_size={group_size} ({result.result})")
-            
-            # If this precision level worked, we're done
-            if result.result == OptimizationResult.SUCCESS:
-                break
-                
-        if result.result != OptimizationResult.SUCCESS:
-            print(f"  ⚠️  Block couldn't be quantized within budget - needs layer analysis")
-            
-    def _quantize_block_layer_by_layer(self, block_name: str, allocation: Dict):
-        """
-        Quantize a sensitive block layer by layer with individual budgets.
-        """
-        print(f"  Implementing layer-by-layer quantization for {block_name}")
-        # TODO: Implement detailed layer-level quantization
-        # This would involve:
-        # 1. Detect all linear layers in the block
-        # 2. Analyze each layer's quantization sensitivity
-        # 3. Allocate sub-budgets to each layer
-        # 4. Quantize layers individually: some to 8-bit, others to 4-bit, etc.
-        # 5. Optimize group sizes per layer
-        pass
-        
+
     def _setup_block_training(self):
         """
         Set up block training system for block-by-block training.
@@ -265,19 +216,7 @@ class GradualQuantizer:
         
         # Get samples for training (all calibration samples for training)
         self.dataset_samples = calib_dataset.get_samples(num_samples=self.calibration_samples)
-        
-        # Debug: Check sample format
-        if self.dataset_samples:
-            sample = self.dataset_samples[0]
-            print(f"Sample format check:")
-            print(f"  Type: {type(sample)}")
-            print(f"  Keys: {list(sample.keys()) if isinstance(sample, dict) else 'Not a dict'}")
-            for key, value in sample.items():
-                if torch.is_tensor(value):
-                    print(f"  {key}: shape={value.shape}, device={value.device}, dtype={value.dtype}")
-                else:
-                    print(f"  {key}: {type(value)} = {value}")
-        
+
         print(f"Prepared {len(self.dataset_samples)} samples for block training")
         
     def _process_blocks_with_training(self):
@@ -320,7 +259,7 @@ class GradualQuantizer:
         
     def _train_block_on_cached_data(self, block_name: str, cached_data: List, allocation: Dict):
         """
-        Train a specific block on its cached activation data.
+        Train a specific block on its cached activation data using progressive quantization.
         
         Args:
             block_name: Name of block to train
@@ -331,64 +270,24 @@ class GradualQuantizer:
             print(f"No cached data for {block_name}, skipping training")
             return
             
-        print(f"Training {block_name} on {len(cached_data)} cached samples...")
+        print(f"Progressive quantization for {block_name} on {len(cached_data)} cached samples...")
         
-        # TODO: Implement actual training logic
-        # This should:
-        # 1. Get budget from allocation
-        # 2. Try progressive quantization (8->4->2 bit)
-        # 3. Optimize group sizes (128->64->32->16)
-        # 4. Use trainable quantization if RTN fails
-        # 5. Rollback if budget exceeded
+        # Get budget allocation
+        allocated_budget = allocation.get('allocated_ppl_budget', float('inf'))
+        print(f"  Allocated error budget: {allocated_budget:.4f}")
         
-        # For now, just simulate training
-        import time
-        time.sleep(0.1)  # Simulate training time
+        # Apply progressive quantization algorithm using PrecisionOptimizer
+        quantization_config = self.precision_optimizer.progressive_quantize_block(
+            block_name, cached_data, allocated_budget
+        )
         
-        print(f"Training simulation completed for {block_name}")
-        
-    def _global_optimization(self):
-        """Perform end-to-end optimization and handle budget violations."""
-        pass
-        
-    def _finalize_quantization(self) -> nn.Module:
-        """Convert to final quantized model and cleanup temporary state."""
-        pass
-        
-    def get_quantization_report(self) -> Dict:
-        """
-        Generate comprehensive report of quantization process.
-        
-        Returns:
-            Dictionary containing metrics, decisions, and performance data
-        """
-        pass
-        
-    def get_precision_analysis(self) -> Dict:
-        """
-        Analyze precision assignment across model blocks and layers.
-        
-        Returns:
-            Dictionary with precision statistics and bit distribution
-        """
-        pass
-        
-    def validate_kl_constraints(self) -> Dict[str, bool]:
-        """
-        Validate that KL divergence constraints are met at block/layer level.
-        
-        Returns:
-            Dictionary mapping block/layer names to constraint satisfaction
-        """
-        pass
-        
-    def save_quantization_state(self, path: str):
-        """Save current quantization state for resuming or analysis.""" 
-        pass
-        
-    def load_quantization_state(self, path: str):
-        """Load previously saved quantization state."""
-        pass
+        if quantization_config is not None:
+            # Apply the best configuration found
+            self.precision_optimizer.apply_quantization_config(block_name, quantization_config)
+            print(f"✓ Successfully quantized {block_name}: {quantization_config.bits}-bit, group_size={quantization_config.group_size}")
+        else:
+            print(f"⚠ Could not quantize {block_name} within budget - keeping original precision")
+            
 
 
 class QuantizationState:
