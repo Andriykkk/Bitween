@@ -154,12 +154,16 @@ class PrecisionOptimizer:
                     best_config = QuantizationConfig(target_bits, target_group_size, "Trained", train_error)
                     continue  # Try even lower precision
                     
-                # Step 3: Training failed, try layer-level recovery
-                print(f"      Training failed (error: {train_error:.4f}), trying layer recovery...")
-                
-                recovery_success, recovery_error = self._try_layer_recovery(
-                    block, target_bits, target_group_size, cached_data, budget_allocation
-                )
+                # Step 3: Training failed, try layer-level recovery (only at minimum group size)
+                if target_group_size == self.min_group_size:
+                    print(f"      Training failed (error: {train_error:.4f}), trying layer recovery...")
+                    
+                    recovery_success, recovery_error = self._try_layer_recovery(
+                        block, target_bits, target_group_size, cached_data, budget_allocation
+                    )
+                else:
+                    print(f"      Training failed (error: {train_error:.4f}), skipping layer recovery (group_size={target_group_size} > min={self.min_group_size})")
+                    recovery_success, recovery_error = False, train_error
                 
                 if recovery_success:
                     print(f"      ✓ Layer recovery successful (error: {recovery_error:.4f})")
@@ -257,9 +261,8 @@ class PrecisionOptimizer:
                     memory_savings=self._estimate_memory_savings(bits, group_size)
                 )
                 
-                # Store quantized wrapper (keep it in the model)
-                self._save_block_quantization(block_name, config, rtn_wrapper)
-                print(f"        ✓ Saved RTN quantization for {block_name}")
+                # Store quantized wrapper if it's better than existing
+                self._save_block_quantization_if_better(block_name, config, rtn_wrapper)
                 
                 return True, performance['ppl_increase']
             else:
@@ -287,32 +290,52 @@ class PrecisionOptimizer:
                 return name
         return None
         
-    def _save_block_quantization(self, block_name: str, config: QuantizationConfig, quantized_block):
-        """Save quantization configuration - if it meets threshold, it's good."""
-        # Update to better config if found (lower bits or smaller group size)
+    def _save_block_quantization_if_better(self, block_name: str, config: QuantizationConfig, quantized_block):
+        """Save quantization configuration only if it uses less memory than current saved config."""
+        # Calculate memory usage for new config
+        new_memory = self._calculate_block_memory_usage(quantized_block, config)
+        
         if block_name in self.block_quantizations:
             existing_config = self.block_quantizations[block_name]
-            # Keep better quantization: lower bits first, then smaller group size
-            if (config.bits < existing_config.bits or 
-                (config.bits == existing_config.bits and config.group_size < existing_config.group_size)):
-                print(f"        ↗ Upgrading {block_name}: {existing_config.bits}-bit → {config.bits}-bit")
+            existing_block = self.quantized_blocks[block_name]
+            existing_memory = self._calculate_block_memory_usage(existing_block, existing_config)
+            
+            # Compare memory usage
+            if new_memory < existing_memory:
+                compression_improvement = existing_memory - new_memory
+                print(f"        ⚡ Better compression: {existing_memory:.1f}MB → {new_memory:.1f}MB (-{compression_improvement:.1f}MB)")
+                
                 # Clean up previous quantized block
                 if hasattr(self.quantized_blocks[block_name], 'cleanup'):
                     self.quantized_blocks[block_name].cleanup()
+                    
+                # Save new better config
+                self.block_quantizations[block_name] = config
+                self.quantized_blocks[block_name] = quantized_block
+                self.current_model_state[block_name] = 'quantized'
+                
+                print(f"        ✓ Saved improved {config.method} {config.bits}-bit for {block_name}")
+                return True
             else:
-                print(f"        → Keeping existing {existing_config.bits}-bit config for {block_name}")
+                memory_difference = new_memory - existing_memory
+                print(f"        → Keeping existing config: {existing_memory:.1f}MB < {new_memory:.1f}MB (+{memory_difference:.1f}MB)")
+                
                 # Clean up current attempt since we're not using it
                 if hasattr(quantized_block, 'cleanup'):
                     quantized_block.cleanup()
                 return False
-        
-        # Save the configuration and quantized block
-        self.block_quantizations[block_name] = config
-        self.quantized_blocks[block_name] = quantized_block
-        self.current_model_state[block_name] = 'quantized'
-        
-        print(f"        ✓ Saved {config.method} {config.bits}-bit for {block_name}")
-        return True
+        else:
+            # First config for this block
+            self.block_quantizations[block_name] = config
+            self.quantized_blocks[block_name] = quantized_block
+            self.current_model_state[block_name] = 'quantized'
+            
+            print(f"        ✓ Saved {config.method} {config.bits}-bit for {block_name} ({new_memory:.1f}MB)")
+            return True
+    
+    def _save_block_quantization(self, block_name: str, config: QuantizationConfig, quantized_block):
+        """Legacy function - redirects to memory-based saving."""
+        return self._save_block_quantization_if_better(block_name, config, quantized_block)
         
     def _restore_block_state(self, block_name: str, previous_block):
         """Restore block to previous state."""
@@ -322,6 +345,57 @@ class PrecisionOptimizer:
     def _estimate_memory_savings(self, bits: int, group_size: int) -> float:
         """Simple memory savings: lower bits = less memory."""
         return (1 - bits / 32.0) * 100  # Compare to float32
+        
+    def _calculate_block_memory_usage(self, quantized_block, config: QuantizationConfig) -> float:
+        """Calculate actual memory usage of a quantized block in MB."""
+        total_memory = 0.0
+        
+        for name, module in quantized_block.named_modules():
+            if isinstance(module, torch.nn.Linear):
+                # Get layer name relative to block
+                layer_name = name
+                
+                if config.layer_exceptions and layer_name in config.layer_exceptions:
+                    # Frozen layer: higher precision but minimum group size
+                    memory = self._calculate_layer_memory(
+                        module,
+                        bits=8,  # Frozen layers use higher precision
+                        group_size=self.min_group_size
+                    )
+                else:
+                    # Quantized layer: uses config settings
+                    memory = self._calculate_layer_memory(
+                        module,
+                        bits=config.bits,
+                        group_size=config.group_size
+                    )
+                total_memory += memory
+                
+        return total_memory
+        
+    def _calculate_layer_memory(self, layer: torch.nn.Linear, bits: int, group_size: int) -> float:
+        """Calculate memory usage for a single layer in MB."""
+        out_features, in_features = layer.weight.shape
+        
+        # Quantized weights memory
+        values_per_int32 = 32 // bits
+        total_elements = out_features * in_features
+        packed_elements = (total_elements + values_per_int32 - 1) // values_per_int32  # Ceiling division
+        quantized_weight_memory = packed_elements * 4  # int32 = 4 bytes
+        
+        # Scale and zero_point tensors
+        num_groups = (in_features + group_size - 1) // group_size  # Ceiling division
+        scale_memory = out_features * num_groups * 4  # float32 scales
+        zp_memory = out_features * num_groups * 4     # int32 zero points
+        
+        # Bias (if present)
+        bias_memory = 0
+        if layer.bias is not None:
+            bias_memory = out_features * 4  # float32 bias
+            
+        total_memory_bytes = quantized_weight_memory + scale_memory + zp_memory + bias_memory
+        return total_memory_bytes / (1024 * 1024)  # Convert to MB
+        
         
     def freeze_layers(self, block_name: str, layer_names: List[str]):
         """Mark specific layers as frozen (won't be quantized further)."""
@@ -501,8 +575,7 @@ class PrecisionOptimizer:
                     memory_savings=self._estimate_memory_savings(bits, group_size)
                 )
                 
-                self._save_block_quantization(block_name, config, finalized_block_module)
-                print(f"        ✓ Saved trained quantization for {block_name}")
+                self._save_block_quantization_if_better(block_name, config, finalized_block_module)
                 
                 return True, performance['ppl_increase']
             else:
@@ -551,37 +624,6 @@ class PrecisionOptimizer:
         samples = calib_dataset.get_samples(num_samples=self.evaluation_samples)
         return samples
         
-        
-    def _evaluate_kl_divergence(self, baseline_logits_list):
-        """Calculate KL divergence between current model and baseline (reusing ImportanceAnalyzer logic)."""
-        import torch.nn.functional as F
-        
-        # Get current model logits
-        current_logits_list = self._get_model_logits()
-        
-        total_kl = 0.0
-        total_tokens = 0
-        
-        for logits1, logits2 in zip(baseline_logits_list, current_logits_list):
-            # Ensure same length
-            min_len = min(logits1.shape[1], logits2.shape[1])
-            logits1 = logits1[:, :min_len, :]
-            logits2 = logits2[:, :min_len, :]
-            
-            # Calculate KL divergence
-            log_prob1 = F.log_softmax(logits1, dim=-1)
-            prob2 = F.softmax(logits2, dim=-1)
-            
-            # Per-token KL divergence
-            per_token_kl = F.kl_div(log_prob1, prob2, reduction='none', log_target=False)  
-            per_token_kl = per_token_kl.sum(dim=-1)  # sum over vocab dim
-            
-            total_kl += per_token_kl.sum().item()
-            total_tokens += per_token_kl.numel()
-            
-        avg_kl_per_token = total_kl / total_tokens if total_tokens > 0 else 0.0
-        return avg_kl_per_token
-        
     def get_block_budget_info(self, block_name: str) -> Dict:
         """Get budget allocation information for a specific block."""
         block_budget = self.budget_allocations.get(block_name, {})
@@ -595,36 +637,7 @@ class PrecisionOptimizer:
             'kl_sensitivity': block_budget.get('kl_sensitivity', 0.0),
             'combined_sensitivity': block_budget.get('combined_sensitivity', 0.0)
         }
-        
-    def validate_global_constraints(self) -> Dict[str, bool]:
-        """
-        Validate that current model meets global perplexity and KL constraints.
-        
-        Returns:
-            Dictionary with constraint validation results
-        """
-        current_ppl = self._evaluate_model_perplexity()
-        baseline_ppl = self.baseline_metrics.get('perplexity', current_ppl)
-        
-        ppl_increase = current_ppl - baseline_ppl
-        ppl_increase_percent = (ppl_increase / baseline_ppl) * 100.0 if baseline_ppl > 0 else 0.0
-        
-        # Check if we're within global constraints (safety multiplier already applied)
-        ppl_constraint_met = ppl_increase_percent <= self.max_perplexity_increase
-        
-        # TODO: Add KL divergence validation when baseline logits are available
-        kl_constraint_met = True  # Placeholder
-        
-        return {
-            'perplexity_constraint_met': ppl_constraint_met,
-            'kl_constraint_met': kl_constraint_met,
-            'current_ppl': current_ppl,
-            'baseline_ppl': baseline_ppl,
-            'ppl_increase': ppl_increase,
-            'ppl_increase_percent': ppl_increase_percent,
-            'max_allowed_ppl_increase': self.max_perplexity_increase
-        }
-        
+         
     def _get_model_logits(self):
         """Get current model logits on evaluation samples."""
         self.model.eval()
