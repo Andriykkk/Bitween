@@ -1048,12 +1048,11 @@ class PrecisionOptimizer:
                 print(f"          No valid inputs found in cached data")
                 return current_block
             
-            # Step 4: Train with frozen layers excluded from optimizer
-            result = self._train_wrapper_with_frozen_layers(
+            # Step 4: Train with frozen layers excluded from optimizer (use unified function)
+            result = self._train_wrapper_respecting_frozen_layers(
                 module_name=block_name,
                 wrapped_module=wrapped_block,
                 block_inputs=block_inputs,
-                frozen_layer_names=frozen_layer_names,
                 iters=1,  # Number of training epochs
                 lr=1e-4,  # Learning rate 
                 batch_size=self.training_batch_size,
