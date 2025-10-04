@@ -597,8 +597,22 @@ class PrecisionOptimizer:
             return False, float('inf')
         
     def _analyze_layer_quality_impact(self, block):
-        """Analyze quality impact of reverting each layer to higher precision by measuring actual perplexity."""
+        """Analyze quality impact of reverting each layer to previously saved quantized state."""
         layer_impacts = []
+        
+        block_name = self._find_block_name(block)
+        if not block_name:
+            return []
+            
+        # Check if we have a previously saved working quantized block to revert to
+        if block_name not in self.block_quantizations:
+            print(f"        No previously saved quantization for {block_name} - cannot do layer recovery")
+            return []
+            
+        saved_quantized_block = self.quantized_blocks.get(block_name)
+        if saved_quantized_block is None:
+            print(f"        No saved quantized block available for {block_name}")
+            return []
         
         # Use existing function to separate layer types
         attention_layers, mlp_layers = self._separate_layer_types(block)
@@ -607,10 +621,7 @@ class PrecisionOptimizer:
         all_layers = attention_layers + mlp_layers
         
         print(f"        Analyzing {len(attention_layers)} attention + {len(mlp_layers)} MLP layers...")
-        
-        block_name = self._find_block_name(block)
-        if not block_name:
-            return []
+        print(f"        Reverting to saved {self.block_quantizations[block_name].method} {self.block_quantizations[block_name].bits}-bit quantization")
         
         # Get cached data from training manager
         cached_data = self._get_cached_data_for_block(block_name)
@@ -618,7 +629,7 @@ class PrecisionOptimizer:
             print(f"        No cached data available for {block_name}")
             return []
         
-        # Get baseline outputs with all layers quantized (calculate once)
+        # Get baseline outputs with current failed quantization (calculate once)
         baseline_outputs = self._get_block_outputs_on_cached_samples(block_name, cached_data[:self.evaluation_samples])
         
         for layer_name, layer_module in all_layers:
@@ -629,8 +640,8 @@ class PrecisionOptimizer:
             print(f"          Testing impact of reverting {layer_name}...")
             
             try:
-                # Measure actual impact by reverting layer to original precision
-                quality_improvement = self._measure_layer_reversion_impact(block_name, layer_name, cached_data, baseline_outputs)
+                # Measure actual impact by reverting layer to saved quantized state
+                quality_improvement = self._measure_layer_reversion_impact(block_name, layer_name, cached_data, baseline_outputs, saved_quantized_block)
                 
                 layer_type = "attention" if any(keyword in layer_name.lower() 
                                                for keyword in ['attn', 'attention', 'query', 'key', 'value']) else "mlp"
@@ -675,8 +686,8 @@ class PrecisionOptimizer:
             print(f"        Error getting cached data for {block_name}: {e}")
             return []
         
-    def _measure_layer_reversion_impact(self, block_name, layer_name, cached_data, baseline_outputs):
-        """Measure KL divergence reduction from reverting a layer to original precision."""
+    def _measure_layer_reversion_impact(self, block_name, layer_name, cached_data, baseline_outputs, saved_quantized_block):
+        """Measure KL divergence reduction from reverting a layer to saved quantized state."""
         try:
             # Use same samples as baseline
             validation_samples = cached_data[:self.evaluation_samples]
@@ -685,13 +696,13 @@ class PrecisionOptimizer:
                 print(f"            No validation samples available for {layer_name}")
                 return 0.0
             
-            # Get outputs with reverted layer
-            reverted_outputs = self._get_block_outputs_with_reverted_layer(block_name, layer_name, validation_samples)
+            # Get outputs with layer reverted to saved quantized state
+            reverted_outputs = self._get_block_outputs_with_reverted_layer_from_saved(block_name, layer_name, validation_samples, saved_quantized_block)
             
             if reverted_outputs is None:
                 return 0.0
             
-            # Calculate KL divergence between reverted and quantized outputs
+            # Calculate KL divergence between reverted and current failed quantization outputs
             kl_divergence = self._calculate_kl_divergence_between_outputs(reverted_outputs, baseline_outputs)
             
             # Higher KL divergence = more impact from this layer
@@ -735,35 +746,35 @@ class PrecisionOptimizer:
             print(f"            Error getting block outputs: {e}")
             return None
         
-    def _get_block_outputs_with_reverted_layer(self, block_name, layer_name, cached_samples):
-        """Get block outputs with one layer temporarily reverted to original precision."""
+    def _get_block_outputs_with_reverted_layer_from_saved(self, block_name, layer_name, cached_samples, saved_quantized_block):
+        """Get block outputs with one layer temporarily reverted to saved quantized state."""
         from .utils import get_module_by_name, set_module_by_name
         
         try:
-            # Get current quantized layer
+            # Get current layer
             current_layer = get_module_by_name(self.model, f"{block_name}.{layer_name}")
             
-            # Create original precision layer
-            original_layer = self._create_original_layer_from_quantized(current_layer)
+            # Get saved quantized layer
+            saved_layer = get_module_by_name(saved_quantized_block, layer_name)
             
-            if original_layer is None:
-                print(f"            Could not create original layer for {layer_name}")
+            if saved_layer is None:
+                print(f"            Could not find saved layer for {layer_name}")
                 return None
             
-            # Temporarily replace with original layer
-            set_module_by_name(self.model, f"{block_name}.{layer_name}", original_layer)
+            # Temporarily replace with saved quantized layer
+            set_module_by_name(self.model, f"{block_name}.{layer_name}", saved_layer)
             
             # Get outputs with reverted layer
             reverted_outputs = self._get_block_outputs_on_cached_samples(block_name, cached_samples)
             
-            # Restore quantized layer
+            # Restore current layer
             set_module_by_name(self.model, f"{block_name}.{layer_name}", current_layer)
             
             return reverted_outputs
             
         except Exception as e:
             print(f"            Error getting outputs with reverted layer {layer_name}: {e}")
-            # Make sure to restore original layer on error
+            # Make sure to restore current layer on error
             try:
                 set_module_by_name(self.model, f"{block_name}.{layer_name}", current_layer)
             except:
@@ -899,7 +910,7 @@ class PrecisionOptimizer:
                 return []
                 
     def _test_recovery_set(self, block_name, recovery_set):
-        """Test if reverting a set of layers meets the quality budget.
+        """Test if reverting a set of layers to previous saved quantized state meets the quality budget.
         
         Returns True if the recovery set meets budget, False otherwise.
         """
@@ -907,32 +918,47 @@ class PrecisionOptimizer:
         
         if not recovery_set:
             return False
+            
+        # Check if we have a previously saved working quantized block
+        if block_name not in self.block_quantizations:
+            print(f"            No previously saved quantization for {block_name}")
+            return False
+            
+        saved_quantized_block = self.quantized_blocks.get(block_name)
+        if saved_quantized_block is None:
+            print(f"            No saved quantized block available for {block_name}")
+            return False
         
-        # Store original layers for restoration
-        original_layers = {}
-        reverted_layers = {}
+        # Store current block state for restoration
+        current_block = get_module_by_name(self.model, block_name)
+        current_layers = {}
         
         try:
-            # Step 1: Revert specified layers to original precision
+            # Step 1: Revert specified layers to saved quantized state
             for layer_info in recovery_set:
                 layer_name = layer_info['layer_name']
                 full_layer_path = f"{block_name}.{layer_name}"
                 
-                # Get current quantized layer
+                # Store current layer
                 current_layer = get_module_by_name(self.model, full_layer_path)
-                original_layers[full_layer_path] = current_layer
+                current_layers[full_layer_path] = current_layer
                 
-                # Create original precision layer
-                original_layer = self._create_original_layer_from_quantized(current_layer)
-                if original_layer is None:
-                    print(f"            Could not create original layer for {layer_name}")
+                # Get corresponding layer from saved quantized block
+                try:
+                    saved_layer = get_module_by_name(saved_quantized_block, layer_name)
+                    if saved_layer is None:
+                        print(f"            Layer {layer_name} not found in saved block")
+                        continue
+                        
+                    # Replace with saved quantized layer
+                    set_module_by_name(self.model, full_layer_path, saved_layer)
+                    print(f"            Reverted {layer_name} to saved quantized state")
+                    
+                except Exception as e:
+                    print(f"            Could not revert {layer_name}: {e}")
                     continue
-                
-                # Replace with original layer
-                set_module_by_name(self.model, full_layer_path, original_layer)
-                reverted_layers[full_layer_path] = original_layer
             
-            # Step 2: Evaluate whole model performance
+            # Step 2: Evaluate whole model performance with reverted layers
             performance = self.evaluate_block_performance(block_name)
             
             # Step 3: Check if meets budget
@@ -947,12 +973,12 @@ class PrecisionOptimizer:
             return False
             
         finally:
-            # Step 4: Always restore original quantized layers
+            # Step 4: Always restore current layers
             try:
-                for full_layer_path, original_layer in original_layers.items():
-                    set_module_by_name(self.model, full_layer_path, original_layer)
+                for full_layer_path, current_layer in current_layers.items():
+                    set_module_by_name(self.model, full_layer_path, current_layer)
             except Exception as e:
-                print(f"            Error restoring layers: {e}")
+                print(f"            Error restoring current layers: {e}")
         
     def _retrain_mixed_precision_block(self, block, recovery_set, cached_data):
         """Retrain block with mixed precision (some layers reverted to higher precision).
