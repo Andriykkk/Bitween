@@ -529,25 +529,20 @@ class PrecisionOptimizer:
                 print(f"        No valid inputs found in cached data")
                 return False, float('inf')
             
-            # Step 3: Train the wrapped block
-            result = train_individual_wrapper(
+            # Step 3: Train the wrapped block (automatically handles frozen layers)
+            result = self._train_wrapper_respecting_frozen_layers(
                 module_name=block_name,
                 wrapped_module=wrapper_info['wrapped_module'],
                 block_inputs=block_inputs,
-                iters=3,  # Number of training epochs
+                iters=1,  # Number of training epochs
                 lr=1e-4,  # Learning rate 
-                batch_size=self.training_batch_size,  # Configurable batch size
+                batch_size=self.training_batch_size,
                 is_single_layer=wrapper_info['is_single_layer']
             )
             
-            # Step 4: Apply best parameters
+            # Step 4: Apply best parameters (automatically skips frozen layers)
             if not wrapper_info['is_single_layer']:
-                # For blocks, apply best parameters to all wrappers
-                from ..wrapper import WrapperLinear
-                wrapped_module = wrapper_info['wrapped_module']
-                for name, submodule in wrapped_module.named_modules():
-                    if isinstance(submodule, WrapperLinear):
-                        submodule.apply_best_params()
+                self._apply_best_params_respecting_frozen_layers(block_name, wrapper_info['wrapped_module'])
             
             # Step 5: Evaluate performance
             performance = self.evaluate_block_performance(block_name)
@@ -980,24 +975,96 @@ class PrecisionOptimizer:
             except Exception as e:
                 print(f"            Error restoring current layers: {e}")
         
-    def _retrain_mixed_precision_block(self, block, recovery_set, cached_data):
-        """Retrain block with mixed precision (some layers reverted to higher precision).
+    def _retrain_mixed_precision_block(self, block_name, recovery_set, cached_data, target_bits, target_group_size):
+        """Retrain block with mixed precision (some layers frozen from previous saved block).
         
         Algorithm:
-        1. Set specified layers to higher precision (8-bit, min group size)
-        2. Keep other layers at target quantization
-        3. Retrain only the quantized layers (frozen layers don't train)
-        4. Theory: Without problematic layers interfering, others train better
-        
-        TODO: Apply different precisions to different layers in same block
-        TODO: Use existing training infrastructure but with layer exclusions
-        TODO: Train only non-frozen layers while keeping frozen layers fixed
+        1. Copy frozen layers from previously saved quantized block (already trained)
+        2. Wrap block for training with target quantization (bits, group_size from loop)
+        3. Replace frozen layers with saved versions and freeze them from training
+        4. Train only non-frozen layers while keeping frozen layers fixed
         """
-        block_name = self._find_block_name(block)
-        print(f"          Retraining {block_name} with {len(recovery_set)} layers at higher precision...")
+        from ..wrapper import wrap_model_for_training
+        from .utils import get_module_by_name, set_module_by_name
         
-        # Placeholder: return current block
-        return block
+        print(f"          Retraining {block_name} with {len(recovery_set)} layers frozen from saved block...")
+        print(f"          Target quantization for non-frozen layers: {target_bits}-bit, group_size={target_group_size}")
+        
+        try:
+            # Get current block state
+            current_block = get_module_by_name(self.model, block_name)
+            
+            # Get saved quantized block (source of frozen layers)
+            saved_quantized_block = self.quantized_blocks.get(block_name)
+            if saved_quantized_block is None:
+                print(f"          No saved quantized block available for frozen layers")
+                return current_block
+            
+            # Get frozen layer names
+            frozen_layer_names = [layer_info['layer_name'] for layer_info in recovery_set]
+            
+            # Step 1: Wrap the block for training with target quantization from loop
+            wrapped_info = wrap_model_for_training(
+                model=self.model,
+                block_names=[block_name],  # Only this block
+                enable_minmax_tuning=True,
+                bits=target_bits,  # Use bits from quantization loop
+                group_size=target_group_size,  # Use group_size from quantization loop
+                ignore_layers=set()  # Don't ignore any layers in wrapping
+            )
+            
+            if block_name not in wrapped_info:
+                print(f"          Failed to wrap {block_name} for mixed precision training")
+                return current_block
+            
+            wrapper_info = wrapped_info[block_name]
+            wrapped_block = wrapper_info['wrapped_module']
+            
+            # Step 2: Replace frozen layers with saved quantized versions
+            for layer_name in frozen_layer_names:
+                try:
+                    # Get saved quantized layer (already trained)
+                    saved_layer = get_module_by_name(saved_quantized_block, layer_name)
+                    if saved_layer is None:
+                        print(f"            Warning: Layer {layer_name} not found in saved block")
+                        continue
+                    
+                    # Replace wrapped layer with saved quantized layer
+                    set_module_by_name(wrapped_block, layer_name, saved_layer)
+                    print(f"            Copied saved quantized layer: {layer_name}")
+                    
+                except Exception as e:
+                    print(f"            Failed to copy saved layer {layer_name}: {e}")
+                    continue
+            
+            # Step 3: Convert cached_data format for training
+            block_inputs = []
+            for input_dict, output_tensor in cached_data:
+                input_tensor = input_dict.get('hidden_states', input_dict.get('input', None))
+                if input_tensor is not None:
+                    block_inputs.append(input_tensor)
+            
+            if not block_inputs:
+                print(f"          No valid inputs found in cached data")
+                return current_block
+            
+            # Step 4: Train with frozen layers excluded from optimizer
+            result = self._train_wrapper_with_frozen_layers(
+                module_name=block_name,
+                wrapped_module=wrapped_block,
+                block_inputs=block_inputs,
+                frozen_layer_names=frozen_layer_names,
+                iters=1,  # Number of training epochs
+                lr=1e-4,  # Learning rate 
+                batch_size=self.training_batch_size,
+                is_single_layer=wrapper_info['is_single_layer']
+            )
+            
+            return wrapped_block
+            
+        except Exception as e:
+            print(f"          Mixed precision retraining failed: {e}")
+            return current_block
         
     def _apply_layer_recovery_config(self, block_name, config, recovery_set):
         """Apply mixed precision configuration and mark problematic layers as frozen.
@@ -1071,8 +1138,8 @@ class PrecisionOptimizer:
                 print(f"        No recovery set found")
                 return False, float('inf')
             
-            # Phase 3: Retrain with mixed precision (some layers at higher precision)
-            mixed_precision_block = self._retrain_mixed_precision_block(block, recovery_set, cached_data)
+            # Phase 3: Retrain with mixed precision (some layers frozen from saved block)
+            mixed_precision_block = self._retrain_mixed_precision_block(block_name, recovery_set, cached_data, bits, group_size)
             
             # Phase 4: Apply recovery configuration and freeze problematic layers
             config = QuantizationConfig(
@@ -1238,5 +1305,173 @@ class PrecisionOptimizer:
                 
         except Exception as e:
             print(f"    ✗ Failed to apply {config.method} quantization to {block_name}: {e}")
+            
+    def _get_frozen_layer_names_for_block(self, block_name):
+        """Get list of frozen layer names for a block."""
+        if block_name not in self.block_quantizations:
+            return []
+            
+        config = self.block_quantizations[block_name]
+        if not config.layer_exceptions:
+            return []
+            
+        # Return layers that are marked as frozen
+        frozen_layers = []
+        for layer_name, exception_info in config.layer_exceptions.items():
+            if isinstance(exception_info, dict) and exception_info.get('reason') == 'quality_recovery':
+                frozen_layers.append(layer_name)
+            elif exception_info == 'frozen':  # Legacy format
+                frozen_layers.append(layer_name)
+                
+        return frozen_layers
+        
+    def _train_wrapper_respecting_frozen_layers(self, module_name, wrapped_module, block_inputs, iters, lr, batch_size, is_single_layer):
+        """Unified training function that automatically excludes frozen layers from optimizer."""
+        from ..utils.sign_sgd import SignSGD
+        from ..wrapper import WrapperLinear
+        from tqdm import tqdm
+        import torch
+        
+        # Get frozen layer names for this block
+        frozen_layer_names = self._get_frozen_layer_names_for_block(module_name)
+        
+        if frozen_layer_names:
+            print(f"        Training {module_name} with {len(frozen_layer_names)} frozen layers: {frozen_layer_names}")
+        else:
+            print(f"        Training {module_name} (no frozen layers)")
+        
+        if not block_inputs:
+            print("Warning: No cached inputs for training, skipping...")
+            return None
+        
+        num_samples = len(block_inputs)
+        device = next(wrapped_module.parameters()).device
+        
+        # Cache original outputs (before training)
+        original_outputs = []
+        wrapped_module.eval()
+        
+        with torch.no_grad():
+            for inp in tqdm(block_inputs, desc="Caching outputs", leave=False):
+                inp = inp.to(device)
+                try:
+                    orig_out = wrapped_module(inp)
+                    if isinstance(orig_out, tuple):
+                        orig_out = orig_out[0]
+                    original_outputs.append(orig_out.detach().cpu())
+                except Exception as e:
+                    print(f"Warning: Failed to cache output: {e}")
+                    continue
+        
+        if not original_outputs:
+            print("Warning: No original outputs cached")
+            return None
+        
+        # Find all wrapper instances
+        wrappers = []
+        if isinstance(wrapped_module, WrapperLinear):
+            wrappers = [wrapped_module]
+        else:
+            for name, submodule in wrapped_module.named_modules():
+                if isinstance(submodule, WrapperLinear):
+                    wrappers.append(submodule)
+        
+        # Setup optimizer parameters (EXCLUDE frozen layers)
+        learnable_params = []
+        trained_wrapper_count = 0
+        
+        for wrapper in wrappers:
+            # Get wrapper's name in the module hierarchy
+            wrapper_name = None
+            for name, submodule in wrapped_module.named_modules():
+                if submodule is wrapper:
+                    wrapper_name = name
+                    break
+            
+            # Skip if this wrapper is frozen
+            if wrapper_name in frozen_layer_names:
+                print(f"        Skipping frozen layer: {wrapper_name}")
+                continue
+            
+            # Add trainable parameters for non-frozen layers
+            if wrapper.value is not None:
+                learnable_params.append(wrapper.value)
+            if wrapper.min_scale is not None:
+                learnable_params.append(wrapper.min_scale)
+            if wrapper.max_scale is not None:
+                learnable_params.append(wrapper.max_scale)
+            
+            trained_wrapper_count += 1
+        
+        if not learnable_params:
+            print(f"        Warning: No learnable parameters found (all {len(wrappers)} layers frozen?)")
+            return wrapped_module
+        
+        print(f"        Training {trained_wrapper_count}/{len(wrappers)} layers ({len(wrappers)-trained_wrapper_count} frozen)")
+        
+        # Create optimizer with only non-frozen parameters
+        optimizer = SignSGD(learnable_params, lr=lr, momentum=0.9)
+        
+        batch_size = min(batch_size, num_samples)
+        steps_per_epoch = (num_samples + batch_size - 1) // batch_size
+        total_steps = iters * steps_per_epoch
+        
+        # Learning rate scheduler
+        scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=1.0, end_factor=0.0, total_iters=total_steps
+        )
+        
+        wrapped_module.train()
+        
+        # Training loop
+        for epoch in range(iters):
+            epoch_loss = 0.0
+            indices = torch.randperm(num_samples)
+            
+            for step in range(steps_per_epoch):
+                start_idx = step * batch_size
+                end_idx = min(start_idx + batch_size, num_samples)
+                batch_indices = indices[start_idx:end_idx]
+                
+                batch_loss = 0.0
+                
+                for idx in batch_indices:
+                    inp = block_inputs[idx].to(device)
+                    target = original_outputs[idx].to(device)
+                    
+                    optimizer.zero_grad()
+                    
+                    output = wrapped_module(inp)
+                    if isinstance(output, tuple):
+                        output = output[0]
+                    
+                    loss = torch.nn.functional.mse_loss(output, target)
+                    loss.backward()
+                    
+                    optimizer.step()
+                    scheduler.step()
+                    
+                    batch_loss += loss.item()
+                
+                epoch_loss += batch_loss / len(batch_indices)
+            
+            avg_loss = epoch_loss / steps_per_epoch
+            print(f"        Epoch {epoch+1}/{iters}: Loss = {avg_loss:.6f}, LR = {scheduler.get_last_lr()[0]:.6f}")
+        
+        wrapped_module.eval()
+        return wrapped_module
+        
+    def _apply_best_params_respecting_frozen_layers(self, block_name, wrapped_module):
+        """Apply best parameters only to non-frozen layers."""
+        from ..wrapper import WrapperLinear
+        
+        frozen_layer_names = self._get_frozen_layer_names_for_block(block_name)
+        
+        for name, submodule in wrapped_module.named_modules():
+            if isinstance(submodule, WrapperLinear):
+                if name not in frozen_layer_names:
+                    submodule.apply_best_params()
+                else:
+                    print(f"        Skipping parameter application for frozen layer: {name}")
 
 
