@@ -54,7 +54,8 @@ class PrecisionOptimizer:
         evaluation_samples: int = 5,
         budget_allocations: Dict = None,
         original_model: nn.Module = None,
-        training_batch_size: int = 4
+        training_batch_size: int = 4,
+        training_manager = None
     ):
         """
         Initialize precision optimizer.
@@ -69,6 +70,7 @@ class PrecisionOptimizer:
             budget_allocations: Per-block budget allocations from importance analysis
             original_model: Reference to original model for KL divergence calculation
             training_batch_size: Batch size for trainable quantization (default: 4)
+            training_manager: Reference to training manager for accessing cached data
         """
         self.model = model
         self.tokenizer = tokenizer
@@ -79,6 +81,7 @@ class PrecisionOptimizer:
         self.budget_allocations = budget_allocations or {}
         self.original_model = original_model
         self.training_batch_size = training_batch_size
+        self.training_manager = training_manager
         
         # Persistent state for building final quantized model
         self.block_quantizations = {}  # Store best quantization config for each block
@@ -593,18 +596,485 @@ class PrecisionOptimizer:
                 pass
             return False, float('inf')
         
-    def _try_layer_recovery(self, block, bits, group_size, cached_data, budget):
-        """Try layer-level recovery for failed quantization."""
-        # TODO: Implement layer recovery algorithm
-        # This should:
-        # 1. Identify problematic layers
-        # 2. Try reverting each layer to higher precision
-        # 3. Apply best reversions until budget is met
+    def _analyze_layer_quality_impact(self, block):
+        """Analyze quality impact of reverting each layer to higher precision by measuring actual perplexity."""
+        layer_impacts = []
         
-        import random
-        error = random.uniform(0, budget * 1.2)  # Best chance with recovery
-        success = error <= budget
-        return success, error
+        # Use existing function to separate layer types
+        attention_layers, mlp_layers = self._separate_layer_types(block)
+        
+        # Test attention layers first (usually more sensitive), then MLP layers
+        all_layers = attention_layers + mlp_layers
+        
+        print(f"        Analyzing {len(attention_layers)} attention + {len(mlp_layers)} MLP layers...")
+        
+        block_name = self._find_block_name(block)
+        if not block_name:
+            return []
+        
+        # Get cached data from training manager
+        cached_data = self._get_cached_data_for_block(block_name)
+        if not cached_data:
+            print(f"        No cached data available for {block_name}")
+            return []
+        
+        # Get baseline outputs with all layers quantized (calculate once)
+        baseline_outputs = self._get_block_outputs_on_cached_samples(block_name, cached_data[:self.evaluation_samples])
+        
+        for layer_name, layer_module in all_layers:
+            # Skip if layer is already frozen
+            if self.is_layer_frozen(block_name, layer_name):
+                continue
+                
+            print(f"          Testing impact of reverting {layer_name}...")
+            
+            try:
+                # Measure actual impact by reverting layer to original precision
+                quality_improvement = self._measure_layer_reversion_impact(block_name, layer_name, cached_data, baseline_outputs)
+                
+                layer_type = "attention" if any(keyword in layer_name.lower() 
+                                               for keyword in ['attn', 'attention', 'query', 'key', 'value']) else "mlp"
+                
+                layer_impacts.append({
+                    'layer_name': layer_name,
+                    'layer_type': layer_type,
+                    'quality_improvement': quality_improvement,
+                })
+                
+                print(f"            {layer_name} ({layer_type}): improvement={quality_improvement:.4f}")
+                
+            except Exception as e:
+                print(f"            Failed to analyze {layer_name}: {e}")
+                continue
+        
+        # Sort by quality improvement (most impactful layers first)
+        layer_impacts.sort(key=lambda x: x['quality_improvement'], reverse=True)
+        
+        print(f"        Layer analysis complete. Top layer: {layer_impacts[0]['layer_name'] if layer_impacts else 'None'}")
+        return layer_impacts
+        
+    def _get_cached_data_for_block(self, block_name):
+        """Get cached training data for a specific block from the training manager."""
+        try:
+            if not self.training_manager:
+                print(f"        Warning: No training manager available for cached data")
+                return []
+            
+            # Get the wrapper for this block
+            if hasattr(self.training_manager, 'block_wrappers') and block_name in self.training_manager.block_wrappers:
+                wrapper = self.training_manager.block_wrappers[block_name]
+                if hasattr(wrapper, 'get_all_cached_data'):
+                    cached_data = wrapper.get_all_cached_data()
+                    print(f"        Retrieved {len(cached_data)} cached samples for {block_name}")
+                    return cached_data
+            
+            print(f"        No cached data found for {block_name}")
+            return []
+            
+        except Exception as e:
+            print(f"        Error getting cached data for {block_name}: {e}")
+            return []
+        
+    def _measure_layer_reversion_impact(self, block_name, layer_name, cached_data, baseline_outputs):
+        """Measure KL divergence reduction from reverting a layer to original precision."""
+        try:
+            # Use same samples as baseline
+            validation_samples = cached_data[:self.evaluation_samples]
+            
+            if not validation_samples:
+                print(f"            No validation samples available for {layer_name}")
+                return 0.0
+            
+            # Get outputs with reverted layer
+            reverted_outputs = self._get_block_outputs_with_reverted_layer(block_name, layer_name, validation_samples)
+            
+            if reverted_outputs is None:
+                return 0.0
+            
+            # Calculate KL divergence between reverted and quantized outputs
+            kl_divergence = self._calculate_kl_divergence_between_outputs(reverted_outputs, baseline_outputs)
+            
+            # Higher KL divergence = more impact from this layer
+            return kl_divergence
+            
+        except Exception as e:
+            print(f"            Failed to measure impact for {layer_name}: {e}")
+            return 0.0
+            
+    def _get_block_outputs_on_cached_samples(self, block_name, cached_samples):
+        """Get block outputs using cached input samples."""
+        from .utils import get_module_by_name
+        
+        try:
+            if not cached_samples:
+                return None
+            
+            outputs = []
+            
+            # Get outputs from current block
+            with torch.no_grad():
+                for input_dict, _ in cached_samples:
+                    # Extract input tensor
+                    input_tensor = input_dict.get('hidden_states', input_dict.get('input', None))
+                    if input_tensor is None:
+                        continue
+                    
+                    # Get current block
+                    block = get_module_by_name(self.model, block_name)
+                    
+                    # Forward through block
+                    output = block(input_tensor)
+                    if isinstance(output, tuple):
+                        output = output[0]
+                    
+                    outputs.append(output.detach())
+            
+            return outputs if outputs else None
+            
+        except Exception as e:
+            print(f"            Error getting block outputs: {e}")
+            return None
+        
+    def _get_block_outputs_with_reverted_layer(self, block_name, layer_name, cached_samples):
+        """Get block outputs with one layer temporarily reverted to original precision."""
+        from .utils import get_module_by_name, set_module_by_name
+        
+        try:
+            # Get current quantized layer
+            current_layer = get_module_by_name(self.model, f"{block_name}.{layer_name}")
+            
+            # Create original precision layer
+            original_layer = self._create_original_layer_from_quantized(current_layer)
+            
+            if original_layer is None:
+                print(f"            Could not create original layer for {layer_name}")
+                return None
+            
+            # Temporarily replace with original layer
+            set_module_by_name(self.model, f"{block_name}.{layer_name}", original_layer)
+            
+            # Get outputs with reverted layer
+            reverted_outputs = self._get_block_outputs_on_cached_samples(block_name, cached_samples)
+            
+            # Restore quantized layer
+            set_module_by_name(self.model, f"{block_name}.{layer_name}", current_layer)
+            
+            return reverted_outputs
+            
+        except Exception as e:
+            print(f"            Error getting outputs with reverted layer {layer_name}: {e}")
+            # Make sure to restore original layer on error
+            try:
+                set_module_by_name(self.model, f"{block_name}.{layer_name}", current_layer)
+            except:
+                pass
+            return None
+            
+    def _calculate_kl_divergence_between_outputs(self, outputs1, outputs2):
+        """Calculate KL divergence between two sets of block outputs."""
+        import torch.nn.functional as F
+        
+        try:
+            if not outputs1 or not outputs2 or len(outputs1) != len(outputs2):
+                return 0.0
+            
+            total_kl = 0.0
+            total_tokens = 0
+            
+            for out1, out2 in zip(outputs1, outputs2):
+                # Ensure same shape
+                min_shape = [min(s1, s2) for s1, s2 in zip(out1.shape, out2.shape)]
+                out1_trimmed = out1[:min_shape[0], :min_shape[1], :min_shape[2]]
+                out2_trimmed = out2[:min_shape[0], :min_shape[1], :min_shape[2]]
+                
+                # Calculate KL divergence (treat as logits)
+                log_prob1 = F.log_softmax(out1_trimmed, dim=-1)
+                prob2 = F.softmax(out2_trimmed, dim=-1)
+                
+                # Per-token KL divergence
+                per_token_kl = F.kl_div(log_prob1, prob2, reduction='none', log_target=False)
+                per_token_kl = per_token_kl.sum(dim=-1)  # sum over vocab dim
+                
+                total_kl += per_token_kl.sum().item()
+                total_tokens += per_token_kl.numel()
+            
+            avg_kl = total_kl / total_tokens if total_tokens > 0 else 0.0
+            return avg_kl
+            
+        except Exception as e:
+            print(f"            Error calculating KL divergence: {e}")
+            return 0.0
+            
+    def _create_original_layer_from_quantized(self, quantized_layer):
+        """Create original torch.nn.Linear layer from quantized wrapper."""
+        try:
+            # Check if this is a wrapper with original weights
+            if hasattr(quantized_layer, 'orig_weight'):
+                # Extract original weights and bias from wrapper
+                original_weight = quantized_layer.orig_weight
+                original_bias = getattr(quantized_layer, 'orig_bias', None)
+                
+                # Create regular Linear layer
+                original_layer = torch.nn.Linear(
+                    in_features=original_weight.shape[1],
+                    out_features=original_weight.shape[0],
+                    bias=original_bias is not None,
+                    device=original_weight.device,
+                    dtype=original_weight.dtype
+                )
+                
+                # Copy weights
+                original_layer.weight.data = original_weight.clone()
+                if original_bias is not None:
+                    original_layer.bias.data = original_bias.clone()
+                
+                return original_layer
+                
+            elif isinstance(quantized_layer, torch.nn.Linear):
+                # Already a regular layer, return as-is
+                return quantized_layer
+                
+            else:
+                print(f"            Unknown layer type: {type(quantized_layer)}")
+                return None
+                
+        except Exception as e:
+            print(f"            Failed to create original layer: {e}")
+            return None
+        
+    def _find_minimum_recovery_set(self, block_name, sorted_layer_impacts, budget):
+        """Find minimum set of layers to revert using exponential search.
+        
+        Algorithm:
+        1. Try reverting 1 layer → evaluate whole model → pass/fail?
+        2. Try reverting 2 layers → evaluate whole model → pass/fail?
+        3. Try reverting 4 layers → evaluate whole model → pass/fail?
+        4. Continue with 8, 16, etc. until success or all layers tested
+        5. Return minimum working set
+        """
+        print(f"        Starting exponential search for minimum recovery set...")
+        
+        if not sorted_layer_impacts:
+            print(f"        No layers to recover")
+            return []
+        
+        # Exponential search: 1, 2, 4, 8, 16, ...
+        recovery_count = 1
+        best_working_set = None
+        
+        while recovery_count <= len(sorted_layer_impacts):
+            # Get top N layers to revert
+            recovery_set = sorted_layer_impacts[:recovery_count]
+            layer_names = [layer['layer_name'] for layer in recovery_set]
+            
+            print(f"          Testing recovery set of {recovery_count} layers: {layer_names[:3]}{'...' if len(layer_names) > 3 else ''}")
+            
+            try:
+                # Temporarily revert these layers and evaluate whole model
+                meets_budget = self._test_recovery_set(block_name, recovery_set)
+                
+                if meets_budget:
+                    print(f"          ✓ Recovery set of {recovery_count} layers meets budget")
+                    best_working_set = recovery_set
+                    break  # Found minimum working set
+                else:
+                    print(f"          ✗ Recovery set of {recovery_count} layers fails budget")
+                    
+            except Exception as e:
+                print(f"          Error testing recovery set of {recovery_count} layers: {e}")
+            
+            # Exponential progression: 1 → 2 → 4 → 8 → 16...
+            recovery_count *= 2
+        
+        if best_working_set:
+            print(f"        Found minimum recovery set: {len(best_working_set)} layers")
+            return best_working_set
+        else:
+            # If no subset works, try all layers as last resort
+            print(f"        No subset works, trying all {len(sorted_layer_impacts)} layers")
+            if self._test_recovery_set(block_name, sorted_layer_impacts):
+                return sorted_layer_impacts
+            else:
+                print(f"        Complete layer recovery failed")
+                return []
+                
+    def _test_recovery_set(self, block_name, recovery_set):
+        """Test if reverting a set of layers meets the quality budget.
+        
+        Returns True if the recovery set meets budget, False otherwise.
+        """
+        from .utils import get_module_by_name, set_module_by_name
+        
+        if not recovery_set:
+            return False
+        
+        # Store original layers for restoration
+        original_layers = {}
+        reverted_layers = {}
+        
+        try:
+            # Step 1: Revert specified layers to original precision
+            for layer_info in recovery_set:
+                layer_name = layer_info['layer_name']
+                full_layer_path = f"{block_name}.{layer_name}"
+                
+                # Get current quantized layer
+                current_layer = get_module_by_name(self.model, full_layer_path)
+                original_layers[full_layer_path] = current_layer
+                
+                # Create original precision layer
+                original_layer = self._create_original_layer_from_quantized(current_layer)
+                if original_layer is None:
+                    print(f"            Could not create original layer for {layer_name}")
+                    continue
+                
+                # Replace with original layer
+                set_module_by_name(self.model, full_layer_path, original_layer)
+                reverted_layers[full_layer_path] = original_layer
+            
+            # Step 2: Evaluate whole model performance
+            performance = self.evaluate_block_performance(block_name)
+            
+            # Step 3: Check if meets budget
+            meets_budget = performance['under_threshold']
+            
+            print(f"            Combined sensitivity: {performance['current_combined_sensitivity']:.4f} (threshold: {performance['threshold_combined_sensitivity']:.4f})")
+            
+            return meets_budget
+            
+        except Exception as e:
+            print(f"            Error testing recovery set: {e}")
+            return False
+            
+        finally:
+            # Step 4: Always restore original quantized layers
+            try:
+                for full_layer_path, original_layer in original_layers.items():
+                    set_module_by_name(self.model, full_layer_path, original_layer)
+            except Exception as e:
+                print(f"            Error restoring layers: {e}")
+        
+    def _retrain_mixed_precision_block(self, block, recovery_set, cached_data):
+        """Retrain block with mixed precision (some layers reverted to higher precision).
+        
+        Algorithm:
+        1. Set specified layers to higher precision (8-bit, min group size)
+        2. Keep other layers at target quantization
+        3. Retrain only the quantized layers (frozen layers don't train)
+        4. Theory: Without problematic layers interfering, others train better
+        
+        TODO: Apply different precisions to different layers in same block
+        TODO: Use existing training infrastructure but with layer exclusions
+        TODO: Train only non-frozen layers while keeping frozen layers fixed
+        """
+        block_name = self._find_block_name(block)
+        print(f"          Retraining {block_name} with {len(recovery_set)} layers at higher precision...")
+        
+        # Placeholder: return current block
+        return block
+        
+    def _apply_layer_recovery_config(self, block_name, config, recovery_set):
+        """Apply mixed precision configuration and mark problematic layers as frozen.
+        
+        Algorithm:
+        1. Update QuantizationConfig with layer exceptions
+        2. Mark recovered layers as frozen for future attempts
+        3. Save memory-optimized config (higher precision but min group size)
+        
+        TODO: Add layer_exceptions to QuantizationConfig
+        TODO: Set frozen layers to: 8-bit precision + min_group_size
+        TODO: Update freeze_layer tracking for this block
+        """
+        print(f"          Applying layer recovery config to {block_name}")
+        
+        # Mark layers as frozen
+        for layer_info in recovery_set:
+            layer_name = layer_info['layer_name']
+            self.freeze_layers(block_name, [layer_name])
+            print(f"            Froze layer: {layer_name}")
+        
+        # Update config with layer exceptions
+        config.layer_exceptions = config.layer_exceptions or {}
+        for layer_info in recovery_set:
+            config.layer_exceptions[layer_info['layer_name']] = {
+                'reason': 'quality_recovery',
+                'original_bits': config.bits,
+                'recovery_bits': 8,
+                'recovery_group_size': self.min_group_size
+            }
+        
+        return config
+    
+    def _try_layer_recovery(self, block, bits, group_size, cached_data, budget):
+        """Try layer-level recovery for failed quantization.
+        
+        LAYER RECOVERY ALGORITHM:
+        ========================
+        Purpose: Get block to pass quality budget when normal quantization fails
+        Constraint: ONLY run at minimum group size (last resort)
+        
+        Steps:
+        1. Analyze Impact: Test each layer - revert to 8-bit, measure perplexity improvement
+        2. Exponential Search: Try reverting 1→2→4→8 layers until quality budget met
+        3. Mixed Training: Retrain with some layers 8-bit, others at target precision
+        4. Freeze Layers: Mark problematic layers as frozen (won't quantize further)
+        5. Save Config: Mixed precision config (some 4-bit, some 8-bit)
+        
+        Quality Focus: Ignore memory usage - that's optimized later globally
+        """
+        # CRITICAL: Only run at minimum group size
+        if group_size > self.min_group_size:
+            print(f"        Skipping layer recovery: group_size={group_size} > min={self.min_group_size}")
+            return False, float('inf')
+        
+        block_name = self._find_block_name(block)
+        print(f"        Starting layer recovery for {block_name}: {bits}-bit at min group_size={group_size}")
+        
+        try:
+            # Phase 1: Analyze which layers impact quality most (sorted by impact)
+            layer_impacts = self._analyze_layer_quality_impact(block, bits, group_size)
+            
+            if not layer_impacts:
+                print(f"        No layers found for recovery analysis")
+                return False, float('inf')
+            
+            # Phase 2: Find minimum set of layers to revert (exponential search)
+            recovery_set = self._find_minimum_recovery_set(block_name, layer_impacts, budget)
+            
+            if not recovery_set:
+                print(f"        No recovery set found")
+                return False, float('inf')
+            
+            # Phase 3: Retrain with mixed precision (some layers at higher precision)
+            mixed_precision_block = self._retrain_mixed_precision_block(block, recovery_set, cached_data)
+            
+            # Phase 4: Apply recovery configuration and freeze problematic layers
+            config = QuantizationConfig(
+                bits=bits,
+                group_size=group_size,
+                method="Mixed",
+                error_metric=0.0,  # Will be updated after evaluation
+                memory_savings=self._estimate_memory_savings(bits, group_size)
+            )
+            
+            recovery_config = self._apply_layer_recovery_config(block_name, config, recovery_set)
+            
+            # Phase 5: Final evaluation
+            performance = self.evaluate_block_performance(block_name)
+            recovery_config.error_metric = performance['ppl_increase']
+            
+            if performance['under_threshold']:
+                # Save the mixed precision configuration
+                self._save_block_quantization_if_better(block_name, recovery_config, mixed_precision_block)
+                print(f"        ✓ Layer recovery successful: {len(recovery_set)} layers frozen")
+                return True, performance['ppl_increase']
+            else:
+                print(f"        ✗ Layer recovery failed: still over budget")
+                return False, performance['ppl_increase']
+                
+        except Exception as e:
+            print(f"        Layer recovery failed with error: {e}")
+            return False, float('inf')
         
         
     def _get_evaluation_samples(self):

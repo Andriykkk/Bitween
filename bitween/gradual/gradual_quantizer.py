@@ -147,7 +147,8 @@ class GradualQuantizer:
             evaluation_samples=self.evaluation_samples,
             budget_allocations=budget_allocations,
             original_model=self.original_model,
-            training_batch_size=self.training_batch_size
+            training_batch_size=self.training_batch_size,
+            training_manager=self.training_manager
         )
         
         """Apply quantization progressively based on importance scores."""
