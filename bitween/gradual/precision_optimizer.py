@@ -268,8 +268,20 @@ class PrecisionOptimizer:
                 # else:
                 #     print(f"      ✗ Layer recovery failed (error: {recovery_error:.4f})")
                 
-                # RTN failed - return best config found so far or continue to next group_size
+                # RTN failed - check if this was minimum group size
                 print(f"      RTN failed (error: {rtn_error:.4f}), skipping training/recovery for testing")
+                
+                # If this was the minimum group size, stop trying lower bits entirely
+                if target_group_size == self.min_group_size:
+                    print(f"      Minimum group size ({self.min_group_size}) failed for {target_bits}-bit, stopping precision reduction")
+                    if best_config is not None:
+                        print(f"    Using best RTN config: {best_config.bits}-bit, group_size={best_config.group_size}, method={best_config.method}")
+                        return best_config
+                    else:
+                        print(f"    No successful configuration found, stopping quantization")
+                        return None
+                
+                # Not minimum group size, continue to next group_size
                 if best_config is not None:
                     # Return best previous configuration
                     print(f"    Using best RTN config: {best_config.bits}-bit, group_size={best_config.group_size}, method={best_config.method}")
@@ -557,7 +569,9 @@ class PrecisionOptimizer:
         
         current_combined_sensitivity = analyzer.calculate_combined_sensitivity(
             ppl_increase=ppl_increase,
-            kl_increase=kl_increase
+            kl_increase=kl_increase,
+            max_ppl_increase=allocated_budget,  # Use allocated budget as max
+            max_kl_increase=self.baseline_metrics['kl_token_budget']  # Use from baseline
         )
         
         # Get budget threshold for this block (already calculated in importance analysis)

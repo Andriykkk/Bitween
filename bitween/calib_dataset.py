@@ -17,7 +17,8 @@ class CalibrationDataset:
         tokenizer=None,
         seqlen: int = 2048,
         nsamples: int = 512,
-        seed: int = 42
+        seed: int = 42,
+        verbose: bool = False
     ):
         """
         Initialize calibration dataset.
@@ -28,13 +29,15 @@ class CalibrationDataset:
             seqlen: Sequence length for tokenization
             nsamples: Number of samples to extract
             seed: Random seed for reproducibility
+            verbose: Verbose output
         """
         self.dataset_name = dataset_name
         self.tokenizer = tokenizer
         self.seqlen = seqlen
         self.nsamples = nsamples
         self.seed = seed
-        
+        self.verbose = verbose
+
         # Set random seed
         random.seed(seed)
         torch.manual_seed(seed)
@@ -109,7 +112,9 @@ class CalibrationDataset:
             })
         
         self.data = tokenized_samples
-        print(f"Tokenized {len(tokenized_samples)} samples with sequence length {self.seqlen}")
+
+        if self.verbose:
+            print(f"Tokenized {len(tokenized_samples)} samples with sequence length {self.seqlen}")
     
     def _create_mock_data(self):
         """Create mock data for testing when real dataset is unavailable."""
