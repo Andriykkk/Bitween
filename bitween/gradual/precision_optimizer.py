@@ -97,6 +97,99 @@ class PrecisionOptimizer:
         print(f"  Training batch size: {self.training_batch_size}")
         print(f"  Original model reference: {'Available' if original_model else 'Not available'}")
         
+    # def progressive_quantize_block(self, block_name: str, cached_data: List, budget_allocation: float) -> Optional[QuantizationConfig]:
+    #     """
+    #     Progressive quantization algorithm for a single block.
+        
+    #     Tries RTN first, then training, with decreasing group sizes and bit precision.
+    #     Falls back to layer-level recovery if needed.
+        
+    #     Args:
+    #         block_name: Name of block to quantize
+    #         cached_data: List of (input_dict, output_tensor) pairs
+    #         budget_allocation: Error budget for this block
+            
+    #     Returns:
+    #         Best quantization configuration found, or None if nothing works
+    #     """
+    #     from .utils import get_module_by_name
+        
+    #     # Configuration
+    #     precision_levels = [8, 4, 2]  # bits
+        
+    #     # Get the block
+    #     block = get_module_by_name(self.model, block_name)
+        
+    #     # Separate attention and MLP layers
+    #     attention_layers, mlp_layers = self._separate_layer_types(block)
+        
+    #     best_config = None
+        
+    #     # Phase 1: Try each precision level
+    #     for target_bits in precision_levels:
+    #         print(f"    Trying {target_bits}-bit quantization...")
+            
+    #         # Try different group sizes from large to small
+    #         group_sizes = self._get_group_size_sequence(self.max_group_size, self.min_group_size)
+            
+    #         for target_group_size in group_sizes:
+    #             print(f"      Group size: {target_group_size}")
+                
+    #             # Step 1: Try RTN quantization first
+    #             rtn_success, rtn_error = self._try_rtn_quantization(
+    #                 block, target_bits, target_group_size, cached_data, budget_allocation
+    #             )
+                
+    #             if rtn_success:
+    #                 print(f"      ✓ RTN successful (error: {rtn_error:.4f})")
+    #                 best_config = QuantizationConfig(target_bits, target_group_size, "RTN", rtn_error)
+    #                 continue  # Try even lower precision
+                    
+    #             # Step 2: RTN failed, try training
+    #             print(f"      RTN failed (error: {rtn_error:.4f}), trying training...")
+                
+    #             train_success, train_error = self._try_trainable_quantization(
+    #                 block, target_bits, target_group_size, cached_data, budget_allocation
+    #             )
+                
+    #             if train_success:
+    #                 print(f"      ✓ Training successful (error: {train_error:.4f})")
+    #                 best_config = QuantizationConfig(target_bits, target_group_size, "Trained", train_error)
+    #                 continue  # Try even lower precision
+                    
+    #             # Step 3: Training failed, try layer-level recovery (only at minimum group size)
+    #             if target_group_size == self.min_group_size:
+    #                 print(f"      Training failed (error: {train_error:.4f}), trying layer recovery...")
+                    
+    #                 recovery_success, recovery_error = self._try_layer_recovery(
+    #                     block, target_bits, target_group_size, cached_data, budget_allocation
+    #                 )
+    #             else:
+    #                 print(f"      Training failed (error: {train_error:.4f}), skipping layer recovery (group_size={target_group_size} > min={self.min_group_size})")
+    #                 recovery_success, recovery_error = False, train_error
+                
+    #             if recovery_success:
+    #                 print(f"      ✓ Layer recovery successful (error: {recovery_error:.4f})")
+    #                 best_config = QuantizationConfig(target_bits, target_group_size, "Mixed", recovery_error)
+    #                 continue  # Try even lower precision
+    #             else:
+    #                 print(f"      ✗ Layer recovery failed (error: {recovery_error:.4f})")
+    #                 # This precision/group_size combination doesn't work
+    #                 if best_config is not None:
+    #                     # Return best previous configuration
+    #                     print(f"    Using best config: {best_config.bits}-bit, group_size={best_config.group_size}, method={best_config.method}")
+    #                     return best_config
+    #                 # Continue to next group_size
+                    
+    #     # Return best configuration found, or None if nothing worked
+    #     if best_config is not None:
+    #         print(f"  Final config: {best_config.bits}-bit, group_size={best_config.group_size}, method={best_config.method}")
+    #         return best_config
+    #     else:
+    #         print(f"  No quantization possible within budget")
+    #         return None
+            
+
     def progressive_quantize_block(self, block_name: str, cached_data: List, budget_allocation: float) -> Optional[QuantizationConfig]:
         """
         Progressive quantization algorithm for a single block.
@@ -145,48 +238,50 @@ class PrecisionOptimizer:
                     best_config = QuantizationConfig(target_bits, target_group_size, "RTN", rtn_error)
                     continue  # Try even lower precision
                     
-                # Step 2: RTN failed, try training
-                print(f"      RTN failed (error: {rtn_error:.4f}), trying training...")
+                # TEMPORARILY DISABLED: Step 2: RTN failed, try training
+                # print(f"      RTN failed (error: {rtn_error:.4f}), trying training...")
+                # 
+                # train_success, train_error = self._try_trainable_quantization(
+                #     block, target_bits, target_group_size, cached_data, budget_allocation
+                # )
+                # 
+                # if train_success:
+                #     print(f"      ✓ Training successful (error: {train_error:.4f})")
+                #     best_config = QuantizationConfig(target_bits, target_group_size, "Trained", train_error)
+                #     continue  # Try even lower precision
+                #     
+                # # TEMPORARILY DISABLED: Step 3: Training failed, try layer-level recovery
+                # if target_group_size == self.min_group_size:
+                #     print(f"      Training failed (error: {train_error:.4f}), trying layer recovery...")
+                #     
+                #     recovery_success, recovery_error = self._try_layer_recovery(
+                #         block, target_bits, target_group_size, cached_data, budget_allocation
+                #     )
+                # else:
+                #     print(f"      Training failed (error: {train_error:.4f}), skipping layer recovery (group_size={target_group_size} > min={self.min_group_size})")
+                #     recovery_success, recovery_error = False, train_error
+                # 
+                # if recovery_success:
+                #     print(f"      ✓ Layer recovery successful (error: {recovery_error:.4f})")
+                #     best_config = QuantizationConfig(target_bits, target_group_size, "Mixed", recovery_error)
+                #     continue  # Try even lower precision
+                # else:
+                #     print(f"      ✗ Layer recovery failed (error: {recovery_error:.4f})")
                 
-                train_success, train_error = self._try_trainable_quantization(
-                    block, target_bits, target_group_size, cached_data, budget_allocation
-                )
-                
-                if train_success:
-                    print(f"      ✓ Training successful (error: {train_error:.4f})")
-                    best_config = QuantizationConfig(target_bits, target_group_size, "Trained", train_error)
-                    continue  # Try even lower precision
+                # RTN failed - return best config found so far or continue to next group_size
+                print(f"      RTN failed (error: {rtn_error:.4f}), skipping training/recovery for testing")
+                if best_config is not None:
+                    # Return best previous configuration
+                    print(f"    Using best RTN config: {best_config.bits}-bit, group_size={best_config.group_size}, method={best_config.method}")
+                    return best_config
+                # Continue to next group_size
                     
-                # Step 3: Training failed, try layer-level recovery (only at minimum group size)
-                if target_group_size == self.min_group_size:
-                    print(f"      Training failed (error: {train_error:.4f}), trying layer recovery...")
-                    
-                    recovery_success, recovery_error = self._try_layer_recovery(
-                        block, target_bits, target_group_size, cached_data, budget_allocation
-                    )
-                else:
-                    print(f"      Training failed (error: {train_error:.4f}), skipping layer recovery (group_size={target_group_size} > min={self.min_group_size})")
-                    recovery_success, recovery_error = False, train_error
-                
-                if recovery_success:
-                    print(f"      ✓ Layer recovery successful (error: {recovery_error:.4f})")
-                    best_config = QuantizationConfig(target_bits, target_group_size, "Mixed", recovery_error)
-                    continue  # Try even lower precision
-                else:
-                    print(f"      ✗ Layer recovery failed (error: {recovery_error:.4f})")
-                    # This precision/group_size combination doesn't work
-                    if best_config is not None:
-                        # Return best previous configuration
-                        print(f"    Using best config: {best_config.bits}-bit, group_size={best_config.group_size}, method={best_config.method}")
-                        return best_config
-                    # Continue to next group_size
-                    
-        # Return best configuration found, or None if nothing worked
+        # Return best RTN configuration found, or None if nothing worked
         if best_config is not None:
-            print(f"  Final config: {best_config.bits}-bit, group_size={best_config.group_size}, method={best_config.method}")
+            print(f"  Final RTN config: {best_config.bits}-bit, group_size={best_config.group_size}, method={best_config.method}")
             return best_config
         else:
-            print(f"  No quantization possible within budget")
+            print(f"  No RTN quantization possible within budget")
             return None
             
     def _separate_layer_types(self, block):
@@ -1472,5 +1567,35 @@ class PrecisionOptimizer:
                     submodule.apply_best_params()
                 else:
                     print(f"        Skipping parameter application for frozen layer: {name}")
+
+    def finalize(self) -> nn.Module:
+        """
+        Finalize quantization by applying all successfully quantized blocks to the model.
+        Returns the model with quantized blocks applied.
+        """
+        print("🔧 Finalizing quantization - applying saved quantized blocks...")
+        
+        if hasattr(self, 'saved_quantized_blocks') and self.saved_quantized_blocks:
+            for block_name, quantized_block in self.saved_quantized_blocks.items():
+                print(f"  Applying quantized block: {block_name}")
+                self._replace_block_in_model(block_name, quantized_block)
+                
+            print(f"✅ Applied {len(self.saved_quantized_blocks)} quantized blocks to model")
+        else:
+            print("⚠️  No quantized blocks found - returning original model")
+            
+        return self.model
+        
+    def _replace_block_in_model(self, block_name: str, quantized_block):
+        """Replace a block in the model with its quantized version."""
+        parts = block_name.split('.')
+        current = self.model
+        
+        # Navigate to parent of target block
+        for part in parts[:-1]:
+            current = getattr(current, part)
+            
+        # Replace the final block
+        setattr(current, parts[-1], quantized_block)
 
 

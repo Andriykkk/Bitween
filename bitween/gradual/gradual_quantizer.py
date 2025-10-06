@@ -136,7 +136,11 @@ class GradualQuantizer:
         # Store original model reference for KL divergence calculation
         self.original_model = copy.deepcopy(self.model)
         
-        # Initialize precision optimizer with all required information
+        """Apply quantization progressively based on importance scores."""
+        # Set up block training system for block-by-block training FIRST
+        self._setup_block_training()
+        
+        # Initialize precision optimizer with all required information (after training_manager is set)
         # Note: budget_allocations already include safety_multiplier from calculate_block_budget_allocation
         self.precision_optimizer = PrecisionOptimizer(
             model=self.model,
@@ -151,10 +155,6 @@ class GradualQuantizer:
             training_manager=self.training_manager
         )
         
-        """Apply quantization progressively based on importance scores."""
-        # Set up block training system for block-by-block training
-        self._setup_block_training()
-        
         # Process all blocks sequentially using training system
         self._process_blocks_with_training()
 
@@ -162,7 +162,7 @@ class GradualQuantizer:
         # self._global_optimization()
         
         # # Phase 4: Final evaluation and cleanup
-        quantized_model = self._finalize_quantization()
+        quantized_model = self.precision_optimizer.finalize()
         
         return quantized_model
         
