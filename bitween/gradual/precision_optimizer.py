@@ -537,8 +537,11 @@ class PrecisionOptimizer:
         from ..utils.evaluation import calculate_perplexity, calculate_kl_divergence
         
         # Get baseline metrics (already calculated in GradualQuantizer)
-        baseline_ppl = self.baseline_metrics.get('perplexity', 0.0)
-        baseline_kl = self.baseline_metrics.get('kl_divergence', 0.0)
+        if 'perplexity' not in self.baseline_metrics:
+            raise ValueError("No baseline perplexity found in baseline_metrics")
+            
+        baseline_ppl = self.baseline_metrics['perplexity']
+        baseline_kl = self.baseline_metrics.get('kl_divergence', 0.0)  # KL can default to 0
         
         # Evaluate current quantized model (with one block quantized)
         current_ppl = calculate_perplexity(
@@ -563,6 +566,17 @@ class PrecisionOptimizer:
         ppl_increase = current_ppl - baseline_ppl
         kl_increase = current_kl - baseline_kl
         
+        # Get budget threshold for this block (already calculated in importance analysis)
+        if block_name not in self.budget_allocations:
+            raise ValueError(f"No budget allocation found for block {block_name}")
+        
+        block_budget = self.budget_allocations[block_name]
+        
+        if 'allocated_ppl_budget' not in block_budget:
+            raise ValueError(f"No allocated_ppl_budget found for block {block_name}")
+            
+        allocated_ppl_budget = block_budget['allocated_ppl_budget']
+        
         # Calculate combined sensitivity for current state (using same weights as in budget allocation)
         from .importance_analyzer import ImportanceAnalyzer
         analyzer = ImportanceAnalyzer(self.model, self.tokenizer, evaluation_samples=self.evaluation_samples)
@@ -570,13 +584,14 @@ class PrecisionOptimizer:
         current_combined_sensitivity = analyzer.calculate_combined_sensitivity(
             ppl_increase=ppl_increase,
             kl_increase=kl_increase,
-            max_ppl_increase=allocated_budget,  # Use allocated budget as max
-            max_kl_increase=self.baseline_metrics['kl_token_budget']  # Use from baseline
+            max_ppl_increase=allocated_ppl_budget,  # Use allocated budget as max
+            max_kl_increase=self.baseline_metrics.get('kl_token_budget', 0.01)  # Use from baseline or default
         )
         
-        # Get budget threshold for this block (already calculated in importance analysis)
-        block_budget = self.budget_allocations.get(block_name, {})
-        threshold_combined_sensitivity = block_budget.get('combined_sensitivity', float('inf'))
+        if 'combined_sensitivity' not in block_budget:
+            raise ValueError(f"No combined_sensitivity found for block {block_name}")
+            
+        threshold_combined_sensitivity = block_budget['combined_sensitivity']
         
         # Check if under threshold
         under_threshold = current_combined_sensitivity <= threshold_combined_sensitivity
@@ -1297,16 +1312,26 @@ class PrecisionOptimizer:
         
     def get_block_budget_info(self, block_name: str) -> Dict:
         """Get budget allocation information for a specific block."""
-        block_budget = self.budget_allocations.get(block_name, {})
+        if block_name not in self.budget_allocations:
+            raise ValueError(f"No budget allocation found for block {block_name}")
+            
+        block_budget = self.budget_allocations[block_name]
+        
+        required_keys = ['allocated_ppl_budget', 'allocated_kl_budget', 'ppl_budget_percent', 
+                        'kl_budget_percent', 'ppl_sensitivity', 'kl_sensitivity', 'combined_sensitivity']
+                        
+        for key in required_keys:
+            if key not in block_budget:
+                raise ValueError(f"Missing '{key}' in budget allocation for block {block_name}")
         
         return {
-            'allocated_ppl_budget': block_budget.get('allocated_ppl_budget', 0.0),
-            'allocated_kl_budget': block_budget.get('allocated_kl_budget', 0.0),
-            'ppl_budget_percent': block_budget.get('ppl_budget_percent', 0.0),
-            'kl_budget_percent': block_budget.get('kl_budget_percent', 0.0),
-            'ppl_sensitivity': block_budget.get('ppl_sensitivity', 0.0),
-            'kl_sensitivity': block_budget.get('kl_sensitivity', 0.0),
-            'combined_sensitivity': block_budget.get('combined_sensitivity', 0.0)
+            'allocated_ppl_budget': block_budget['allocated_ppl_budget'],
+            'allocated_kl_budget': block_budget['allocated_kl_budget'],
+            'ppl_budget_percent': block_budget['ppl_budget_percent'],
+            'kl_budget_percent': block_budget['kl_budget_percent'],
+            'ppl_sensitivity': block_budget['ppl_sensitivity'],
+            'kl_sensitivity': block_budget['kl_sensitivity'],
+            'combined_sensitivity': block_budget['combined_sensitivity']
         }
          
     def _get_model_logits(self):
