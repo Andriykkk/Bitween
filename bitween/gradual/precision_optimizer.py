@@ -345,7 +345,7 @@ class PrecisionOptimizer:
                 wrapped_block=current_block,
                 bits=bits,
                 group_size=group_size,
-                storage_device="cpu",  # Use CPU storage for memory efficiency
+                storage_device="cuda",
                 block_name=block_name
             )
             

@@ -33,13 +33,10 @@ class ImportanceAnalyzer:
     4. Layer upgrade benefit analysis
     """
     
-    def __init__(self, model: nn.Module, tokenizer, calibration_samples: int = 100, wrapper_storage_device: str = "cpu", working_device: str = "cuda", evaluation_samples: int = 2):
+    def __init__(self, model: nn.Module, tokenizer, calibration_samples: int = 100, evaluation_samples: int = 2):
         self.model = model
         self.tokenizer = tokenizer
         self.calibration_samples = calibration_samples
-        self.wrapper_storage_device = wrapper_storage_device
-        self.working_device = working_device
-
         self.evaluation_samples = evaluation_samples
         
         # Results storage
@@ -241,7 +238,7 @@ class ImportanceAnalyzer:
             wrapped_block=original_block,
             bits=bits,
             group_size=group_size,
-            storage_device=self.wrapper_storage_device,
+            storage_device="cuda",
             block_name=block_name
         )
         
@@ -294,7 +291,7 @@ class ImportanceAnalyzer:
             wrapped_block=original_block,
             noise_std=0.1,  # 10% noise relative to weight std
             seed=seed,
-            storage_device=self.wrapper_storage_device,
+            storage_device="cuda",
             block_name=block_name
         )
         

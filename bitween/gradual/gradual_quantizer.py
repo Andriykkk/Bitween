@@ -35,7 +35,6 @@ class GradualQuantizer:
         nsamples: int = 128,
         evaluation_samples: int = 5,
         ignore_layers: Optional[List[str]] = None,
-        cpu_offload: bool = False,
         min_group_size: int = 32,
         max_group_size: int = 128,
         training_batch_size: int = 4
@@ -52,7 +51,6 @@ class GradualQuantizer:
             calibration_samples: Samples for importance analysis
             evaluation_samples: Samples for final evaluation (kept small for speed)
             ignore_layers: List of layer names to exclude from quantization
-            cpu_offload: Enable CPU offloading for memory efficiency (requires GPU)
             min_group_size: Minimum group size for quantization (default: 32)
             max_group_size: Maximum group size for quantization (default: 128)
             training_batch_size: Batch size for trainable quantization (default: 4)
@@ -70,32 +68,14 @@ class GradualQuantizer:
         self.max_group_size = max_group_size
         self.training_batch_size = training_batch_size
         
-        # Device management - detect model's current device
-        self.gpu_available = torch.cuda.is_available()
-        self.model_device = next(self.model.parameters()).device
-        self.cpu_offload = cpu_offload if self.gpu_available and self.model_device.type == 'cuda' else False
-        
-        # Determine storage and working devices
-        if self.cpu_offload:
-            self.wrapper_storage_device = "cpu"
-            self.working_device = "cuda"
-            print("💾 CPU offload enabled - blocks will be stored on CPU and loaded to GPU for forward pass")
-        else:
-            self.wrapper_storage_device = str(self.model_device)
-            self.working_device = str(self.model_device)
-            if not self.gpu_available:
-                print("⚠️  No GPU available - running on CPU only")
-        
         # Working budget with safety margin
         self.working_budget = max_perplexity_increase * safety_multiplier
         
-        # Initialize components with device settings
+        # Initialize components (everything on GPU)
         self.importance_analyzer = ImportanceAnalyzer(
             model, tokenizer, 
             calibration_samples=self.calibration_samples,  # For training (128)
-            evaluation_samples=self.evaluation_samples,  # For evaluation (5)
-            wrapper_storage_device=self.wrapper_storage_device,
-            working_device=self.working_device
+            evaluation_samples=self.evaluation_samples  # For evaluation (5)
         )
         self.precision_optimizer = None  # Initialize after importance analysis
 

@@ -37,16 +37,12 @@ class BaseBlockWrapper(nn.Module):
         self.block_name = block_name or "unnamed_block"
         self.enabled = True
         
-        # Move block to storage device initially
-        if storage_device == "cpu":
-            self.wrapped_block.to("cpu")
-            
         # Store original device for restoration
         self._original_device = next(wrapped_block.parameters()).device
         
     def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         """
-        Forward pass with device management and modification hooks.
+        Forward pass with modification hooks (no device management).
         
         Args:
             x: Input tensor
@@ -60,40 +56,14 @@ class BaseBlockWrapper(nn.Module):
             # If disabled, act as passthrough
             return self.wrapped_block(x, *args, **kwargs)
             
-        # Device management: move block to GPU if stored on CPU
-        if self.storage_device == "cpu":
-            # Move the entire module to the target device
-            # This should handle all parameters and buffers automatically
-            self.wrapped_block = self.wrapped_block.to(x.device)
-            
-            # Double check that quantized layers have their buffers on the right device
-            for module in self.wrapped_block.modules():
-                if hasattr(module, 'qweight'):
-                    # Verify device alignment - if misaligned, fix it
-                    if module.qweight.device != x.device:
-                        module.qweight = module.qweight.to(x.device)
-                    if module.scale.device != x.device:
-                        module.scale = module.scale.to(x.device)
-                    if module.zero_point.device != x.device:
-                        module.zero_point = module.zero_point.to(x.device)
-                    if module.bias is not None and module.bias.device != x.device:
-                        module.bias = module.bias.to(x.device)
-            
-        try:
-            # Pre-forward hook for modifications (noise, quantization, etc.)
-            x = self._pre_forward_hook(x)
-            
-            # Actual forward pass with all arguments
-            output = self.wrapped_block(x, *args, **kwargs)
-            
-            # Post-forward hook for cleanup/modifications
-            output = self._post_forward_hook(output)
-            
-        finally:
-            # Always return block to storage device to save memory
-            if self.storage_device == "cpu":
-                # Move the entire module back to CPU
-                self.wrapped_block = self.wrapped_block.to("cpu")
+        # Pre-forward hook for modifications (noise, quantization, etc.)
+        x = self._pre_forward_hook(x)
+        
+        # Actual forward pass with all arguments
+        output = self.wrapped_block(x, *args, **kwargs)
+        
+        # Post-forward hook for cleanup/modifications
+        output = self._post_forward_hook(output)
                 
         return output
         
@@ -298,73 +268,60 @@ class RTNWrapper(BaseBlockWrapper):
         self.bits = bits
         self.group_size = group_size
         
-        # Store original linear layers for restoration
-        self.original_layers = {}
-        self.quantized_layers = {}
+        # Store original block for restoration
+        self.original_block = wrapped_block
+        self.quantized_block = None
         self.quantization_applied = False
         
     def _pre_forward_hook(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply RTN quantization before forward pass."""
-        if self.enabled and not self.quantization_applied:
-            # Ensure we're applying quantization when the block is on the right device
-            target_device = x.device
-            self._apply_rtn_quantization(target_device)
+        """Apply RTN quantization on first forward pass when device is known."""
+        if not self.quantization_applied:
+            # Ensure the original block is on the same device as input
+            if next(self.original_block.parameters()).device != x.device:
+                self.original_block = self.original_block.to(x.device)
+            self._apply_rtn_quantization()
         return x
         
     def _post_forward_hook(self, output: torch.Tensor) -> torch.Tensor:
         """Clean up after forward pass."""
         return output
         
-    def _apply_rtn_quantization(self, target_device=None):
-        """Apply RTN quantization to all linear layers in the block."""
+    def _apply_rtn_quantization(self):
+        """Copy block and quantize all linear layers (like quantizer.py)."""
         if self.quantization_applied:
             return
             
+        import copy
         from ..modules import QuantizedLinear
         
-        # Find and quantize all linear layers
-        for name, module in self.wrapped_block.named_modules():
+        # Create a deepcopy of the block for quantization (like quantizer.py)
+        self.quantized_block = copy.deepcopy(self.original_block)
+        
+        # Find and replace all linear layers in the copied block
+        for name, module in self.quantized_block.named_modules():
             if isinstance(module, nn.Linear):
-                # Store original layer
-                full_name = f"{name}" if name else "root"
-                self.original_layers[full_name] = module
-                
-                # Create quantized version - ensure it's created on the right device
-                device_for_quantization = target_device if target_device is not None else module.weight.device
-                
-                # Temporarily move module to target device if needed for quantization
-                original_device = module.weight.device
-                if device_for_quantization != original_device:
-                    module = module.to(device_for_quantization)
-                
+                # Create quantized version
                 quantized_layer = QuantizedLinear.from_float(
                     module, 
                     bits=self.bits, 
                     group_size=self.group_size
                 )
                 
-                # Ensure quantized layer is on the target device
-                quantized_layer = quantized_layer.to(device_for_quantization)
-                
-                # Replace the layer
-                self._set_submodule(self.wrapped_block, name, quantized_layer)
-                self.quantized_layers[full_name] = quantized_layer
-                
+                # Replace the layer in the quantized block
+                self._set_submodule(self.quantized_block, name, quantized_layer)
+        
+        # Replace the wrapped_block with quantized version
+        self.wrapped_block = self.quantized_block
         self.quantization_applied = True
         
     def _remove_rtn_quantization(self):
-        """Restore original linear layers."""
+        """Restore original block."""
         if not self.quantization_applied:
             return
             
-        # Restore all original layers
-        for name, original_layer in self.original_layers.items():
-            if name == "root":
-                # Handle root level replacement if needed
-                continue
-            else:
-                self._set_submodule(self.wrapped_block, name, original_layer)
-                
+        # Restore original block
+        self.wrapped_block = self.original_block
+        self.quantized_block = None
         self.quantization_applied = False
         
     def _set_submodule(self, parent_module, module_name, new_module):
@@ -385,8 +342,7 @@ class RTNWrapper(BaseBlockWrapper):
     def enable(self):
         """Enable RTN quantization."""
         super().enable()
-        if not self.quantization_applied:
-            self._apply_rtn_quantization()
+        # Quantization will be applied on first forward pass when we know the device
             
     def disable(self):
         """Disable RTN quantization and restore original layers."""
@@ -396,8 +352,11 @@ class RTNWrapper(BaseBlockWrapper):
     def cleanup(self):
         """Clean up and restore original state."""
         self._remove_rtn_quantization()
-        self.original_layers.clear()
-        self.quantized_layers.clear()
+        self.quantized_block = None
+        
+    def get_wrapped_block(self) -> nn.Module:
+        """Get the original wrapped block (not quantized version)."""
+        return self.original_block
 
 
 class BlockCacheWrapper(BaseBlockWrapper):
@@ -443,18 +402,18 @@ class BlockCacheWrapper(BaseBlockWrapper):
             if self.capture_enabled:
                 # Cache input for this sample
                 input_cache = {
-                    'input': x.clone().detach().cpu(),  # Store on CPU to save GPU memory
-                    'args': [arg.clone().detach().cpu() if torch.is_tensor(arg) else arg for arg in args],
-                    'kwargs': {k: v.clone().detach().cpu() if torch.is_tensor(v) else v for k, v in kwargs.items()}
+                    'input': x.clone().detach(),  # Keep on GPU
+                    'args': [arg.clone().detach() if torch.is_tensor(arg) else arg for arg in args],
+                    'kwargs': {k: v.clone().detach() if torch.is_tensor(v) else v for k, v in kwargs.items()}
                 }
                 
                 # Cache output for this sample - handle different output types
                 if torch.is_tensor(output):
-                    output_cache = output.clone().detach().cpu()
+                    output_cache = output.clone().detach()
                 elif isinstance(output, (tuple, list)):
                     # Handle tuple/list outputs
                     output_cache = type(output)(
-                        item.clone().detach().cpu() if torch.is_tensor(item) else item 
+                        item.clone().detach() if torch.is_tensor(item) else item 
                         for item in output
                     )
                 else:
@@ -536,7 +495,7 @@ class BlockTrainingManager:
             wrapper = BlockCacheWrapper(
                 wrapped_block=original_block,
                 block_name=block_name,
-                storage_device="cpu"  # Store cached data on CPU
+                storage_device="cuda"
             )
             
             # Replace block with wrapper

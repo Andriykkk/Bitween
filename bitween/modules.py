@@ -162,6 +162,8 @@ class QuantizedLinear(nn.Module):
 
         q_layer = cls(float_layer.in_features, float_layer.out_features, bits, group_size, bias=float_layer.bias is not None, dtype=torch.float16)
 
+        q_layer = q_layer.to(device)
+
         q_layer.qweight.copy_(qweight)
         q_layer.scale.copy_(scale)
         q_layer.zero_point.copy_(zero_point)
