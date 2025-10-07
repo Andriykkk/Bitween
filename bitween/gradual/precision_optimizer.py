@@ -236,7 +236,7 @@ class PrecisionOptimizer:
                 if rtn_success:
                     print(f"      ✓ RTN successful (error: {rtn_error:.4f})")
                     best_config = QuantizationConfig(target_bits, target_group_size, "RTN", rtn_error)
-                    continue  # Try even lower precision
+                    break  # Skip remaining group sizes, try lower bits
                     
                 # TEMPORARILY DISABLED: Step 2: RTN failed, try training
                 # print(f"      RTN failed (error: {rtn_error:.4f}), trying training...")

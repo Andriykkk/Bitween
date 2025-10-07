@@ -400,20 +400,20 @@ class BlockCacheWrapper(BaseBlockWrapper):
             
             # Cache data if enabled
             if self.capture_enabled:
-                # Cache input for this sample
+                # Cache input for this sample - store on CPU to save GPU memory
                 input_cache = {
-                    'input': x.clone().detach(),  # Keep on GPU
-                    'args': [arg.clone().detach() if torch.is_tensor(arg) else arg for arg in args],
-                    'kwargs': {k: v.clone().detach() if torch.is_tensor(v) else v for k, v in kwargs.items()}
+                    'input': x.clone().detach().cpu(),  # Store on CPU
+                    'args': [arg.clone().detach().cpu() if torch.is_tensor(arg) else arg for arg in args],
+                    'kwargs': {k: v.clone().detach().cpu() if torch.is_tensor(v) else v for k, v in kwargs.items()}
                 }
                 
-                # Cache output for this sample - handle different output types
+                # Cache output for this sample - handle different output types, store on CPU
                 if torch.is_tensor(output):
-                    output_cache = output.clone().detach()
+                    output_cache = output.clone().detach().cpu()
                 elif isinstance(output, (tuple, list)):
                     # Handle tuple/list outputs
                     output_cache = type(output)(
-                        item.clone().detach() if torch.is_tensor(item) else item 
+                        item.clone().detach().cpu() if torch.is_tensor(item) else item 
                         for item in output
                     )
                 else:

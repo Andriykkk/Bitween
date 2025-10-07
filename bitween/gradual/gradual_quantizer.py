@@ -113,8 +113,8 @@ class GradualQuantizer:
         # Store budget allocations for later use
         self.budget_allocations = budget_allocations
         
-        # Store original model reference for KL divergence calculation
-        self.original_model = copy.deepcopy(self.model)
+        # Store original model reference for KL divergence calculation (on CPU to save GPU memory)
+        self.original_model = copy.deepcopy(self.model).cpu()
         
         """Apply quantization progressively based on importance scores."""
         # Set up block training system for block-by-block training FIRST
