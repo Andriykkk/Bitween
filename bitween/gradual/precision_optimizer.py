@@ -82,7 +82,7 @@ class PrecisionOptimizer:
         self.original_model = original_model
         self.training_batch_size = training_batch_size
         self.training_manager = training_manager
-        
+
         # Persistent state for building final quantized model
         self.block_quantizations = {}  # Store best quantization config for each block
         self.quantized_blocks = {}     # Store actual quantized block instances
@@ -565,6 +565,7 @@ class PrecisionOptimizer:
         # Calculate degradation
         ppl_increase = current_ppl - baseline_ppl
         kl_increase = current_kl - baseline_kl
+        print(f"  {block_name}: ppl increase: {ppl_increase:.2f}, kl increase: {kl_increase:.2f}, baseline ppl: {baseline_ppl:.2f}, baseline kl: {baseline_kl:.2f}")
         
         # Get budget threshold for this block (already calculated in importance analysis)
         if block_name not in self.budget_allocations:

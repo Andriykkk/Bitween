@@ -115,8 +115,8 @@ def main():
         tokenizer=tokenizer, 
         max_perplexity_increase=5,
         ignore_layers=['lm_head', 'embed_tokens'],
-        nsamples=4,
-        evaluation_samples=2,
+        nsamples=8,
+        evaluation_samples=5,
         min_group_size=32,
         max_group_size=128
     )
