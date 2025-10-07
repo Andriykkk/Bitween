@@ -54,7 +54,8 @@ class CalibrationDataset:
     
     def _load_pile_10k(self):
         """Load and preprocess the pile-10k dataset."""
-        print(f"Loading {self.dataset_name} dataset...")
+        if self.verbose:
+            print(f"Loading {self.dataset_name} dataset...")
         
         # Load the pile-10k dataset
         try:

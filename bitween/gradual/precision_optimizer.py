@@ -230,7 +230,7 @@ class PrecisionOptimizer:
                 
                 # Step 1: Try RTN quantization first
                 rtn_success, rtn_error = self._try_rtn_quantization(
-                    block, target_bits, target_group_size, cached_data, budget_allocation
+                    block_name, target_bits, target_group_size, cached_data, budget_allocation
                 )
                 
                 if rtn_success:
@@ -323,16 +323,10 @@ class PrecisionOptimizer:
             current = current // 2
         return sizes
         
-    def _try_rtn_quantization(self, block, bits, group_size, cached_data, budget):
+    def _try_rtn_quantization(self, block_name, bits, group_size, cached_data, budget):
         """Try RTN quantization with given parameters."""
         from .base_wrapper import RTNWrapper
         from .utils import get_module_by_name, set_module_by_name
-        
-        # Get block name from model
-        block_name = self._find_block_name(block)
-        if not block_name:
-            print(f"      Could not find block name in model")
-            return False, float('inf')
         
         print(f"      Applying RTN {bits}-bit quantization to {block_name}")
         

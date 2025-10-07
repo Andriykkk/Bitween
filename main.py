@@ -113,7 +113,7 @@ def main():
     quantizer = GradualQuantizer(
         model=model,
         tokenizer=tokenizer, 
-        max_perplexity_increase=5,
+        max_perplexity_increase=25,
         ignore_layers=['lm_head', 'embed_tokens'],
         nsamples=8,
         evaluation_samples=5,
