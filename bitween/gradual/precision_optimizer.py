@@ -415,7 +415,7 @@ class PrecisionOptimizer:
                     
                 # Save new better config
                 self.block_quantizations[block_name] = config
-                self.quantized_blocks[block_name] = quantized_block
+                self.quantized_blocks[block_name] = quantized_block.cpu()  # Store on CPU to save GPU memory
                 self.current_model_state[block_name] = 'quantized'
                 
                 print(f"        ✓ Saved improved {config.method} {config.bits}-bit for {block_name}")
@@ -431,7 +431,7 @@ class PrecisionOptimizer:
         else:
             # First config for this block
             self.block_quantizations[block_name] = config
-            self.quantized_blocks[block_name] = quantized_block
+            self.quantized_blocks[block_name] = quantized_block.cpu()  # Store on CPU to save GPU memory
             self.current_model_state[block_name] = 'quantized'
             
             print(f"        ✓ Saved {config.method} {config.bits}-bit for {block_name} ({new_memory:.1f}MB)")
@@ -1609,12 +1609,17 @@ class PrecisionOptimizer:
         """
         print("🔧 Finalizing quantization - applying saved quantized blocks...")
         
-        if hasattr(self, 'saved_quantized_blocks') and self.saved_quantized_blocks:
-            for block_name, quantized_block in self.saved_quantized_blocks.items():
-                print(f"  Applying quantized block: {block_name}")
-                self._replace_block_in_model(block_name, quantized_block)
+        if hasattr(self, 'quantized_blocks') and self.quantized_blocks:
+            # Get target device for the model
+            target_device = next(self.model.parameters()).device
+            
+            for block_name, quantized_block in self.quantized_blocks.items():
+                print(f"  Applying quantized block: {block_name} (loading from CPU to GPU)")
+                # Load quantized block from CPU to GPU and apply to model
+                quantized_block_gpu = quantized_block.to(target_device)
+                self._replace_block_in_model(block_name, quantized_block_gpu)
                 
-            print(f"✅ Applied {len(self.saved_quantized_blocks)} quantized blocks to model")
+            print(f"✅ Applied {len(self.quantized_blocks)} quantized blocks to model")
         else:
             print("⚠️  No quantized blocks found - returning original model")
             
