@@ -217,13 +217,21 @@ class PrecisionOptimizer:
         attention_layers, mlp_layers = self._separate_layer_types(block)
         
         best_config = None
+        failed_group_sizes = set()  # Track group sizes that failed for higher bits
         
         # Phase 1: Try each precision level
         for target_bits in precision_levels:
             print(f"    Trying {target_bits}-bit quantization...")
             
             # Try different group sizes from large to small
-            group_sizes = self._get_group_size_sequence(self.max_group_size, self.min_group_size)
+            all_group_sizes = self._get_group_size_sequence(self.max_group_size, self.min_group_size)
+            
+            # Skip group sizes that failed for higher bits (they'll definitely fail for lower bits)
+            group_sizes = [gs for gs in all_group_sizes if gs not in failed_group_sizes]
+            
+            if not group_sizes:
+                print(f"      All group sizes failed for higher bits, skipping {target_bits}-bit")
+                continue
             
             for target_group_size in group_sizes:
                 print(f"      Group size: {target_group_size}")
@@ -236,7 +244,7 @@ class PrecisionOptimizer:
                 if rtn_success:
                     print(f"      ✓ RTN successful (error: {rtn_error:.4f})")
                     best_config = QuantizationConfig(target_bits, target_group_size, "RTN", rtn_error)
-                    break  # Skip remaining group sizes, try lower bits
+                    break  # Skip remaining group sizes for this bit level, try next lower bit level
                     
                 # TEMPORARILY DISABLED: Step 2: RTN failed, try training
                 # print(f"      RTN failed (error: {rtn_error:.4f}), trying training...")
@@ -271,22 +279,18 @@ class PrecisionOptimizer:
                 # RTN failed - check if this was minimum group size
                 print(f"      RTN failed (error: {rtn_error:.4f}), skipping training/recovery for testing")
                 
-                # If this was the minimum group size, stop trying lower bits entirely
-                if target_group_size == self.min_group_size:
-                    print(f"      Minimum group size ({self.min_group_size}) failed for {target_bits}-bit, stopping precision reduction")
-                    if best_config is not None:
-                        print(f"    Using best RTN config: {best_config.bits}-bit, group_size={best_config.group_size}, method={best_config.method}")
-                        return best_config
-                    else:
-                        print(f"    No successful configuration found, stopping quantization")
-                        return None
+                # Mark this specific group size as failed for lower bit levels
+                failed_group_sizes.add(target_group_size)
+                print(f"      Marked group size {target_group_size} as failed for lower bits")
                 
-                # Not minimum group size, continue to next group_size
-                if best_config is not None:
-                    # Return best previous configuration
-                    print(f"    Using best RTN config: {best_config.bits}-bit, group_size={best_config.group_size}, method={best_config.method}")
-                    return best_config
-                # Continue to next group_size
+                # If this was the minimum group size, no more group sizes to try for any bit level
+                if target_group_size == self.min_group_size:
+                    print(f"      Minimum group size ({self.min_group_size}) failed, stopping precision reduction")
+                    break  # Move to next bit level (but will likely be skipped due to no available group sizes)
+                
+                # Not minimum group size, continue to next smaller group_size
+                print(f"      Continuing to next smaller group size...")
+                # Continue to next group_size (don't return here)
                     
         # Return best RTN configuration found, or None if nothing worked
         if best_config is not None:
