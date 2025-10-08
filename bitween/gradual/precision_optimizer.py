@@ -7,6 +7,16 @@ import torch.nn as nn
 from typing import Dict, List, Tuple, Optional, Union
 from dataclasses import dataclass
 from enum import Enum
+from tqdm import tqdm
+
+# Local imports
+from .utils import get_module_by_name, set_module_by_name
+from .base_wrapper import RTNWrapper
+from .importance_analyzer import ImportanceAnalyzer
+from ..utils.evaluation import calculate_perplexity, calculate_kl_divergence
+from ..utils.sign_sgd import SignSGD
+from ..wrapper import wrap_model_for_training, train_individual_wrapper, WrapperLinear
+from ..calib_dataset import get_calibration_dataset
 
 
 class OptimizationResult(Enum):
@@ -205,7 +215,6 @@ class PrecisionOptimizer:
         Returns:
             Best quantization configuration found, or None if nothing works
         """
-        from .utils import get_module_by_name
         
         # Configuration
         precision_levels = [8, 4, 2]  # bits
@@ -246,18 +255,18 @@ class PrecisionOptimizer:
                     best_config = QuantizationConfig(target_bits, target_group_size, "RTN", rtn_error)
                     break  # Skip remaining group sizes for this bit level, try next lower bit level
                     
-                # TEMPORARILY DISABLED: Step 2: RTN failed, try training
-                # print(f"      RTN failed (error: {rtn_error:.4f}), trying training...")
-                # 
-                # train_success, train_error = self._try_trainable_quantization(
-                #     block, target_bits, target_group_size, cached_data, budget_allocation
-                # )
-                # 
-                # if train_success:
-                #     print(f"      ✓ Training successful (error: {train_error:.4f})")
-                #     best_config = QuantizationConfig(target_bits, target_group_size, "Trained", train_error)
-                #     continue  # Try even lower precision
-                #     
+                # Step 2: RTN failed, try training
+                print(f"      RTN failed (error: {rtn_error:.4f}), trying trainable quantization...")
+                
+                train_success, train_error = self._try_trainable_quantization(
+                    block_name, target_bits, target_group_size, cached_data, budget_allocation
+                )
+                
+                if train_success:
+                    print(f"      ✓ Training successful (error: {train_error:.4f})")
+                    best_config = QuantizationConfig(target_bits, target_group_size, "Trained", train_error)
+                    break  # Skip remaining group sizes for this bit level, try next lower bit level
+                    
                 # # TEMPORARILY DISABLED: Step 3: Training failed, try layer-level recovery
                 # if target_group_size == self.min_group_size:
                 #     print(f"      Training failed (error: {train_error:.4f}), trying layer recovery...")
@@ -329,8 +338,6 @@ class PrecisionOptimizer:
         
     def _try_rtn_quantization(self, block_name, bits, group_size, cached_data, budget):
         """Try RTN quantization with given parameters."""
-        from .base_wrapper import RTNWrapper
-        from .utils import get_module_by_name, set_module_by_name
         
         print(f"      Applying RTN {bits}-bit quantization to {block_name}")
         
@@ -464,7 +471,6 @@ class PrecisionOptimizer:
         
     def _restore_block_state(self, block_name: str, previous_block):
         """Restore block to previous state."""
-        from .utils import set_module_by_name
         set_module_by_name(self.model, block_name, previous_block)
         
     def _estimate_memory_savings(self, bits: int, group_size: int) -> float:
@@ -549,7 +555,6 @@ class PrecisionOptimizer:
         Returns:
             Dict with evaluation results and threshold check
         """
-        from ..utils.evaluation import calculate_perplexity, calculate_kl_divergence
         
         # Get baseline metrics (already calculated in GradualQuantizer)
         if 'perplexity' not in self.baseline_metrics:
@@ -594,7 +599,6 @@ class PrecisionOptimizer:
         allocated_ppl_budget = block_budget['allocated_ppl_budget']
         
         # Calculate combined sensitivity for current state (using same weights as in budget allocation)
-        from .importance_analyzer import ImportanceAnalyzer
         analyzer = ImportanceAnalyzer(self.model, self.tokenizer, evaluation_samples=self.evaluation_samples)
         
         current_combined_sensitivity = analyzer.calculate_combined_sensitivity(
@@ -624,16 +628,8 @@ class PrecisionOptimizer:
             'under_threshold': under_threshold
         }
         
-    def _try_trainable_quantization(self, block, bits, group_size, cached_data, budget):
+    def _try_trainable_quantization(self, block_name, bits, group_size, cached_data, budget):
         """Try trainable quantization with given parameters using existing Bitween training infrastructure."""
-        from ..wrapper import wrap_model_for_training, train_individual_wrapper, finalize_wrapped_model
-        from .utils import get_module_by_name, set_module_by_name
-        
-        block_name = self._find_block_name(block)
-        if not block_name:
-            print(f"        Could not find block name in model")
-            return False, float('inf')
-        
         print(f"        Training {block_name} with {len(cached_data)} samples...")
         
         try:
@@ -849,7 +845,6 @@ class PrecisionOptimizer:
             
     def _get_block_outputs_on_cached_samples(self, block_name, cached_samples):
         """Get block outputs using cached input samples."""
-        from .utils import get_module_by_name
         
         try:
             if not cached_samples:
@@ -883,7 +878,6 @@ class PrecisionOptimizer:
         
     def _get_block_outputs_with_reverted_layer_from_saved(self, block_name, layer_name, cached_samples, saved_quantized_block):
         """Get block outputs with one layer temporarily reverted to saved quantized state."""
-        from .utils import get_module_by_name, set_module_by_name
         
         try:
             # Get current layer
@@ -1049,7 +1043,6 @@ class PrecisionOptimizer:
         
         Returns True if the recovery set meets budget, False otherwise.
         """
-        from .utils import get_module_by_name, set_module_by_name
         
         if not recovery_set:
             return False
@@ -1124,8 +1117,6 @@ class PrecisionOptimizer:
         3. Replace frozen layers with saved versions and freeze them from training
         4. Train only non-frozen layers while keeping frozen layers fixed
         """
-        from ..wrapper import wrap_model_for_training
-        from .utils import get_module_by_name, set_module_by_name
         
         print(f"          Retraining {block_name} with {len(recovery_set)} layers frozen from saved block...")
         print(f"          Target quantization for non-frozen layers: {target_bits}-bit, group_size={target_group_size}")
@@ -1311,7 +1302,6 @@ class PrecisionOptimizer:
         
     def _get_evaluation_samples(self):
         """Get fixed calibration data for consistent evaluation (reusing ImportanceAnalyzer approach)."""
-        from ..calib_dataset import get_calibration_dataset
         
         # Get small, fixed dataset for testing (same as ImportanceAnalyzer._get_fixed_calibration_data)
         calib_dataset = get_calibration_dataset(
@@ -1421,8 +1411,6 @@ class PrecisionOptimizer:
         
     def apply_quantization_config(self, block_name: str, config: QuantizationConfig):
         """Apply the quantization configuration to the actual model block."""
-        from .utils import get_module_by_name, set_module_by_name
-        from .base_wrapper import RTNWrapper
         
         print(f"  Applying {config.method} quantization: {config.bits}-bit, group_size={config.group_size}")
         
@@ -1476,9 +1464,6 @@ class PrecisionOptimizer:
         
     def _train_wrapper_respecting_frozen_layers(self, module_name, wrapped_module, block_inputs, iters, lr, batch_size, is_single_layer):
         """Unified training function that automatically excludes frozen layers from optimizer."""
-        from ..utils.sign_sgd import SignSGD
-        from ..wrapper import WrapperLinear
-        from tqdm import tqdm
         import torch
         
         # Get frozen layer names for this block
@@ -1612,7 +1597,6 @@ class PrecisionOptimizer:
         
     def _apply_best_params_respecting_frozen_layers(self, block_name, wrapped_module):
         """Apply best parameters only to non-frozen layers."""
-        from ..wrapper import WrapperLinear
         
         frozen_layer_names = self._get_frozen_layer_names_for_block(block_name)
         
