@@ -315,14 +315,24 @@ class RTNWrapper(BaseBlockWrapper):
         self.quantization_applied = True
         
     def _remove_rtn_quantization(self):
-        """Restore original block."""
+        """Restore original block and clean up GPU memory."""
         if not self.quantization_applied:
             return
+            
+        # Move quantized block to CPU before deletion to free GPU memory
+        if self.quantized_block is not None:
+            self.quantized_block = self.quantized_block.cpu()
+            del self.quantized_block
             
         # Restore original block
         self.wrapped_block = self.original_block
         self.quantized_block = None
         self.quantization_applied = False
+        
+        # Explicit GPU cache cleanup
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
     def _set_submodule(self, parent_module, module_name, new_module):
         """Set submodule by name."""
@@ -457,6 +467,14 @@ class BlockCacheWrapper(BaseBlockWrapper):
         """Disable activation capture for normal execution."""
         self.capture_enabled = False
         
+    def set_eval_mode(self):
+        """Set wrapped block to eval mode to save memory."""
+        self.wrapped_block.eval()
+        
+    def set_train_mode(self):
+        """Set wrapped block to train mode."""
+        self.wrapped_block.train()
+        
 
 
 class BlockTrainingManager:
@@ -503,11 +521,47 @@ class BlockTrainingManager:
             self.wrapped_blocks[block_name] = wrapper
             
         self.block_order = block_names
+        
+        # Initially disable capture for all blocks and set to eval mode
+        self.disable_all_capture()
+        self.set_all_eval_mode()
+        
         print(f"Successfully wrapped blocks: {list(self.wrapped_blocks.keys())}")
+        print("All blocks initialized with capture disabled and in eval mode")
+        
+    def disable_all_capture(self):
+        """Disable capture for all wrapped blocks."""
+        for wrapper in self.wrapped_blocks.values():
+            wrapper.disable_capture()
+            
+    def enable_capture_for_block(self, block_name: str):
+        """Enable capture for only one specific block."""
+        # First disable all
+        self.disable_all_capture()
+        
+        # Then enable target block
+        if block_name in self.wrapped_blocks:
+            self.wrapped_blocks[block_name].enable_capture()
+            print(f"Enabled capture for {block_name}")
+        else:
+            raise ValueError(f"Block {block_name} not found in wrapped blocks")
+            
+    def set_all_eval_mode(self):
+        """Set all wrapped blocks to eval mode to save memory."""
+        for block_name, wrapper in self.wrapped_blocks.items():
+            wrapper.set_eval_mode()
+            
+    def set_block_train_mode(self, block_name: str):
+        """Set specific block to train mode."""
+        if block_name in self.wrapped_blocks:
+            self.wrapped_blocks[block_name].set_train_mode()
+            print(f"Set {block_name} to train mode")
+        else:
+            raise ValueError(f"Block {block_name} not found in wrapped blocks")
         
     def capture_block_data(self, block_name: str, dataset_samples, max_samples=None):
         """
-        Capture input/output data for a specific block.
+        Capture input/output data for a specific block using selective caching.
         
         Args:
             block_name: Name of block to capture data for
@@ -525,10 +579,11 @@ class BlockTrainingManager:
         # Clear any existing cache
         wrapper.clear_cache()
         
-        # Enable capture for this block only
-        wrapper.enable_capture()
+        # Set up selective caching: only target block captures, others in eval mode
+        self.set_all_eval_mode()  # Set all blocks to eval mode to save memory
+        self.enable_capture_for_block(block_name)  # Enable capture only for target block
         
-        print(f"Capturing data for {block_name}...")
+        print(f"Capturing data for {block_name} (others in eval mode)...")
         
         self.model.eval()
         samples_processed = 0
@@ -561,8 +616,8 @@ class BlockTrainingManager:
                     print(f"Forward pass failed for sample {samples_processed}: {e}")
                     continue
         
-        # Disable capture
-        wrapper.disable_capture()
+        # Disable capture for all blocks and restore training mode
+        self.disable_all_capture()
         
         captured_count = wrapper.get_cached_count()
         print(f"Captured {captured_count} samples for {block_name}")
@@ -612,7 +667,9 @@ class BlockTrainingManager:
         """Clear cached data for specific block to free memory."""
         if block_name in self.wrapped_blocks:
             self.wrapped_blocks[block_name].clear_cache()
-            print(f"Cleared cache for {block_name}")
+            self.wrapped_blocks[block_name].disable_capture()  # Also disable capture
+            self.wrapped_blocks[block_name].set_eval_mode()    # Set back to eval mode
+            print(f"Cleared cache for {block_name} and set to eval mode")
             
     def cleanup(self):
         """

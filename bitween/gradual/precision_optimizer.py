@@ -366,13 +366,30 @@ class PrecisionOptimizer:
                 )
                 
                 # Store quantized wrapper if it's better than existing
-                self._save_block_quantization_if_better(block_name, config, rtn_wrapper)
+                saved = self._save_block_quantization_if_better(block_name, config, rtn_wrapper)
+                
+                # If not saved (not better), clean up the wrapper
+                if not saved:
+                    rtn_wrapper.cleanup()
+                    
+                # Always restore original state after testing
+                self._restore_block_state(block_name, current_block)
+                
+                # Force GPU cleanup after RTN test
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 
                 return True, performance['ppl_increase']
             else:
                 # RTN failed - restore previous state
                 self._restore_block_state(block_name, current_block)
                 rtn_wrapper.cleanup()
+                
+                # Force GPU cleanup after failed test
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 
                 return False, performance['ppl_increase']
             
