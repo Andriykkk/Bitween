@@ -16,6 +16,7 @@ from .importance_analyzer import ImportanceAnalyzer
 from ..utils.evaluation import calculate_perplexity, calculate_kl_divergence
 from ..utils.sign_sgd import SignSGD
 from ..wrapper import wrap_model_for_training, train_individual_wrapper, WrapperLinear, unified_unwrapper
+from ..modules import QuantizedLinear
 from ..calib_dataset import get_calibration_dataset
 
 
@@ -430,10 +431,28 @@ class PrecisionOptimizer:
         """Calculate actual memory usage of a quantized block in MB."""
         total_memory = 0.0
         
-        for name, module in quantized_block.named_modules():
-            if isinstance(module, torch.nn.Linear):
+        # Handle different wrapper types
+        actual_block = quantized_block
+        
+        # Handle wrappers with wrapped_block attribute (both RTNWrapper and BlockCacheWrapper)
+        if hasattr(quantized_block, 'wrapped_block'):
+            actual_block = quantized_block.wrapped_block
+            
+        # Handle wrappers with wrapped_module attribute  
+        elif hasattr(quantized_block, 'wrapped_module'):
+            actual_block = quantized_block.wrapped_module
+            
+        # Handle other wrapper types
+        elif hasattr(quantized_block, 'module'):
+            actual_block = quantized_block.module
+        
+        layer_count = 0
+        for name, module in actual_block.named_modules():
+            # Check for both regular Linear and QuantizedLinear modules
+            if isinstance(module, (torch.nn.Linear, QuantizedLinear)):
                 # Get layer name relative to block
                 layer_name = name
+                layer_count += 1
                 
                 if config.layer_exceptions and layer_name in config.layer_exceptions:
                     # Frozen layer: higher precision but minimum group size
@@ -450,12 +469,29 @@ class PrecisionOptimizer:
                         group_size=config.group_size
                     )
                 total_memory += memory
+        
+        # Debug: Print layer count and total memory
+        if layer_count == 0:
+            print(f"        Warning: No Linear layers found in block")
+            print(f"        Original block type: {type(quantized_block)}")
+            print(f"        Actual block type: {type(actual_block)}")
+            # Try to see what's inside actual_block
+            if hasattr(actual_block, 'named_modules'):
+                all_modules = list(actual_block.named_modules())
+                print(f"        Found {len(all_modules)} modules: {[(name, type(mod).__name__) for name, mod in all_modules[:5]]}")
+        else:
+            print(f"        Calculated memory for {layer_count} layers: {total_memory:.1f}MB")
                 
         return total_memory
         
-    def _calculate_layer_memory(self, layer: torch.nn.Linear, bits: int, group_size: int) -> float:
+    def _calculate_layer_memory(self, layer: Union[torch.nn.Linear, QuantizedLinear], bits: int, group_size: int) -> float:
         """Calculate memory usage for a single layer in MB."""
-        out_features, in_features = layer.weight.shape
+        # Get dimensions based on layer type
+        if isinstance(layer, QuantizedLinear):
+            out_features = layer.out_features
+            in_features = layer.in_features
+        else:
+            out_features, in_features = layer.weight.shape
         
         # Quantized weights memory
         values_per_int32 = 32 // bits
@@ -470,7 +506,7 @@ class PrecisionOptimizer:
         
         # Bias (if present)
         bias_memory = 0
-        if layer.bias is not None:
+        if hasattr(layer, 'bias') and layer.bias is not None:
             bias_memory = out_features * 4  # float32 bias
             
         total_memory_bytes = quantized_weight_memory + scale_memory + zp_memory + bias_memory
@@ -670,7 +706,7 @@ class PrecisionOptimizer:
                 pass
             return False, float('inf')
         
-    def _analyze_layer_quality_impact(self, block):
+    def _analyze_layer_quality_impact(self, block, cached_data):
         """Analyze quality impact of reverting each layer to previously saved quantized state."""
         layer_impacts = []
         
@@ -697,8 +733,7 @@ class PrecisionOptimizer:
         print(f"        Analyzing {len(attention_layers)} attention + {len(mlp_layers)} MLP layers...")
         print(f"        Reverting to saved {self.block_quantizations[block_name].method} {self.block_quantizations[block_name].bits}-bit quantization")
         
-        # Get cached data from training manager
-        cached_data = self._get_cached_data_for_block(block_name)
+        # Use the cached data passed from the calling function
         if not cached_data:
             print(f"        No cached data available for {block_name}")
             return []
@@ -1195,7 +1230,7 @@ class PrecisionOptimizer:
         
         try:
             # Phase 1: Analyze which layers impact quality most (sorted by impact)
-            layer_impacts = self._analyze_layer_quality_impact(block)
+            layer_impacts = self._analyze_layer_quality_impact(block, cached_data)
             
             if not layer_impacts:
                 print(f"        No layers found for recovery analysis")
