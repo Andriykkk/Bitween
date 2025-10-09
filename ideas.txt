@@ -1,5 +1,4 @@
 [ ] add gradual quantisation
-    [x] add layer freezing to training
     [ ] in the end run training quantization for whole model to check everything and also try to increase freeze layers group size
     [ ] move quantized blocks to ram and move to eval mode
     [ ] make usual algorithm that remove layers that have too high error and could not learn and some layers learn to lover bits

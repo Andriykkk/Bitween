@@ -252,63 +252,71 @@ class PrecisionOptimizer:
                 
                 if rtn_success:
                     print(f"      ✓ RTN successful (error: {rtn_error:.4f})")
-                    best_config = QuantizationConfig(target_bits, target_group_size, "RTN", rtn_error)
-                    break  # Skip remaining group sizes for this bit level, try next lower bit level
+                    candidate_config = QuantizationConfig(target_bits, target_group_size, "RTN", rtn_error)
+                    if best_config is None or self._is_better_config_memory_based(candidate_config, best_config):
+                        best_config = candidate_config
+                        print(f"        → New best config: RTN {target_bits}-bit, group_size={target_group_size}")
+                else:
+                    # Step 2: RTN failed, try training
+                    print(f"      RTN failed (error: {rtn_error:.4f}), trying trainable quantization...")
                     
-                # Step 2: RTN failed, try training
-                print(f"      RTN failed (error: {rtn_error:.4f}), trying trainable quantization...")
-                
-                train_success, train_error = self._try_trainable_quantization(
-                    block_name, target_bits, target_group_size, cached_data, budget_allocation
-                )
-                
-                if train_success:
-                    print(f"      ✓ Training successful (error: {train_error:.4f})")
-                    best_config = QuantizationConfig(target_bits, target_group_size, "Trained", train_error)
-                    break  # Skip remaining group sizes for this bit level, try next lower bit level
+                    train_success, train_error = self._try_trainable_quantization(
+                        block_name, target_bits, target_group_size, cached_data, budget_allocation
+                    )
                     
-                # # TEMPORARILY DISABLED: Step 3: Training failed, try layer-level recovery
-                # if target_group_size == self.min_group_size:
-                #     print(f"      Training failed (error: {train_error:.4f}), trying layer recovery...")
-                #     
-                #     recovery_success, recovery_error = self._try_layer_recovery(
-                #         block, target_bits, target_group_size, cached_data, budget_allocation
-                #     )
-                # else:
-                #     print(f"      Training failed (error: {train_error:.4f}), skipping layer recovery (group_size={target_group_size} > min={self.min_group_size})")
-                #     recovery_success, recovery_error = False, train_error
-                # 
-                # if recovery_success:
-                #     print(f"      ✓ Layer recovery successful (error: {recovery_error:.4f})")
-                #     best_config = QuantizationConfig(target_bits, target_group_size, "Mixed", recovery_error)
-                #     continue  # Try even lower precision
-                # else:
-                #     print(f"      ✗ Layer recovery failed (error: {recovery_error:.4f})")
-                
-                # RTN failed - check if this was minimum group size
-                print(f"      RTN failed (error: {rtn_error:.4f}), skipping training/recovery for testing")
-                
-                # Mark this specific group size as failed for lower bit levels
-                failed_group_sizes.add(target_group_size)
-                print(f"      Marked group size {target_group_size} as failed for lower bits")
-                
-                # If this was the minimum group size, no more group sizes to try for any bit level
-                if target_group_size == self.min_group_size:
-                    print(f"      Minimum group size ({self.min_group_size}) failed, stopping precision reduction")
-                    break  # Move to next bit level (but will likely be skipped due to no available group sizes)
-                
-                # Not minimum group size, continue to next smaller group_size
-                print(f"      Continuing to next smaller group size...")
-                # Continue to next group_size (don't return here)
+                    if train_success:
+                        print(f"      ✓ Training successful (error: {train_error:.4f})")
+                        candidate_config = QuantizationConfig(target_bits, target_group_size, "Trained", train_error)
+                        if best_config is None or self._is_better_config_memory_based(candidate_config, best_config):
+                            best_config = candidate_config
+                            print(f"        → New best config: Trained {target_bits}-bit, group_size={target_group_size}")
+                    else:
+                        # Step 3: Both RTN and training failed, try layer recovery
+                        print(f"      Training failed (error: {train_error:.4f}), trying layer recovery...")
+                        
+                        recovery_success, recovery_error = self._try_layer_recovery(
+                            block, target_bits, target_group_size, cached_data, budget_allocation
+                        )
+                        
+                        if recovery_success:
+                            print(f"      ✓ Layer recovery successful (error: {recovery_error:.4f})")
+                            candidate_config = QuantizationConfig(target_bits, target_group_size, "Mixed", recovery_error)
+                            if best_config is None or self._is_better_config_memory_based(candidate_config, best_config):
+                                best_config = candidate_config
+                                print(f"        → New best config: Mixed {target_bits}-bit, group_size={target_group_size}")
+                        else:
+                            # All methods failed for this group size
+                            print(f"      All methods failed for group_size={target_group_size}")
+                            failed_group_sizes.add(target_group_size)
                     
-        # Return best RTN configuration found, or None if nothing worked
+        # Return best configuration found, or None if nothing worked
         if best_config is not None:
-            print(f"  Final RTN config: {best_config.bits}-bit, group_size={best_config.group_size}, method={best_config.method}")
+            print(f"  Final best config: {best_config.bits}-bit, group_size={best_config.group_size}, method={best_config.method}")
             return best_config
         else:
             print(f"  No RTN quantization possible within budget")
             return None
             
+    def _is_better_config_memory_based(self, new_config: QuantizationConfig, current_config: QuantizationConfig) -> bool:
+        """
+        Compare two configs based on memory usage (lower bits = less memory = better).
+        Priority: Lower bits > smaller group size > better error metric
+        """
+        # Lower bits are always better (more memory savings)
+        if new_config.bits < current_config.bits:
+            return True
+        elif new_config.bits > current_config.bits:
+            return False
+        
+        # Same bits - prefer smaller group size (more memory savings)
+        if new_config.group_size < current_config.group_size:
+            return True
+        elif new_config.group_size > current_config.group_size:
+            return False
+        
+        # Same bits and group size - prefer better error metric
+        return new_config.error_metric < current_config.error_metric
+    
     def _separate_layer_types(self, block):
         """Separate attention and MLP layers in a transformer block."""
         attention_layers = []
@@ -367,7 +375,7 @@ class PrecisionOptimizer:
             print(f"        Combined sensitivity = {performance['current_combined_sensitivity']:.4f}, threshold = {performance['threshold_combined_sensitivity']:.4f}")
             
             if performance['under_threshold']:
-                # Save this quantization configuration
+                # Create configuration for successful RTN
                 config = QuantizationConfig(
                     bits=bits,
                     group_size=group_size,
@@ -376,18 +384,14 @@ class PrecisionOptimizer:
                     memory_savings=self._estimate_memory_savings(bits, group_size)
                 )
                 
-                # Store quantized wrapper if it's better than existing
-                saved = self._save_block_quantization_if_better(block_name, config, rtn_wrapper)
+                # Use unified success handling
+                success = self._handle_successful_quantization(block_name, config, rtn_wrapper, current_block)
                 
-                # If not saved (not better), clean up the wrapper
-                if not saved:
-                    rtn_wrapper.cleanup()
-                    
-                # Always restore original state after testing
+                # Always clean up the wrapper and restore original state
+                rtn_wrapper.cleanup()
                 self._restore_block_state(block_name, current_block)
                 
                 # Force GPU cleanup after RTN test
-                import torch
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 
@@ -398,7 +402,6 @@ class PrecisionOptimizer:
                 rtn_wrapper.cleanup()
                 
                 # Force GPU cleanup after failed test
-                import torch
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 
@@ -469,6 +472,45 @@ class PrecisionOptimizer:
         """Legacy function - redirects to memory-based saving."""
         return self._save_block_quantization_if_better(block_name, config, quantized_block)
         
+    def _handle_successful_quantization(self, block_name: str, config: QuantizationConfig, quantized_module, original_block):
+        """
+        Unified handler for successful quantization (both RTN and training).
+        
+        Args:
+            block_name: Name of the quantized block
+            config: Quantization configuration
+            quantized_module: The quantized module (RTNWrapper or wrapped module)
+            original_block: Original block to restore after saving
+            
+        Returns:
+            True if quantization was saved, False otherwise
+        """
+        try:
+            # Convert wrapped module to final quantized form if needed
+            if hasattr(quantized_module, 'wrapped_module'):
+                # This is from training - unwrap to get final quantized module
+                final_quantized_module = unified_unwrapper(quantized_module, apply_quantization=True)
+            elif hasattr(quantized_module, 'wrapped_block'):
+                # This is RTNWrapper - get the quantized block
+                final_quantized_module = quantized_module.wrapped_block
+            else:
+                # Already in final form
+                final_quantized_module = quantized_module
+            
+            # Save the quantized configuration if it's better than existing
+            saved = self._save_block_quantization_if_better(block_name, config, final_quantized_module)
+            
+            if saved:
+                print(f"        ✓ Successfully saved {config.method} {config.bits}-bit quantization for {block_name}")
+            else:
+                print(f"        → Existing quantization is better for {block_name}")
+                
+            return saved
+            
+        except Exception as e:
+            print(f"        ⚠ Failed to save quantization for {block_name}: {e}")
+            return False
+    
     def _restore_block_state(self, block_name: str, previous_block):
         """Restore block to previous state."""
         set_module_by_name(self.model, block_name, previous_block)
@@ -687,14 +729,7 @@ class PrecisionOptimizer:
             print(f"        Combined sensitivity = {performance['current_combined_sensitivity']:.4f}, threshold = {performance['threshold_combined_sensitivity']:.4f}")
             
             if performance['under_threshold']:
-                # Step 6: Convert to final quantized form and save
-                finalized_block = finalize_wrapped_model(self.model, {block_name: wrapper_info})
-                finalized_block_module = get_module_by_name(finalized_block, block_name)
-                
-                # Replace in our model
-                set_module_by_name(self.model, block_name, finalized_block_module)
-                
-                # Save configuration
+                # Create configuration for successful training
                 config = QuantizationConfig(
                     bits=bits,
                     group_size=group_size,
@@ -709,7 +744,8 @@ class PrecisionOptimizer:
                     memory_savings=self._estimate_memory_savings(bits, group_size)
                 )
                 
-                self._save_block_quantization_if_better(block_name, config, finalized_block_module)
+                # Use unified success handling
+                success = self._handle_successful_quantization(block_name, config, wrapper_info['wrapped_module'], current_block)
                 
                 return True, performance['ppl_increase']
             else:
@@ -912,8 +948,6 @@ class PrecisionOptimizer:
             
     def _calculate_kl_divergence_between_outputs(self, outputs1, outputs2):
         """Calculate KL divergence between two sets of block outputs."""
-        import torch.nn.functional as F
-        
         try:
             if not outputs1 or not outputs2 or len(outputs1) != len(outputs2):
                 return 0.0
@@ -1234,28 +1268,27 @@ class PrecisionOptimizer:
         LAYER RECOVERY ALGORITHM:
         ========================
         Purpose: Get block to pass quality budget when normal quantization fails
-        Constraint: ONLY run at minimum group size (last resort)
+        Strategy: Works at ANY group size - problematic layers frozen at minimal group size
         
         Steps:
         1. Analyze Impact: Test each layer - revert to 8-bit, measure perplexity improvement
         2. Exponential Search: Try reverting 1→2→4→8 layers until quality budget met
-        3. Mixed Training: Retrain with some layers 8-bit, others at target precision
+        3. Mixed Training: Retrain with some layers 8-bit (min group size), others at target precision
         4. Freeze Layers: Mark problematic layers as frozen (won't quantize further)
-        5. Save Config: Mixed precision config (some 4-bit, some 8-bit)
+        5. Save Config: Mixed precision config with optimal group sizes per layer
         
-        Quality Focus: Ignore memory usage - that's optimized later globally
+        Quality Focus: Maximize compression while staying within budget
         """
-        # CRITICAL: Only run at minimum group size
-        if group_size > self.min_group_size:
-            print(f"        Skipping layer recovery: group_size={group_size} > min={self.min_group_size}")
-            return False, float('inf')
+        # Layer recovery can now work at any group size
+        # Frozen layers will be set to minimal group size regardless of current quantization level
+        print(f"        Layer recovery enabled at group_size={group_size} (frozen layers will use min_group_size={self.min_group_size})")
         
         block_name = self._find_block_name(block)
-        print(f"        Starting layer recovery for {block_name}: {bits}-bit at min group_size={group_size}")
+        print(f"        Starting layer recovery for {block_name}: {bits}-bit at group_size={group_size}")
         
         try:
             # Phase 1: Analyze which layers impact quality most (sorted by impact)
-            layer_impacts = self._analyze_layer_quality_impact(block, bits, group_size)
+            layer_impacts = self._analyze_layer_quality_impact(block)
             
             if not layer_impacts:
                 print(f"        No layers found for recovery analysis")
@@ -1464,8 +1497,6 @@ class PrecisionOptimizer:
         
     def _train_wrapper_respecting_frozen_layers(self, module_name, wrapped_module, block_inputs, iters, lr, batch_size, is_single_layer):
         """Unified training function that automatically excludes frozen layers from optimizer."""
-        import torch
-        
         # Get frozen layer names for this block
         frozen_layer_names = self._get_frozen_layer_names_for_block(module_name)
         
