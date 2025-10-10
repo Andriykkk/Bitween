@@ -406,15 +406,12 @@ class PrecisionOptimizer:
             True if quantization was saved, False otherwise
         """
         try:
-            # Keep wrapped modules as-is, don't unwrap until final model building
-            if hasattr(quantized_module, 'wrapped_module'):
-                # This is from training - keep the wrapped module
-                final_quantized_module = quantized_module
-            elif hasattr(quantized_module, 'wrapped_block'):
-                # This is RTNWrapper - get the wrapped block (still contains WrapperLinear)
+            # Now both RTN and training paths provide QuantizedLinear modules
+            if hasattr(quantized_module, 'wrapped_block'):
+                # This is RTNWrapper - get the wrapped block (contains QuantizedLinear)
                 final_quantized_module = quantized_module.wrapped_block
             else:
-                # Already in correct form
+                # Already in correct form (QuantizedLinear block from training conversion)
                 final_quantized_module = quantized_module
             
             # Save the quantized configuration if it's better than existing
@@ -431,6 +428,28 @@ class PrecisionOptimizer:
             print(f"        ⚠ Failed to save quantization for {block_name}: {e}")
             return False
     
+    def _convert_wrappers_to_quantized(self, module):
+        """Convert all WrapperLinear modules to QuantizedLinear for consistency."""
+        import copy
+        
+        # Create a copy to avoid modifying the original
+        converted_module = copy.deepcopy(module)
+        
+        # Find and replace all WrapperLinear with QuantizedLinear
+        for name, submodule in list(converted_module.named_modules()):
+            if isinstance(submodule, WrapperLinear):
+                # Convert WrapperLinear to QuantizedLinear
+                quantized_layer = submodule.to_quantized_linear()
+                
+                # Replace in the converted module
+                if name:  # Skip root module
+                    set_module_by_name(converted_module, name, quantized_layer)
+                else:
+                    # This is the root module itself
+                    converted_module = quantized_layer
+        
+        return converted_module
+        
     def _restore_block_state(self, block_name: str, previous_block):
         """Restore block to previous state."""
         set_module_by_name(self.model, block_name, previous_block)
@@ -704,8 +723,11 @@ class PrecisionOptimizer:
                     memory_savings=self._estimate_memory_savings(bits, group_size)
                 )
                 
+                # Convert WrapperLinear to QuantizedLinear for consistency
+                quantized_module = self._convert_wrappers_to_quantized(wrapper_info['wrapped_module'])
+                
                 # Use unified success handling
-                success = self._handle_successful_quantization(block_name, config, wrapper_info['wrapped_module'], current_block)
+                success = self._handle_successful_quantization(block_name, config, quantized_module, current_block)
                 
                 return True, performance['ppl_increase']
             else:
@@ -748,7 +770,7 @@ class PrecisionOptimizer:
         all_layers = attention_layers + mlp_layers
         
         print(f"        Analyzing {len(attention_layers)} attention + {len(mlp_layers)} MLP layers...")
-        print(f"        Reverting to saved {self.block_quantizations[block_name].method} {self.block_quantizations[block_name].bits}-bit quantization")
+        print(f"        Reverting to original unquantized layers for impact analysis")
         
         # Use the cached data passed from the calling function
         if not cached_data:
@@ -766,7 +788,7 @@ class PrecisionOptimizer:
             print(f"          Testing impact of reverting {layer_name}...")
             
             try:
-                # Measure actual impact by reverting layer to saved quantized state
+                # Measure actual impact by reverting layer to saved quantized state  
                 quality_improvement = self._measure_layer_reversion_impact(block_name, layer_name, cached_data, baseline_outputs, saved_quantized_block)
                 
                 layer_type = "attention" if any(keyword in layer_name.lower() 
@@ -889,20 +911,24 @@ class PrecisionOptimizer:
             # Get current layer from the actual block
             current_layer = get_module_by_name(actual_current_block, layer_name)
             
-            # Get saved layer from saved block (also unwrapped if needed)
-            if hasattr(saved_quantized_block, 'wrapped_block'):
-                actual_saved_block = saved_quantized_block.wrapped_block
-            else:
-                actual_saved_block = saved_quantized_block
+            # Get original layer from the original model reference
+            if self.original_model is None:
+                print(f"            No original model available for {layer_name}")
+                return None
                 
-            saved_layer = get_module_by_name(actual_saved_block, layer_name)
+            original_layer_path = f"{block_name}.{layer_name}"
+            original_layer = get_module_by_name(self.original_model, original_layer_path)
             
-            if saved_layer is None:
-                print(f"            Could not find saved layer for {layer_name}")
+            if original_layer is None:
+                print(f"            Could not find original layer {original_layer_path}")
                 return None
             
+            # Move original layer to same device as current block and ensure proper dtype
+            device = next(actual_current_block.parameters()).device
+            original_layer = original_layer.to(device=device, dtype=torch.float16)
+            
             # Temporarily replace layer in the actual block
-            set_module_by_name(actual_current_block, layer_name, saved_layer)
+            set_module_by_name(actual_current_block, layer_name, original_layer)
             
             # Get outputs with reverted layer
             reverted_outputs = self._get_block_outputs_on_cached_samples(block_name, cached_samples)
@@ -1200,7 +1226,8 @@ class PrecisionOptimizer:
                 is_single_layer=wrapper_info['is_single_layer']
             )
             
-            return wrapped_block
+            # Convert WrapperLinear to QuantizedLinear for consistency
+            return self._convert_wrappers_to_quantized(wrapped_block)
             
         except Exception as e:
             print(f"          Mixed precision retraining failed: {e}")
