@@ -230,8 +230,20 @@ class PrecisionOptimizer:
         attention_layers = []
         mlp_layers = []
         
-        for name, module in block.named_modules():
-            if isinstance(module, torch.nn.Linear):
+        # Handle wrapped blocks - get the actual block
+        actual_block = block
+        if hasattr(block, 'wrapped_block'):
+            actual_block = block.wrapped_block
+        elif hasattr(block, 'wrapped_module'):
+            actual_block = block.wrapped_module
+        
+        for name, module in actual_block.named_modules():
+            # Look for WrapperLinear, torch.nn.Linear, and QuantizedLinear modules
+            if isinstance(module, (torch.nn.Linear, QuantizedLinear, WrapperLinear)):
+                # Skip empty names (the root module itself)
+                if not name:
+                    continue
+                    
                 # Simple heuristic to identify layer types
                 if any(keyword in name.lower() for keyword in ['attn', 'attention', 'query', 'key', 'value']):
                     attention_layers.append((name, module))
@@ -394,15 +406,15 @@ class PrecisionOptimizer:
             True if quantization was saved, False otherwise
         """
         try:
-            # Convert wrapped module to final quantized form if needed
+            # Keep wrapped modules as-is, don't unwrap until final model building
             if hasattr(quantized_module, 'wrapped_module'):
-                # This is from training - unwrap to get final quantized module
-                final_quantized_module = unified_unwrapper(quantized_module, apply_quantization=True)
+                # This is from training - keep the wrapped module
+                final_quantized_module = quantized_module
             elif hasattr(quantized_module, 'wrapped_block'):
-                # This is RTNWrapper - get the quantized block
+                # This is RTNWrapper - get the wrapped block (still contains WrapperLinear)
                 final_quantized_module = quantized_module.wrapped_block
             else:
-                # Already in final form
+                # Already in correct form
                 final_quantized_module = quantized_module
             
             # Save the quantized configuration if it's better than existing
@@ -448,8 +460,8 @@ class PrecisionOptimizer:
         
         layer_count = 0
         for name, module in actual_block.named_modules():
-            # Check for both regular Linear and QuantizedLinear modules
-            if isinstance(module, (torch.nn.Linear, QuantizedLinear)):
+            # Check for Linear, QuantizedLinear, and WrapperLinear modules
+            if isinstance(module, (torch.nn.Linear, QuantizedLinear, WrapperLinear)):
                 # Get layer name relative to block
                 layer_name = name
                 layer_count += 1
@@ -484,12 +496,14 @@ class PrecisionOptimizer:
                 
         return total_memory
         
-    def _calculate_layer_memory(self, layer: Union[torch.nn.Linear, QuantizedLinear], bits: int, group_size: int) -> float:
+    def _calculate_layer_memory(self, layer: Union[torch.nn.Linear, QuantizedLinear, WrapperLinear], bits: int, group_size: int) -> float:
         """Calculate memory usage for a single layer in MB."""
         # Get dimensions based on layer type
         if isinstance(layer, QuantizedLinear):
             out_features = layer.out_features
             in_features = layer.in_features
+        elif isinstance(layer, WrapperLinear):
+            out_features, in_features = layer.orig_layer.weight.shape
         else:
             out_features, in_features = layer.weight.shape
         
@@ -506,7 +520,10 @@ class PrecisionOptimizer:
         
         # Bias (if present)
         bias_memory = 0
-        if hasattr(layer, 'bias') and layer.bias is not None:
+        if isinstance(layer, WrapperLinear):
+            if layer.orig_layer.bias is not None:
+                bias_memory = out_features * 4  # float32 bias
+        elif hasattr(layer, 'bias') and layer.bias is not None:
             bias_memory = out_features * 4  # float32 bias
             
         total_memory_bytes = quantized_weight_memory + scale_memory + zp_memory + bias_memory
@@ -841,6 +858,10 @@ class PrecisionOptimizer:
                     # Get current block
                     block = get_module_by_name(self.model, block_name)
                     
+                    # Ensure input tensor is on same device as model
+                    device = next(block.parameters()).device
+                    input_tensor = input_tensor.to(device)
+                    
                     # Forward through block
                     output = block(input_tensor)
                     if isinstance(output, tuple):
@@ -858,32 +879,45 @@ class PrecisionOptimizer:
         """Get block outputs with one layer temporarily reverted to saved quantized state."""
         
         try:
-            # Get current layer
-            current_layer = get_module_by_name(self.model, f"{block_name}.{layer_name}")
+            # Get the actual block (unwrapped)
+            current_block = get_module_by_name(self.model, block_name)
+            if hasattr(current_block, 'wrapped_block'):
+                actual_current_block = current_block.wrapped_block
+            else:
+                actual_current_block = current_block
             
-            # Get saved quantized layer
-            saved_layer = get_module_by_name(saved_quantized_block, layer_name)
+            # Get current layer from the actual block
+            current_layer = get_module_by_name(actual_current_block, layer_name)
+            
+            # Get saved layer from saved block (also unwrapped if needed)
+            if hasattr(saved_quantized_block, 'wrapped_block'):
+                actual_saved_block = saved_quantized_block.wrapped_block
+            else:
+                actual_saved_block = saved_quantized_block
+                
+            saved_layer = get_module_by_name(actual_saved_block, layer_name)
             
             if saved_layer is None:
                 print(f"            Could not find saved layer for {layer_name}")
                 return None
             
-            # Temporarily replace with saved quantized layer
-            set_module_by_name(self.model, f"{block_name}.{layer_name}", saved_layer)
+            # Temporarily replace layer in the actual block
+            set_module_by_name(actual_current_block, layer_name, saved_layer)
             
             # Get outputs with reverted layer
             reverted_outputs = self._get_block_outputs_on_cached_samples(block_name, cached_samples)
             
             # Restore current layer
-            set_module_by_name(self.model, f"{block_name}.{layer_name}", current_layer)
+            set_module_by_name(actual_current_block, layer_name, current_layer)
             
             return reverted_outputs
             
         except Exception as e:
             print(f"            Error getting outputs with reverted layer {layer_name}: {e}")
-            # Make sure to restore current layer on error
+            # Try to restore current layer if something went wrong
             try:
-                set_module_by_name(self.model, f"{block_name}.{layer_name}", current_layer)
+                if 'actual_current_block' in locals() and 'current_layer' in locals() and current_layer is not None:
+                    set_module_by_name(actual_current_block, layer_name, current_layer)
             except:
                 pass
             return None
@@ -1592,10 +1626,15 @@ class PrecisionOptimizer:
             target_device = next(self.model.parameters()).device
             
             for block_name, quantized_block in self.quantized_blocks.items():
-                print(f"  Applying quantized block: {block_name} (loading from CPU to GPU)")
-                # Load quantized block from CPU to GPU and apply to model
+                print(f"  Applying quantized block: {block_name} (loading from CPU to GPU and unwrapping)")
+                # Load quantized block from CPU to GPU
                 quantized_block_gpu = quantized_block.to(target_device)
-                self._replace_block_in_model(block_name, quantized_block_gpu)
+                
+                # Now unwrap WrapperLinear to QuantizedLinear for final model (in-place)
+                final_block = unified_unwrapper(quantized_block_gpu, apply_quantization=True)
+                
+                # Apply to model
+                self._replace_block_in_model(block_name, final_block)
                 
             print(f"✅ Applied {len(self.quantized_blocks)} quantized blocks to model")
         else:
@@ -1603,6 +1642,32 @@ class PrecisionOptimizer:
             
         return self.model
         
+    def _unwrap_block_to_quantized_linear(self, wrapped_block):
+        """Convert a block with WrapperLinear modules to QuantizedLinear modules."""
+        import copy
+        
+        # Create a copy of the block
+        final_block = copy.deepcopy(wrapped_block)
+        
+        # Convert all WrapperLinear modules to QuantizedLinear
+        for name, module in list(final_block.named_modules()):
+            if isinstance(module, WrapperLinear):
+                # Convert wrapper to QuantizedLinear
+                quantized_layer = module.to_quantized_linear()
+                
+                # Replace in the block
+                if '.' in name:
+                    # Nested module
+                    parent_name = '.'.join(name.split('.')[:-1])
+                    child_name = name.split('.')[-1]
+                    parent_module = dict(final_block.named_modules())[parent_name]
+                    setattr(parent_module, child_name, quantized_layer)
+                else:
+                    # Direct child
+                    setattr(final_block, name, quantized_layer)
+        
+        return final_block
+    
     def _replace_block_in_model(self, block_name: str, quantized_block):
         """Replace a block in the model with its quantized version."""
         parts = block_name.split('.')
