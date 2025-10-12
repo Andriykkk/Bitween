@@ -759,14 +759,17 @@ class PrecisionOptimizer:
                 pass
             return False, float('inf')
         
-    def _analyze_layer_quality_impact(self, block, cached_data):
+    def _analyze_layer_quality_impact(self, block, cached_data, block_name=None):
         """Analyze quality impact of reverting each layer to previously saved quantized state."""
         layer_impacts = []
-        
-        block_name = self._find_block_name(block)
+        print("####", block_name)
+        # Use provided block_name or try to find it
+        if block_name is None:
+            block_name = self._find_block_name(block)
         if not block_name:
             return []
-            
+        
+        print(f"        Analyzing layer quality impact for {block_name}", self.block_quantizations)
         # Check if we have a previously saved working quantized block to revert to
         if block_name not in self.block_quantizations:
             print(f"        No previously saved quantization for {block_name} - cannot do layer recovery")
@@ -779,6 +782,9 @@ class PrecisionOptimizer:
         
         # Use existing function to separate layer types
         attention_layers, mlp_layers = self._separate_layer_types(block)
+        
+        print(f"        🔧 DEBUG: Found {len(attention_layers)} attention layers: {[name for name, _ in attention_layers]}")
+        print(f"        🔧 DEBUG: Found {len(mlp_layers)} MLP layers: {[name for name, _ in mlp_layers]}")
         
         # Test attention layers first (usually more sensitive), then MLP layers
         all_layers = attention_layers + mlp_layers
@@ -1377,27 +1383,16 @@ class PrecisionOptimizer:
             block_name = self._find_block_name(block)
         print(f"        Starting layer recovery for {block_name}: {bits}-bit at group_size={group_size}")
         
-        # Debug: check what block we received for layer recovery
-        print(f"        🔧 DEBUG: Layer recovery received block type: {type(block)}")
-        
         # Unwrap to get actual block
         actual_block = block
         if hasattr(block, 'wrapped_block'):
             actual_block = block.wrapped_block
-            print(f"        🔧 DEBUG: Unwrapped to: {type(actual_block)}")
         elif hasattr(block, 'wrapped_module'):
             actual_block = block.wrapped_module
-            print(f"        🔧 DEBUG: Unwrapped to: {type(actual_block)}")
-        
-        # Debug: check what types of layers are in the block
-        print(f"        🔧 DEBUG: Layer types in block for recovery:")
-        for name, submodule in actual_block.named_modules():
-            if 'proj' in name or 'fc' in name:
-                print(f"        🔧 DEBUG: {name}: {type(submodule)}")
         
         try:
             # Phase 1: Analyze which layers impact quality most (sorted by impact)
-            layer_impacts = self._analyze_layer_quality_impact(block, cached_data)
+            layer_impacts = self._analyze_layer_quality_impact(block, cached_data, block_name)
             print("######### LAYER IMPACTS:", layer_impacts)
             # if not layer_impacts:
             #     print(f"        No layers found for recovery analysis")
