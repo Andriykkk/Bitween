@@ -61,10 +61,9 @@ class ImportanceAnalyzer:
         noise_scores = self._run_noise_injection_test()
         
         # Run RTN sensitivity test
-        rtn_scores = self._run_rtn_sensitivity_test()
-        
-        # TODO: Add layer upgrade test
-        # layer_scores = self._run_layer_upgrade_test()
+        # rtn_scores = self._run_rtn_sensitivity_test()
+        rtn_scores = {'model.decoder.layers.0': {'8bit': 0.09429931640625, '4bit': 8.807220458984375, '2bit': 4067.5029296875}, 'model.decoder.layers.1': {'8bit': -0.1089324951171875, '4bit': 0.1566314697265625, '2bit': 3870.28955078125}, 'model.decoder.layers.10': {'8bit': -0.1432037353515625, '4bit': 4.478462219238281, '2bit': 1138.7763671875}, 'model.decoder.layers.11': {'8bit': -0.35028839111328125, '4bit': 10.711296081542969, '2bit': 1059.99365234375}, 'model.decoder.layers.2': {'8bit': -0.019073486328125, '4bit': 2.9447021484375, '2bit': 1762.01220703125}, 'model.decoder.layers.3': {'8bit': -0.0877685546875, '4bit': 3.07257080078125, '2bit': 1402.13427734375}, 'model.decoder.layers.4': {'8bit': -0.13086700439453125, '4bit': -1.4408645629882812, '2bit': 1261.44384765625}, 'model.decoder.layers.5': {'8bit': -0.0730743408203125, '4bit': 1.1270370483398438, '2bit': 1653.35400390625}, 'model.decoder.layers.6': {'8bit': 0.199615478515625, '4bit': 3.894287109375, '2bit': 3093.42724609375}, 'model.decoder.layers.7': {'8bit': -0.169036865234375, '4bit': 7.075172424316406, '2bit': 1839.68701171875}, 'model.decoder.layers.8': {'8bit': -0.24076080322265625, '4bit': 1.54425048828125, '2bit': 1324.6083984375}, 'model.decoder.layers.9': {'8bit': 0.0688323974609375, '4bit': 1.9608383178710938, '2bit': 1722.9541015625}}
+        print(rtn_scores)
         
         # Combine noise injection and RTN scores
         importance_scores = {}

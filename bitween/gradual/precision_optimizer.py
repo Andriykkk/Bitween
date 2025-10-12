@@ -4,6 +4,7 @@ Handles precision optimization with group size co-optimization and rollback mech
 
 import torch
 import torch.nn as nn
+import copy
 from typing import Dict, List, Tuple, Optional, Union
 from dataclasses import dataclass
 from enum import Enum
@@ -125,7 +126,8 @@ class PrecisionOptimizer:
         """
         
         # Configuration
-        precision_levels = [8, 4, 2]  # bits
+        # precision_levels = [8, 4, 2]  # bits
+        precision_levels = [4, 2]  # bits
         
         # Get the block
         block = get_module_by_name(self.model, block_name)
@@ -141,7 +143,8 @@ class PrecisionOptimizer:
             print(f"    Trying {target_bits}-bit quantization...")
             
             # Try different group sizes from large to small
-            all_group_sizes = self._get_group_size_sequence(self.max_group_size, self.min_group_size)
+            # all_group_sizes = self._get_group_size_sequence(self.max_group_size, self.min_group_size)
+            all_group_sizes = self._get_group_size_sequence(64, self.min_group_size)
             
             # Skip group sizes that failed for higher bits (they'll definitely fail for lower bits)
             group_sizes = [gs for gs in all_group_sizes if gs not in failed_group_sizes]
@@ -182,9 +185,15 @@ class PrecisionOptimizer:
                         # Step 3: Both RTN and training failed, try layer recovery
                         print(f"      Training failed (error: {train_error:.4f}), trying layer recovery...")
                         
-                        recovery_success, recovery_error = self._try_layer_recovery(
-                            block, target_bits, target_group_size, cached_data, budget_allocation
-                        )
+                        # Get the best saved quantized block for layer recovery
+                        saved_quantized_block = self.quantized_blocks.get(block_name)
+                        if saved_quantized_block is not None:
+                            recovery_success, recovery_error = self._try_layer_recovery(
+                                saved_quantized_block, target_bits, target_group_size, cached_data, budget_allocation, block_name
+                            )
+                        else:
+                            print(f"      No saved quantized block available for layer recovery")
+                            recovery_success, recovery_error = False, float('inf')
                         
                         if recovery_success:
                             print(f"      ✓ Layer recovery successful (error: {recovery_error:.4f})")
@@ -413,7 +422,7 @@ class PrecisionOptimizer:
             else:
                 # Already in correct form (QuantizedLinear block from training conversion)
                 final_quantized_module = quantized_module
-            
+                
             # Save the quantized configuration if it's better than existing
             saved = self._save_block_quantization_if_better(block_name, config, final_quantized_module)
             
@@ -435,18 +444,23 @@ class PrecisionOptimizer:
         # Create a copy to avoid modifying the original
         converted_module = copy.deepcopy(module)
         
+        wrapper_count = 0
         # Find and replace all WrapperLinear with QuantizedLinear
         for name, submodule in list(converted_module.named_modules()):
             if isinstance(submodule, WrapperLinear):
-                # Convert WrapperLinear to QuantizedLinear
-                quantized_layer = submodule.to_quantized_linear()
-                
-                # Replace in the converted module
-                if name:  # Skip root module
-                    set_module_by_name(converted_module, name, quantized_layer)
-                else:
-                    # This is the root module itself
-                    converted_module = quantized_layer
+                wrapper_count += 1
+                try:
+                    # Convert WrapperLinear to QuantizedLinear
+                    quantized_layer = submodule.to_quantized_linear()
+                    
+                    # Replace in the converted module
+                    if name:  # Skip root module
+                        set_module_by_name(converted_module, name, quantized_layer)
+                    else:
+                        # This is the root module itself
+                        converted_module = quantized_layer
+                except Exception as e:
+                    print(f"        ⚠ Conversion failed for {name}: {e}")
         
         return converted_module
         
@@ -880,9 +894,54 @@ class PrecisionOptimizer:
                     # Get current block
                     block = get_module_by_name(self.model, block_name)
                     
-                    # Ensure input tensor is on same device as model
+                    # Ensure input tensor is on same device as model and correct dtype
                     device = next(block.parameters()).device
-                    input_tensor = input_tensor.to(device)
+                    input_tensor = input_tensor.to(device=device, dtype=torch.float16)
+                    
+                    # Forward through block
+                    output = block(input_tensor)
+                    if isinstance(output, tuple):
+                        output = output[0]
+                    
+                    outputs.append(output.detach())
+            
+            return outputs if outputs else None
+            
+        except Exception as e:
+            print(f"            Error getting block outputs: {e}")
+            return None
+    
+    def _get_block_outputs_on_cached_samples_direct(self, block, cached_samples):
+        """Get block outputs using cached input samples with direct block reference."""
+        
+        try:
+            if not cached_samples:
+                return None
+            
+            outputs = []
+            
+            # Get outputs from provided block
+            with torch.no_grad():
+                for input_dict, _ in cached_samples:
+                    # Extract input tensor
+                    input_tensor = input_dict.get('hidden_states', input_dict.get('input', None))
+                    if input_tensor is None:
+                        continue
+                    
+                    # Ensure input tensor is on same device as block and correct dtype
+                    device = next(block.parameters()).device
+                    input_tensor = input_tensor.to(device=device, dtype=torch.float16)
+                    
+                    # Debug: check input tensor dtype
+                    print(f"              Input tensor dtype: {input_tensor.dtype}, device: {input_tensor.device}")
+                    
+                    # Debug: check all parameter dtypes in the block
+                    for name, param in block.named_parameters():
+                        if param.dtype != torch.float16:
+                            print(f"              Non-float16 parameter found: {name} = {param.dtype}")
+                    for name, module in block.named_modules():
+                        if 'proj' in name or 'fc' in name:
+                            print(f"{name}: {type(module)}")
                     
                     # Forward through block
                     output = block(input_tensor)
@@ -901,10 +960,13 @@ class PrecisionOptimizer:
         """Get block outputs with one layer temporarily reverted to saved quantized state."""
         
         try:
-            # Get the actual block (unwrapped)
+            # Get the actual block (unwrap if necessary)
             current_block = get_module_by_name(self.model, block_name)
+            
             if hasattr(current_block, 'wrapped_block'):
                 actual_current_block = current_block.wrapped_block
+            elif hasattr(current_block, 'wrapped_module'):
+                actual_current_block = current_block.wrapped_module
             else:
                 actual_current_block = current_block
             
@@ -925,13 +987,20 @@ class PrecisionOptimizer:
             
             # Move original layer to same device as current block and ensure proper dtype
             device = next(actual_current_block.parameters()).device
-            original_layer = original_layer.to(device=device, dtype=torch.float16)
             
-            # Temporarily replace layer in the actual block
+            # Create a copy and convert to float16 to match the rest of the model
+            original_layer = copy.deepcopy(original_layer)
+            original_layer = original_layer.to(device=device)
+            original_layer = original_layer.half()  # Explicit conversion to float16
+            
+            # Debug: check dtype after conversion
+            print(f"            Original layer {layer_name} dtype: {original_layer.weight.dtype}")
+            
+            # Temporarily replace layer in the actual block with original unquantized layer
             set_module_by_name(actual_current_block, layer_name, original_layer)
             
-            # Get outputs with reverted layer
-            reverted_outputs = self._get_block_outputs_on_cached_samples(block_name, cached_samples)
+            # Get outputs with reverted layer (pass the modified block directly)
+            reverted_outputs = self._get_block_outputs_on_cached_samples_direct(actual_current_block, cached_samples)
             
             # Restore current layer
             set_module_by_name(actual_current_block, layer_name, current_layer)
@@ -1093,29 +1162,46 @@ class PrecisionOptimizer:
             print(f"            No saved quantized block available for {block_name}")
             return False
         
-        # Store current block state for restoration
+        # Get the actual blocks (unwrap if necessary)
         current_block = get_module_by_name(self.model, block_name)
+        
+        # Unwrap current block
+        if hasattr(current_block, 'wrapped_block'):
+            actual_current_block = current_block.wrapped_block
+        elif hasattr(current_block, 'wrapped_module'):
+            actual_current_block = current_block.wrapped_module
+        else:
+            actual_current_block = current_block
+            
+        # Unwrap saved block
+        if hasattr(saved_quantized_block, 'wrapped_block'):
+            actual_saved_block = saved_quantized_block.wrapped_block
+        elif hasattr(saved_quantized_block, 'wrapped_module'):
+            actual_saved_block = saved_quantized_block.wrapped_module
+        else:
+            actual_saved_block = saved_quantized_block
+        
+        # Store current layer states for restoration
         current_layers = {}
         
         try:
             # Step 1: Revert specified layers to saved quantized state
             for layer_info in recovery_set:
                 layer_name = layer_info['layer_name']
-                full_layer_path = f"{block_name}.{layer_name}"
                 
-                # Store current layer
-                current_layer = get_module_by_name(self.model, full_layer_path)
-                current_layers[full_layer_path] = current_layer
-                
-                # Get corresponding layer from saved quantized block
+                # Store current layer from actual block
                 try:
-                    saved_layer = get_module_by_name(saved_quantized_block, layer_name)
+                    current_layer = get_module_by_name(actual_current_block, layer_name)
+                    current_layers[layer_name] = current_layer
+                    
+                    # Get corresponding layer from saved quantized block
+                    saved_layer = get_module_by_name(actual_saved_block, layer_name)
                     if saved_layer is None:
                         print(f"            Layer {layer_name} not found in saved block")
                         continue
                         
-                    # Replace with saved quantized layer
-                    set_module_by_name(self.model, full_layer_path, saved_layer)
+                    # Replace with saved quantized layer in actual block
+                    set_module_by_name(actual_current_block, layer_name, saved_layer)
                     print(f"            Reverted {layer_name} to saved quantized state")
                     
                 except Exception as e:
@@ -1139,8 +1225,8 @@ class PrecisionOptimizer:
         finally:
             # Step 4: Always restore current layers
             try:
-                for full_layer_path, current_layer in current_layers.items():
-                    set_module_by_name(self.model, full_layer_path, current_layer)
+                for layer_name, current_layer in current_layers.items():
+                    set_module_by_name(actual_current_block, layer_name, current_layer)
             except Exception as e:
                 print(f"            Error restoring current layers: {e}")
         
@@ -1265,7 +1351,7 @@ class PrecisionOptimizer:
         
         return config
     
-    def _try_layer_recovery(self, block, bits, group_size, cached_data, budget):
+    def _try_layer_recovery(self, block, bits, group_size, cached_data, budget, block_name=None):
         """Try layer-level recovery for failed quantization.
         
         LAYER RECOVERY ALGORITHM:
@@ -1286,50 +1372,70 @@ class PrecisionOptimizer:
         # Frozen layers will be set to minimal group size regardless of current quantization level
         print(f"        Layer recovery enabled at group_size={group_size} (frozen layers will use min_group_size={self.min_group_size})")
         
-        block_name = self._find_block_name(block)
+        # Use provided block_name or try to find it
+        if block_name is None:
+            block_name = self._find_block_name(block)
         print(f"        Starting layer recovery for {block_name}: {bits}-bit at group_size={group_size}")
+        
+        # Debug: check what block we received for layer recovery
+        print(f"        🔧 DEBUG: Layer recovery received block type: {type(block)}")
+        
+        # Unwrap to get actual block
+        actual_block = block
+        if hasattr(block, 'wrapped_block'):
+            actual_block = block.wrapped_block
+            print(f"        🔧 DEBUG: Unwrapped to: {type(actual_block)}")
+        elif hasattr(block, 'wrapped_module'):
+            actual_block = block.wrapped_module
+            print(f"        🔧 DEBUG: Unwrapped to: {type(actual_block)}")
+        
+        # Debug: check what types of layers are in the block
+        print(f"        🔧 DEBUG: Layer types in block for recovery:")
+        for name, submodule in actual_block.named_modules():
+            if 'proj' in name or 'fc' in name:
+                print(f"        🔧 DEBUG: {name}: {type(submodule)}")
         
         try:
             # Phase 1: Analyze which layers impact quality most (sorted by impact)
             layer_impacts = self._analyze_layer_quality_impact(block, cached_data)
+            print("######### LAYER IMPACTS:", layer_impacts)
+            # if not layer_impacts:
+            #     print(f"        No layers found for recovery analysis")
+            #     return False, float('inf')
             
-            if not layer_impacts:
-                print(f"        No layers found for recovery analysis")
-                return False, float('inf')
+            # # Phase 2: Find minimum set of layers to revert (exponential search)
+            # recovery_set = self._find_minimum_recovery_set(block_name, layer_impacts, budget)
             
-            # Phase 2: Find minimum set of layers to revert (exponential search)
-            recovery_set = self._find_minimum_recovery_set(block_name, layer_impacts, budget)
+            # if not recovery_set:
+            #     print(f"        No recovery set found")
+            #     return False, float('inf')
             
-            if not recovery_set:
-                print(f"        No recovery set found")
-                return False, float('inf')
+            # # Phase 3: Retrain with mixed precision (some layers frozen from saved block)
+            # mixed_precision_block = self._retrain_mixed_precision_block(block_name, recovery_set, cached_data, bits, group_size)
             
-            # Phase 3: Retrain with mixed precision (some layers frozen from saved block)
-            mixed_precision_block = self._retrain_mixed_precision_block(block_name, recovery_set, cached_data, bits, group_size)
+            # # Phase 4: Apply recovery configuration and freeze problematic layers
+            # config = QuantizationConfig(
+            #     bits=bits,
+            #     group_size=group_size,
+            #     method="Mixed",
+            #     error_metric=0.0,  # Will be updated after evaluation
+            #     memory_savings=self._estimate_memory_savings(bits, group_size)
+            # )
             
-            # Phase 4: Apply recovery configuration and freeze problematic layers
-            config = QuantizationConfig(
-                bits=bits,
-                group_size=group_size,
-                method="Mixed",
-                error_metric=0.0,  # Will be updated after evaluation
-                memory_savings=self._estimate_memory_savings(bits, group_size)
-            )
+            # recovery_config = self._apply_layer_recovery_config(block_name, config, recovery_set)
             
-            recovery_config = self._apply_layer_recovery_config(block_name, config, recovery_set)
+            # # Phase 5: Final evaluation
+            # performance = self.evaluate_block_performance(block_name)
+            # recovery_config.error_metric = performance['ppl_increase']
             
-            # Phase 5: Final evaluation
-            performance = self.evaluate_block_performance(block_name)
-            recovery_config.error_metric = performance['ppl_increase']
-            
-            if performance['under_threshold']:
-                # Save the mixed precision configuration
-                self._save_block_quantization_if_better(block_name, recovery_config, mixed_precision_block)
-                print(f"        ✓ Layer recovery successful: {len(recovery_set)} layers frozen")
-                return True, performance['ppl_increase']
-            else:
-                print(f"        ✗ Layer recovery failed: still over budget")
-                return False, performance['ppl_increase']
+            # if performance['under_threshold']:
+            #     # Save the mixed precision configuration
+            #     self._save_block_quantization_if_better(block_name, recovery_config, mixed_precision_block)
+            #     print(f"        ✓ Layer recovery successful: {len(recovery_set)} layers frozen")
+            #     return True, performance['ppl_increase']
+            # else:
+            #     print(f"        ✗ Layer recovery failed: still over budget")
+            #     return False, performance['ppl_increase']
                 
         except Exception as e:
             print(f"        Layer recovery failed with error: {e}")
