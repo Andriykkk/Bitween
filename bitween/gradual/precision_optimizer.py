@@ -850,32 +850,6 @@ class PrecisionOptimizer:
         except Exception as e:
             print(f"        Error getting cached data for {block_name}: {e}")
             return []
-        
-    def _measure_layer_reversion_impact(self, block_name, layer_name, cached_data, baseline_outputs, saved_quantized_block):
-        """Measure KL divergence reduction from reverting a layer to saved quantized state."""
-        try:
-            # Use same samples as baseline
-            validation_samples = cached_data[:self.evaluation_samples]
-            
-            if not validation_samples:
-                print(f"            No validation samples available for {layer_name}")
-                return 0.0
-            
-            # Get outputs with layer reverted to saved quantized state
-            reverted_outputs = self._get_block_outputs_with_reverted_layer_from_saved(block_name, layer_name, validation_samples, saved_quantized_block)
-            
-            if reverted_outputs is None:
-                return 0.0
-            
-            # Calculate KL divergence between reverted and current failed quantization outputs
-            kl_divergence = self._calculate_kl_divergence_between_outputs(reverted_outputs, baseline_outputs)
-            
-            # Higher KL divergence = more impact from this layer
-            return kl_divergence
-            
-        except Exception as e:
-            print(f"            Failed to measure impact for {layer_name}: {e}")
-            return 0.0
     
     def _measure_layer_quantization_impact(self, original_working_block, quantized_block, layer_name, cached_data, baseline_outputs):
         """Measure quality impact from quantizing a single layer (progressive quantization approach)."""
@@ -893,62 +867,39 @@ class PrecisionOptimizer:
                 print(f"            Could not find quantized layer {layer_name}")
                 return 0.0
             
-            # Get outputs with original layer replaced by quantized version
-            quantized_outputs = self._get_block_outputs_with_original_layer(original_working_block, layer_name, validation_samples, quantized_layer)
+            # Replace the original layer with quantized layer temporarily
+            if '.' in layer_name:
+                parent_name, attr_name = layer_name.rsplit('.', 1)
+                parent_module = getattr(original_working_block, parent_name)
+                original_layer = getattr(parent_module, attr_name)
+                setattr(parent_module, attr_name, quantized_layer)
+            else:
+                original_layer = getattr(original_working_block, layer_name)
+                setattr(original_working_block, layer_name, quantized_layer)
+            
+            # Get outputs with quantized layer
+            quantized_outputs = self._get_block_outputs_on_cached_samples_direct(original_working_block, validation_samples)
+            
+            # Restore original layer
+            if '.' in layer_name:
+                parent_name, attr_name = layer_name.rsplit('.', 1)
+                parent_module = getattr(original_working_block, parent_name)
+                setattr(parent_module, attr_name, original_layer)
+            else:
+                setattr(original_working_block, layer_name, original_layer)
             
             if quantized_outputs is None:
                 return 0.0
             
-            # Calculate both KL divergence and MSE for comparison
-            kl_divergence = self._calculate_kl_divergence_between_outputs(quantized_outputs, baseline_outputs)
-            mse_diff = self._calculate_mse_between_outputs(quantized_outputs, baseline_outputs)
-            
-            # Debug: check output shapes and values
-            if len(quantized_outputs) > 0 and len(baseline_outputs) > 0:
-                quant_mean = quantized_outputs[0].mean().item()
-                base_mean = baseline_outputs[0].mean().item()
-                print(f"              Layer {layer_name}: quantized_mean={quant_mean:.6f}, baseline_mean={base_mean:.6f}, kl={kl_divergence:.8f}, mse={mse_diff:.8f}")
+            # Calculate MSE between hidden states (more appropriate than KL for embeddings)
+            mse_divergence = self._calculate_mse_between_outputs(quantized_outputs, baseline_outputs)
             
             # Higher MSE = more negative impact from quantizing this layer
-            return mse_diff
+            return mse_divergence
         
         except Exception as e:
             print(f"            Error measuring layer quantization impact for {layer_name}: {e}")
             return 0.0
-
-    def _get_block_outputs_with_original_layer(self, quantized_block, layer_name, cached_samples, original_layer):
-        """Get block outputs with one layer temporarily reverted to original unquantized state."""
-        try:
-            # Create a temporary copy of the quantized block
-            temp_block = copy.deepcopy(quantized_block)
-            
-            # Move to GPU if available and convert entire block to half precision
-            device = 'cuda' if torch.cuda.is_available() else 'cpu'
-            temp_block = temp_block.to(device=device, dtype=torch.float16)
-            
-            # Convert original layer to half precision and move to GPU
-            original_layer = original_layer.to(device=device, dtype=torch.float16)
-            
-            # Replace the quantized layer with original layer (handle nested attributes)
-            if '.' in layer_name:
-                parent_name, attr_name = layer_name.rsplit('.', 1)
-                parent_module = getattr(temp_block, parent_name)
-                setattr(parent_module, attr_name, original_layer)
-            else:
-                setattr(temp_block, layer_name, original_layer)
-            
-            # Debug: verify the replacement worked
-            replaced_layer = get_module_by_name(temp_block, layer_name)
-            print(f"              Replaced {layer_name}: {type(replaced_layer)}")
-            
-            # Get outputs from the modified block
-            outputs = self._get_block_outputs_on_cached_samples_direct(temp_block, cached_samples)
-            
-            return outputs
-            
-        except Exception as e:
-            print(f"            Error getting outputs with original layer {layer_name}: {e}")
-            return None 
         
     def _get_block_outputs_on_cached_samples_direct(self, block, cached_samples):
         """Get block outputs using cached input samples with direct block reference."""
@@ -982,68 +933,7 @@ class PrecisionOptimizer:
         except Exception as e:
             print(f"            Error getting block outputs: {e}")
             return None
-        
-    def _get_block_outputs_with_reverted_layer_from_saved(self, block_name, layer_name, cached_samples, saved_quantized_block):
-        """Get block outputs with one layer temporarily reverted to saved quantized state."""
-        
-        try:
-            # Get the actual block (unwrap if necessary)
-            current_block = get_module_by_name(self.model, block_name)
-            
-            if hasattr(current_block, 'wrapped_block'):
-                actual_current_block = current_block.wrapped_block
-            elif hasattr(current_block, 'wrapped_module'):
-                actual_current_block = current_block.wrapped_module
-            else:
-                actual_current_block = current_block
-            
-            # Get current layer from the actual block
-            current_layer = get_module_by_name(actual_current_block, layer_name)
-            
-            # Get original layer from the original model reference
-            if self.original_model is None:
-                print(f"            No original model available for {layer_name}")
-                return None
-                
-            original_layer_path = f"{block_name}.{layer_name}"
-            original_layer = get_module_by_name(self.original_model, original_layer_path)
-            
-            if original_layer is None:
-                print(f"            Could not find original layer {original_layer_path}")
-                return None
-            
-            # Move original layer to same device as current block and ensure proper dtype
-            device = next(actual_current_block.parameters()).device
-            
-            # Create a copy and convert to float16 to match the rest of the model
-            original_layer = copy.deepcopy(original_layer)
-            original_layer = original_layer.to(device=device)
-            original_layer = original_layer.half()  # Explicit conversion to float16
-            
-            # Debug: check dtype after conversion
-            print(f"            Original layer {layer_name} dtype: {original_layer.weight.dtype}")
-            
-            # Temporarily replace layer in the actual block with original unquantized layer
-            set_module_by_name(actual_current_block, layer_name, original_layer)
-            
-            # Get outputs with reverted layer (pass the modified block directly)
-            reverted_outputs = self._get_block_outputs_on_cached_samples_direct(actual_current_block, cached_samples)
-            
-            # Restore current layer
-            set_module_by_name(actual_current_block, layer_name, current_layer)
-            
-            return reverted_outputs
-            
-        except Exception as e:
-            print(f"            Error getting outputs with reverted layer {layer_name}: {e}")
-            # Try to restore current layer if something went wrong
-            try:
-                if 'actual_current_block' in locals() and 'current_layer' in locals() and current_layer is not None:
-                    set_module_by_name(actual_current_block, layer_name, current_layer)
-            except:
-                pass
-            return None
-            
+ 
     def _calculate_kl_divergence_between_outputs(self, outputs1, outputs2):
         """Calculate KL divergence between two sets of block outputs."""
         try:
@@ -1140,61 +1030,198 @@ class PrecisionOptimizer:
             print(f"            Failed to create original layer: {e}")
             return None
         
-    def _find_minimum_recovery_set(self, block_name, sorted_layer_impacts, budget):
-        """Find minimum set of layers to revert using exponential search.
+    def _find_minimum_recovery_set(self, quantized_block, block_name, sorted_layer_impacts, budget):
+        """Find minimum set of layers to replace with layers from saved quantized block.
         
         Algorithm:
-        1. Try reverting 1 layer → evaluate whole model → pass/fail?
-        2. Try reverting 2 layers → evaluate whole model → pass/fail?
-        3. Try reverting 4 layers → evaluate whole model → pass/fail?
-        4. Continue with 8, 16, etc. until success or all layers tested
-        5. Return minimum working set
+        1. Exponential search: 1, 2, 4, 8, 16... layers until success
+        2. Binary search between last_failed and first_success to find exact minimum
+        3. Replace layers from quantized_block with layers from saved_quantized_block
         """
-        print(f"        Starting exponential search for minimum recovery set...")
+        print(f"        Finding minimal recovery set for {block_name}...")
         
         if not sorted_layer_impacts:
             print(f"        No layers to recover")
             return []
+            
+        # Check if we have a saved quantized block
+        if block_name not in self.quantized_blocks:
+            print(f"        No saved quantized block available for {block_name}")
+            return []
         
-        # Exponential search: 1, 2, 4, 8, 16, ...
+        saved_quantized_block = self.quantized_blocks[block_name]
+        
+        # Store original model block for restoration at the end
+        original_model_block = get_module_by_name(self.model, block_name)
+        
+        # Phase 1: Exponential search to find upper bound
         recovery_count = 1
-        best_working_set = None
+        last_failed = 0
+        first_success = None
         
+        print(f"        Phase 1: Exponential search...")
         while recovery_count <= len(sorted_layer_impacts):
-            # Get top N layers to revert
             recovery_set = sorted_layer_impacts[:recovery_count]
             layer_names = [layer['layer_name'] for layer in recovery_set]
             
-            print(f"          Testing recovery set of {recovery_count} layers: {layer_names[:3]}{'...' if len(layer_names) > 3 else ''}")
+            print(f"          Testing {recovery_count} layers: {layer_names[:3]}{'...' if len(layer_names) > 3 else ''}")
             
             try:
-                # Temporarily revert these layers and evaluate whole model
-                meets_budget = self._test_recovery_set(block_name, recovery_set)
+                meets_budget = self._test_mixed_block_with_recovery_layers(
+                    quantized_block, saved_quantized_block, block_name, recovery_set
+                )
                 
                 if meets_budget:
-                    print(f"          ✓ Recovery set of {recovery_count} layers meets budget")
-                    best_working_set = recovery_set
-                    break  # Found minimum working set
+                    print(f"          ✓ SUCCESS with {recovery_count} layers")
+                    first_success = recovery_count
+                    break
                 else:
-                    print(f"          ✗ Recovery set of {recovery_count} layers fails budget")
+                    print(f"          ✗ Failed with {recovery_count} layers")
+                    last_failed = recovery_count
                     
             except Exception as e:
-                print(f"          Error testing recovery set of {recovery_count} layers: {e}")
+                print(f"          Error testing {recovery_count} layers: {e}")
+                last_failed = recovery_count
             
             # Exponential progression: 1 → 2 → 4 → 8 → 16...
             recovery_count *= 2
         
-        if best_working_set:
-            print(f"        Found minimum recovery set: {len(best_working_set)} layers")
-            return best_working_set
-        else:
-            # If no subset works, try all layers as last resort
-            print(f"        No subset works, trying all {len(sorted_layer_impacts)} layers")
-            if self._test_recovery_set(block_name, sorted_layer_impacts):
-                return sorted_layer_impacts
+        if first_success is None:
+            # Try all layers as last resort
+            print(f"        Exponential search failed, trying all {len(sorted_layer_impacts)} layers")
+            recovery_set = sorted_layer_impacts
+            if self._test_mixed_block_with_recovery_layers(quantized_block, saved_quantized_block, block_name, recovery_set):
+                return recovery_set
             else:
-                print(f"        Complete layer recovery failed")
+                print(f"        Complete recovery failed")
                 return []
+        
+        # Phase 2: Binary search to find exact minimum
+        print(f"        Phase 2: Binary search between {last_failed} and {first_success}")
+        left = last_failed + 1
+        right = first_success
+        best_count = first_success
+        
+        while left < right:
+            mid = (left + right) // 2
+            recovery_set = sorted_layer_impacts[:mid]
+            
+            print(f"          Binary testing {mid} layers")
+            
+            try:
+                meets_budget = self._test_mixed_block_with_recovery_layers(
+                    quantized_block, saved_quantized_block, block_name, recovery_set
+                )
+                
+                if meets_budget:
+                    print(f"          ✓ SUCCESS with {mid} layers - trying fewer")
+                    best_count = mid
+                    right = mid
+                else:
+                    print(f"          ✗ Failed with {mid} layers - need more")
+                    left = mid + 1
+                    
+            except Exception as e:
+                print(f"          Error testing {mid} layers: {e}")
+                left = mid + 1
+        
+        final_recovery_set = sorted_layer_impacts[:best_count]
+        
+        # Create final quantized block with recovery layers applied
+        final_quantized_block = copy.deepcopy(quantized_block)
+        for layer_info in final_recovery_set:
+            layer_name = layer_info['layer_name']
+            saved_layer = get_module_by_name(saved_quantized_block, layer_name)
+            if saved_layer is not None:
+                set_module_by_name(final_quantized_block, layer_name, saved_layer)
+        
+        print(f"        Found minimal recovery set: {best_count} layers")
+        
+        # Restore original model block after all testing
+        set_module_by_name(self.model, block_name, original_model_block)
+        
+        return final_recovery_set, final_quantized_block
+        
+    def _find_optimal_recovery_set(self, quantized_block, block_name, sorted_layer_impacts, budget):
+        """Find optimal recovery set by trying both ascending and descending impact order."""
+        print(f"        Comparing ascending vs descending impact order...")
+        
+        # Try ascending order (most impactful first)
+        print(f"        → Trying ASCENDING order (most impactful first)...")
+        recovery_set_asc, block_asc = self._find_minimum_recovery_set(
+            quantized_block, block_name, sorted_layer_impacts, budget
+        )
+        
+        # Try descending order (least impactful first) 
+        print(f"        → Trying DESCENDING order (least impactful first)...")
+        recovery_set_desc, block_desc = self._find_minimum_recovery_set(
+            quantized_block, block_name, sorted_layer_impacts[::-1], budget
+        )
+        
+        # Compare memory usage of both approaches
+        if recovery_set_asc and recovery_set_desc:
+            # Create temporary configs for memory calculation
+            config_asc = QuantizationConfig(bits=4, group_size=64, method="Mixed", error_metric=0.0)
+            config_desc = QuantizationConfig(bits=4, group_size=64, method="Mixed", error_metric=0.0)
+            
+            memory_asc = self._calculate_block_memory_usage(block_asc, config_asc)
+            memory_desc = self._calculate_block_memory_usage(block_desc, config_desc)
+            
+            print(f"        Memory comparison:")
+            print(f"          Ascending: {len(recovery_set_asc)} layers, {memory_asc:.1f}MB")
+            print(f"          Descending: {len(recovery_set_desc)} layers, {memory_desc:.1f}MB")
+            
+            if memory_asc <= memory_desc:
+                print(f"        → Using ascending order (better memory efficiency)")
+                return recovery_set_asc, block_asc
+            else:
+                print(f"        → Using descending order (better memory efficiency)")
+                return recovery_set_desc, block_desc
+        elif recovery_set_asc:
+            print(f"        → Using ascending order (only working solution)")
+            return recovery_set_asc, block_asc
+        elif recovery_set_desc:
+            print(f"        → Using descending order (only working solution)")
+            return recovery_set_desc, block_desc
+        else:
+            print(f"        → Both directions failed")
+            return [], None
+        
+    def _test_mixed_block_with_recovery_layers(self, quantized_block, saved_quantized_block, block_name, recovery_set):
+        """Test if mixed block meets budget by replacing layers from saved block."""
+        if not recovery_set:
+            return False
+            
+        # Store original layers for restoration
+        original_layers = {}
+        
+        try:
+            # Replace specified layers with layers from saved block
+            for layer_info in recovery_set:
+                layer_name = layer_info['layer_name']
+                
+                # Store original layer from quantized block
+                original_layer = get_module_by_name(quantized_block, layer_name)
+                original_layers[layer_name] = original_layer
+                
+                # Get layer from saved block and replace
+                saved_layer = get_module_by_name(saved_quantized_block, layer_name)
+                if saved_layer is not None:
+                    set_module_by_name(quantized_block, layer_name, saved_layer)
+            
+            # Put mixed quantized_block in model and test
+            set_module_by_name(self.model, block_name, quantized_block)
+            
+            # Test performance
+            performance = self.evaluate_block_performance(block_name)
+            meets_budget = performance['under_threshold']
+            
+            return meets_budget
+            
+        finally:
+            # Restore original layers in quantized block
+            for layer_name, original_layer in original_layers.items():
+                set_module_by_name(quantized_block, layer_name, original_layer)
                 
     def _test_recovery_set(self, block_name, recovery_set):
         """Test if reverting a set of layers to previous saved quantized state meets the quality budget.
@@ -1441,9 +1468,18 @@ class PrecisionOptimizer:
             
             try:
                 # Phase 1: Analyze which layers impact quality most by progressive quantization
-                # Pass quantized block, working block, and cached data
                 layer_impacts = self._analyze_layer_quality_impact(quantized_block, working_block, cached_data, block_name)
-                print("######### LAYER IMPACTS:", layer_impacts)
+
+                if not layer_impacts:
+                    print(f"        No layers found for recovery analysis")
+                    return False, float('inf')
+                
+                # Phase 2: Find optimal recovery set (try both directions)
+                recovery_set, mixed_precision_block = self._find_optimal_recovery_set(quantized_block, block_name, layer_impacts, budget)
+                
+                if not recovery_set:
+                    print(f"        No recovery set found")
+                    return False, float('inf')
                 
             finally:
                 # Clean up working block
@@ -1454,16 +1490,7 @@ class PrecisionOptimizer:
             # Temporary return for debugging
             return False, float('inf')
             
-            # if not layer_impacts:
-            #     print(f"        No layers found for recovery analysis")
-            #     return False, float('inf')
-            
-            # # Phase 2: Find minimum set of layers to revert (exponential search)
-            # recovery_set = self._find_minimum_recovery_set(block_name, layer_impacts, budget)
-            
-            # if not recovery_set:
-            #     print(f"        No recovery set found")
-            #     return False, float('inf')
+
             
             # # Phase 3: Retrain with mixed precision (some layers reverted from saved block)
             # mixed_precision_block = self._retrain_mixed_precision_block(block_name, recovery_set, cached_data, bits, group_size)
