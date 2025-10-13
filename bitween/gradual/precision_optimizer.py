@@ -172,7 +172,7 @@ class PrecisionOptimizer:
                     # Step 2: RTN failed, try training
                     print(f"      RTN failed (error: {rtn_error:.4f}), trying trainable quantization...")
                     
-                    train_success, train_error = self._try_trainable_quantization(
+                    train_success, train_error, trained_block = self._try_trainable_quantization(
                         block_name, target_bits, target_group_size, cached_data, budget_allocation
                     )
                     
@@ -186,15 +186,21 @@ class PrecisionOptimizer:
                         # Step 3: Both RTN and training failed, try layer recovery
                         print(f"      Training failed (error: {train_error:.4f}), trying layer recovery...")
                         
-                        # Get the best saved quantized block for layer recovery
-                        saved_quantized_block = self.quantized_blocks.get(block_name)
-                        if saved_quantized_block is not None:
+                        # Use the trained block (even though it failed) for layer recovery
+                        if trained_block is not None:
                             recovery_success, recovery_error = self._try_layer_recovery(
-                                saved_quantized_block, target_bits, target_group_size, cached_data, budget_allocation, block_name
+                                trained_block, target_bits, target_group_size, cached_data, budget_allocation, block_name
                             )
                         else:
-                            print(f"      No saved quantized block available for layer recovery")
-                            recovery_success, recovery_error = False, float('inf')
+                            # Fallback to saved block if trained block is None
+                            saved_quantized_block = self.quantized_blocks.get(block_name)
+                            if saved_quantized_block is not None:
+                                recovery_success, recovery_error = self._try_layer_recovery(
+                                    saved_quantized_block, target_bits, target_group_size, cached_data, budget_allocation, block_name
+                                )
+                            else:
+                                print(f"      No saved quantized block available for layer recovery")
+                                recovery_success, recovery_error = False, float('inf')
                         
                         if recovery_success:
                             print(f"      ✓ Layer recovery successful (error: {recovery_error:.4f})")
@@ -440,14 +446,9 @@ class PrecisionOptimizer:
     
     def _convert_wrappers_to_quantized(self, module):
         """Convert all WrapperLinear modules to QuantizedLinear for consistency."""
-        import copy
-        
-        # Create a copy to avoid modifying the original
-        converted_module = copy.deepcopy(module)
-        
         wrapper_count = 0
         # Find and replace all WrapperLinear with QuantizedLinear
-        for name, submodule in list(converted_module.named_modules()):
+        for name, submodule in list(module.named_modules()):
             if isinstance(submodule, WrapperLinear):
                 wrapper_count += 1
                 try:
@@ -456,14 +457,14 @@ class PrecisionOptimizer:
                     
                     # Replace in the converted module
                     if name:  # Skip root module
-                        set_module_by_name(converted_module, name, quantized_layer)
+                        set_module_by_name(module, name, quantized_layer)
                     else:
                         # This is the root module itself
-                        converted_module = quantized_layer
+                        module = quantized_layer
                 except Exception as e:
                     print(f"        ⚠ Conversion failed for {name}: {e}")
         
-        return converted_module
+        return module
         
     def _restore_block_state(self, block_name: str, previous_block):
         """Restore block to previous state."""
@@ -744,12 +745,11 @@ class PrecisionOptimizer:
                 # Use unified success handling
                 success = self._handle_successful_quantization(block_name, config, quantized_module, current_block)
                 
-                return True, performance['ppl_increase']
+                return True, performance['ppl_increase'], quantized_module
             else:
-                # Training failed - restore previous state
-                self._restore_block_state(block_name, current_block)
+                quantized_module = self._convert_wrappers_to_quantized(wrapper_info['wrapped_module'])
                 
-                return False, performance['ppl_increase']
+                return False, performance['ppl_increase'], quantized_module
                 
         except Exception as e:
             print(f"        Training quantization failed: {e}")
@@ -758,53 +758,51 @@ class PrecisionOptimizer:
                 self._restore_block_state(block_name, current_block)
             except:
                 pass
-            return False, float('inf')
+            return False, float('inf'), None
         
-    def _analyze_layer_quality_impact(self, block, cached_data, block_name):
-        """Analyze quality impact of reverting each layer from saved quantized block to original."""
+    def _analyze_layer_quality_impact(self, quantized_block, working_block, cached_data, block_name):
+        """Analyze quality impact by progressively quantizing layers from working block."""
         layer_impacts = []
         
         print(f"        Analyzing layer quality impact for {block_name}")
+        print(f"        Progressive quantization: start with original, quantize layers one by one")
         
-        # Move saved block to GPU for Triton kernels, store original device
-        original_device = next(block.parameters()).device
+        # Move quantized block to GPU and unwrap to get QuantizedLinear layers
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        block = block.to(device=device, dtype=torch.float16)
+        if hasattr(quantized_block, 'wrapped_block'):
+            quantized_block = quantized_block.wrapped_block
+        elif hasattr(quantized_block, 'wrapped_module'):
+            quantized_block = quantized_block.wrapped_module
+        quantized_block = quantized_block.to(device=device, dtype=torch.float16)
         
         try:
-            # Unwrap to get the actual quantized block with QuantizedLinear layers
-            if hasattr(block, 'wrapped_block'):
-                block = block.wrapped_block
-            elif hasattr(block, 'wrapped_module'):
-                block = block.wrapped_module
-            
-            # Use existing function to separate layer types on the quantized block
-            attention_layers, mlp_layers = self._separate_layer_types(block)
+            # Use existing function to separate layer types on original block
+            attention_layers, mlp_layers = self._separate_layer_types(working_block)
             
             # Test attention layers first (usually more sensitive), then MLP layers
             all_layers = attention_layers + mlp_layers
             
             print(f"        Analyzing {len(attention_layers)} attention + {len(mlp_layers)} MLP layers...")
-            print(f"        Reverting to original unquantized layers for impact analysis")
+            print(f"        Progressive quantization: measure impact of quantizing each layer")
             
             # Use the cached data passed from the calling function
             if not cached_data:
                 print(f"        No cached data available for {block_name}")
                 return []
             
-            # Get baseline outputs with current quantized block (calculate once)
-            baseline_outputs = self._get_block_outputs_on_cached_samples_direct(block, cached_data[:self.evaluation_samples])
+            # Get baseline outputs with original block (all layers unquantized)
+            baseline_outputs = self._get_block_outputs_on_cached_samples_direct(working_block, cached_data[:self.evaluation_samples])
             
             for layer_name, layer_module in all_layers:
                 # Skip if layer is already frozen
                 if self.is_layer_frozen(block_name, layer_name):
                     continue
                     
-                print(f"          Testing impact of reverting {layer_name}...")
+                print(f"          Testing impact of quantizing {layer_name}...")
                 
                 try:
-                    # Measure actual impact by reverting layer to original unquantized state
-                    quality_improvement = self._measure_layer_reversion_to_original(block, layer_name, cached_data, baseline_outputs, block_name)
+                    # Measure actual impact by replacing original layer with quantized version
+                    quality_impact = self._measure_layer_quantization_impact(working_block, quantized_block, layer_name, cached_data, baseline_outputs)
                     
                     layer_type = "attention" if any(keyword in layer_name.lower() 
                                                 for keyword in ['attn', 'attention', 'query', 'key', 'value']) else "mlp"
@@ -812,10 +810,10 @@ class PrecisionOptimizer:
                     layer_impacts.append({
                         'layer_name': layer_name,
                         'layer_type': layer_type,
-                        'quality_improvement': quality_improvement,
+                        'quality_improvement': quality_impact,
                     })
                     
-                    print(f"            {layer_name} ({layer_type}): improvement={quality_improvement:.4f}")
+                    print(f"            {layer_name} ({layer_type}): quantization_impact={quality_impact:.4f}")
                     
                 except Exception as e:
                     print(f"            Failed to analyze {layer_name}: {e}")
@@ -827,9 +825,9 @@ class PrecisionOptimizer:
             print(f"        Layer analysis complete. Top layer: {layer_impacts[0]['layer_name'] if layer_impacts else 'None'}")
             return layer_impacts
                 
-        finally:
-            # Move block back to original device (CPU) to save memory
-            block = block.to(original_device)
+        except Exception as e:
+            print(f"        Error in layer analysis: {e}")
+            return []
         
     def _get_cached_data_for_block(self, block_name):
         """Get cached training data for a specific block from the training manager."""
@@ -879,8 +877,8 @@ class PrecisionOptimizer:
             print(f"            Failed to measure impact for {layer_name}: {e}")
             return 0.0
     
-    def _measure_layer_reversion_to_original(self, quantized_block, layer_name, cached_data, baseline_outputs, block_name):
-        """Measure KL divergence reduction from reverting a layer to original unquantized state."""
+    def _measure_layer_quantization_impact(self, original_working_block, quantized_block, layer_name, cached_data, baseline_outputs):
+        """Measure quality impact from quantizing a single layer (progressive quantization approach)."""
         try:
             # Use same samples as baseline
             validation_samples = cached_data[:self.evaluation_samples]
@@ -889,39 +887,33 @@ class PrecisionOptimizer:
                 print(f"            No validation samples available for {layer_name}")
                 return 0.0
             
-            # Get original layer from the original model reference
-            if self.original_model is None:
-                print(f"            No original model available for {layer_name}")
-                return 0.0
-                
-            original_layer_path = f"{block_name}.{layer_name}"
-            original_layer = get_module_by_name(self.original_model, original_layer_path)
-            
-            if original_layer is None:
-                print(f"            Could not find original layer {original_layer_path}")
+            # Get the quantized layer from the quantized block
+            quantized_layer = get_module_by_name(quantized_block, layer_name)
+            if quantized_layer is None:
+                print(f"            Could not find quantized layer {layer_name}")
                 return 0.0
             
-            # Get outputs with layer reverted to original unquantized state
-            reverted_outputs = self._get_block_outputs_with_original_layer(quantized_block, layer_name, validation_samples, original_layer)
+            # Get outputs with original layer replaced by quantized version
+            quantized_outputs = self._get_block_outputs_with_original_layer(original_working_block, layer_name, validation_samples, quantized_layer)
             
-            if reverted_outputs is None:
+            if quantized_outputs is None:
                 return 0.0
             
             # Calculate both KL divergence and MSE for comparison
-            kl_divergence = self._calculate_kl_divergence_between_outputs(reverted_outputs, baseline_outputs)
-            mse_diff = self._calculate_mse_between_outputs(reverted_outputs, baseline_outputs)
+            kl_divergence = self._calculate_kl_divergence_between_outputs(quantized_outputs, baseline_outputs)
+            mse_diff = self._calculate_mse_between_outputs(quantized_outputs, baseline_outputs)
             
             # Debug: check output shapes and values
-            if len(reverted_outputs) > 0 and len(baseline_outputs) > 0:
-                rev_mean = reverted_outputs[0].mean().item()
+            if len(quantized_outputs) > 0 and len(baseline_outputs) > 0:
+                quant_mean = quantized_outputs[0].mean().item()
                 base_mean = baseline_outputs[0].mean().item()
-                print(f"              Layer {layer_name}: reverted_mean={rev_mean:.6f}, baseline_mean={base_mean:.6f}, kl={kl_divergence:.8f}, mse={mse_diff:.8f}")
+                print(f"              Layer {layer_name}: quantized_mean={quant_mean:.6f}, baseline_mean={base_mean:.6f}, kl={kl_divergence:.8f}, mse={mse_diff:.8f}")
             
-            # Use MSE as it's more sensitive to magnitude differences with quantization
+            # Higher MSE = more negative impact from quantizing this layer
             return mse_diff
         
         except Exception as e:
-            print(f"            Error measuring layer reversion to original for {layer_name}: {e}")
+            print(f"            Error measuring layer quantization impact for {layer_name}: {e}")
             return 0.0
 
     def _get_block_outputs_with_original_layer(self, quantized_block, layer_name, cached_samples, original_layer):
@@ -1412,7 +1404,7 @@ class PrecisionOptimizer:
         
         return config
     
-    def _try_layer_recovery(self, block, bits, group_size, cached_data, budget, block_name):
+    def _try_layer_recovery(self, quantized_block, bits, group_size, cached_data, budget, block_name):
         """Try layer-level recovery for failed quantization using saved quantized block.
         
         LAYER RECOVERY ALGORITHM:
@@ -1433,9 +1425,31 @@ class PrecisionOptimizer:
         print(f"        Starting layer recovery for {block_name}: {bits}-bit at group_size={group_size}")
         
         try:
-            # Phase 1: Analyze which layers impact quality most (sorted by impact)
-            layer_impacts = self._analyze_layer_quality_impact(block, cached_data, block_name)
-            print("######### LAYER IMPACTS:", layer_impacts)
+            # Get original block from original model for comparison
+            if self.original_model is None:
+                print(f"        No original model available for layer recovery")
+                return False, float('inf')
+            
+            original_block = get_module_by_name(self.original_model, block_name)
+            if original_block is None:
+                print(f"        Could not find original block {block_name}")
+                return False, float('inf')
+            
+            # Create working copy of original block for analysis
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            working_block = copy.deepcopy(original_block).to(device=device, dtype=torch.float16)
+            
+            try:
+                # Phase 1: Analyze which layers impact quality most by progressive quantization
+                # Pass quantized block, working block, and cached data
+                layer_impacts = self._analyze_layer_quality_impact(quantized_block, working_block, cached_data, block_name)
+                print("######### LAYER IMPACTS:", layer_impacts)
+                
+            finally:
+                # Clean up working block
+                del working_block
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             
             # Temporary return for debugging
             return False, float('inf')
