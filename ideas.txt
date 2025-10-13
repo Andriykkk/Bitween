@@ -1,4 +1,6 @@
 [ ] add gradual quantisation
+    [ ] remove hardcoded values for bits, rtn analys and group
+    [ ] remove if .wrapper and move block to 16 bit for quantization
     [ ] in the end run training quantization for whole model to check everything and also try to increase freeze layers group size
     [ ] move quantized blocks to ram and move to eval mode
     [ ] make usual algorithm that remove layers that have too high error and could not learn and some layers learn to lover bits

@@ -4,6 +4,7 @@ Handles precision optimization with group size co-optimization and rollback mech
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import copy
 from typing import Dict, List, Tuple, Optional, Union
 from dataclasses import dataclass
@@ -768,7 +769,7 @@ class PrecisionOptimizer:
         # Move saved block to GPU for Triton kernels, store original device
         original_device = next(block.parameters()).device
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        block = block.to(device)
+        block = block.to(device=device, dtype=torch.float16)
         
         try:
             # Unwrap to get the actual quantized block with QuantizedLinear layers
@@ -906,11 +907,18 @@ class PrecisionOptimizer:
             if reverted_outputs is None:
                 return 0.0
             
-            # Calculate KL divergence between reverted and current quantized outputs
+            # Calculate both KL divergence and MSE for comparison
             kl_divergence = self._calculate_kl_divergence_between_outputs(reverted_outputs, baseline_outputs)
+            mse_diff = self._calculate_mse_between_outputs(reverted_outputs, baseline_outputs)
             
-            # Higher KL divergence = more impact from this layer
-            return kl_divergence
+            # Debug: check output shapes and values
+            if len(reverted_outputs) > 0 and len(baseline_outputs) > 0:
+                rev_mean = reverted_outputs[0].mean().item()
+                base_mean = baseline_outputs[0].mean().item()
+                print(f"              Layer {layer_name}: reverted_mean={rev_mean:.6f}, baseline_mean={base_mean:.6f}, kl={kl_divergence:.8f}, mse={mse_diff:.8f}")
+            
+            # Use MSE as it's more sensitive to magnitude differences with quantization
+            return mse_diff
         
         except Exception as e:
             print(f"            Error measuring layer reversion to original for {layer_name}: {e}")
@@ -922,13 +930,24 @@ class PrecisionOptimizer:
             # Create a temporary copy of the quantized block
             temp_block = copy.deepcopy(quantized_block)
             
-            # Move to GPU if available
+            # Move to GPU if available and convert entire block to half precision
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
-            temp_block = temp_block.to(device)
-            original_layer = original_layer.to(device)
+            temp_block = temp_block.to(device=device, dtype=torch.float16)
             
-            # Replace the quantized layer with original layer
-            setattr(temp_block, layer_name, original_layer)
+            # Convert original layer to half precision and move to GPU
+            original_layer = original_layer.to(device=device, dtype=torch.float16)
+            
+            # Replace the quantized layer with original layer (handle nested attributes)
+            if '.' in layer_name:
+                parent_name, attr_name = layer_name.rsplit('.', 1)
+                parent_module = getattr(temp_block, parent_name)
+                setattr(parent_module, attr_name, original_layer)
+            else:
+                setattr(temp_block, layer_name, original_layer)
+            
+            # Debug: verify the replacement worked
+            replaced_layer = get_module_by_name(temp_block, layer_name)
+            print(f"              Replaced {layer_name}: {type(replaced_layer)}")
             
             # Get outputs from the modified block
             outputs = self._get_block_outputs_on_cached_samples_direct(temp_block, cached_samples)
@@ -937,45 +956,8 @@ class PrecisionOptimizer:
             
         except Exception as e:
             print(f"            Error getting outputs with original layer {layer_name}: {e}")
-            return None
-            
-    def _get_block_outputs_on_cached_samples(self, block_name, cached_samples):
-        """Get block outputs using cached input samples."""
+            return None 
         
-        try:
-            if not cached_samples:
-                return None
-            
-            outputs = []
-            
-            # Get outputs from current block
-            with torch.no_grad():
-                for input_dict, _ in cached_samples:
-                    # Extract input tensor
-                    input_tensor = input_dict.get('hidden_states', input_dict.get('input', None))
-                    if input_tensor is None:
-                        continue
-                    
-                    # Get current block
-                    block = get_module_by_name(self.model, block_name)
-                    
-                    # Ensure input tensor is on same device as model and correct dtype
-                    device = next(block.parameters()).device
-                    input_tensor = input_tensor.to(device=device, dtype=torch.float16)
-                    
-                    # Forward through block
-                    output = block(input_tensor)
-                    if isinstance(output, tuple):
-                        output = output[0]
-                    
-                    outputs.append(output.detach())
-            
-            return outputs if outputs else None
-            
-        except Exception as e:
-            print(f"            Error getting block outputs: {e}")
-            return None
-    
     def _get_block_outputs_on_cached_samples_direct(self, block, cached_samples):
         """Get block outputs using cached input samples with direct block reference."""
         
@@ -992,17 +974,9 @@ class PrecisionOptimizer:
                     input_tensor = input_dict.get('hidden_states', input_dict.get('input', None))
                     if input_tensor is None:
                         continue
-                    
                     # Ensure input tensor is on same device as block and correct dtype
                     device = next(block.parameters()).device
                     input_tensor = input_tensor.to(device=device, dtype=torch.float16)
-                    
-                    # Debug: check input tensor dtype
-                    print(f"              Input tensor dtype: {input_tensor.dtype}, device: {input_tensor.device}")
-                    
-                    for name, module in block.named_modules():
-                        if 'proj' in name or 'fc' in name:
-                            print(f"{name}: {type(module)}")
                     
                     # Forward through block
                     output = block(input_tensor)
@@ -1109,6 +1083,32 @@ class PrecisionOptimizer:
             
         except Exception as e:
             print(f"            Error calculating KL divergence: {e}")
+            return 0.0
+    
+    def _calculate_mse_between_outputs(self, outputs1, outputs2):
+        """Calculate Mean Squared Error between two sets of block outputs."""
+        try:
+            if not outputs1 or not outputs2 or len(outputs1) != len(outputs2):
+                return 0.0
+            
+            total_mse = 0.0
+            total_elements = 0
+            
+            for out1, out2 in zip(outputs1, outputs2):
+                # Ensure same shape
+                min_shape = [min(s1, s2) for s1, s2 in zip(out1.shape, out2.shape)]
+                out1_trimmed = out1[:min_shape[0], :min_shape[1], :min_shape[2]]
+                out2_trimmed = out2[:min_shape[0], :min_shape[1], :min_shape[2]]
+                
+                # Calculate MSE
+                mse = F.mse_loss(out1_trimmed, out2_trimmed, reduction='sum')
+                total_mse += mse.item()
+                total_elements += out1_trimmed.numel()
+            
+            return total_mse / total_elements if total_elements > 0 else 0.0
+            
+        except Exception as e:
+            print(f"            Error calculating MSE: {e}")
             return 0.0
             
     def _create_original_layer_from_quantized(self, quantized_layer):
