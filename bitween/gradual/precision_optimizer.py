@@ -96,9 +96,6 @@ class PrecisionOptimizer:
         self.training_batch_size = training_batch_size
         self.training_manager = training_manager
 
-        # Move model to fp16 globally for consistent dtype across all operations
-        self.model = self.model.to(dtype=torch.float16)
-
         # Persistent state for building final quantized model
         self.block_quantizations = {}  # Store best quantization config for each block
         self.quantized_blocks = {}     # Store actual quantized block instances
@@ -485,6 +482,88 @@ class PrecisionOptimizer:
         """Simple memory savings: lower bits = less memory."""
         return (1 - bits / 32.0) * 100  # Compare to float32
         
+    def _calculate_block_memory_direct(self, block) -> float:
+        """Calculate actual memory usage of a block by inspecting each layer individually.
+
+        This directly examines layer parameters without requiring a QuantizationConfig.
+        Works for mixed blocks with both quantized and non-quantized layers.
+        """
+        total_memory = 0.0
+
+        # Unwrap to get actual block
+        actual_block = self._unwrap_module(block)
+
+        layer_count = 0
+        for name, module in actual_block.named_modules():
+            # Skip empty names (the root module itself)
+            if not name:
+                continue
+
+            # Check for Linear, QuantizedLinear, and WrapperLinear modules
+            if isinstance(module, torch.nn.Linear):
+                # Regular Linear layer - fp16
+                layer_count += 1
+                out_features, in_features = module.weight.shape
+                weight_memory = out_features * in_features * 2  # fp16 = 2 bytes
+                bias_memory = out_features * 2 if module.bias is not None else 0
+                total_memory += (weight_memory + bias_memory) / (1024 * 1024)
+
+            elif isinstance(module, QuantizedLinear):
+                # Quantized layer - calculate from actual quantized parameters
+                layer_count += 1
+                out_features = module.out_features
+                in_features = module.in_features
+
+                # Get actual quantized weight size
+                if hasattr(module, 'weight') and module.weight is not None:
+                    weight_memory = module.weight.numel() * module.weight.element_size()
+                else:
+                    weight_memory = 0
+
+                # Get scale and zero_point size
+                scale_memory = 0
+                zp_memory = 0
+                if hasattr(module, 'scale') and module.scale is not None:
+                    scale_memory = module.scale.numel() * module.scale.element_size()
+                if hasattr(module, 'zero_point') and module.zero_point is not None:
+                    zp_memory = module.zero_point.numel() * module.zero_point.element_size()
+
+                # Bias
+                bias_memory = out_features * 4 if hasattr(module, 'bias') and module.bias is not None else 0
+
+                total_memory += (weight_memory + scale_memory + zp_memory + bias_memory) / (1024 * 1024)
+
+            elif isinstance(module, WrapperLinear):
+                # WrapperLinear - calculate based on its quantization parameters
+                layer_count += 1
+                out_features, in_features = module.orig_layer.weight.shape
+
+                # Check if quantized (has quantization params)
+                if hasattr(module, 'bits') and module.bits is not None:
+                    bits = module.bits
+                    group_size = getattr(module, 'group_size', 128)
+
+                    # Quantized weights
+                    values_per_int32 = 32 // bits
+                    total_elements = out_features * in_features
+                    packed_elements = (total_elements + values_per_int32 - 1) // values_per_int32
+                    weight_memory = packed_elements * 4  # int32 = 4 bytes
+
+                    # Scale and zero_point
+                    num_groups = (in_features + group_size - 1) // group_size
+                    scale_memory = out_features * num_groups * 4  # float32
+                    zp_memory = out_features * num_groups * 4     # int32
+
+                    bias_memory = out_features * 4 if module.orig_layer.bias is not None else 0
+                    total_memory += (weight_memory + scale_memory + zp_memory + bias_memory) / (1024 * 1024)
+                else:
+                    # Not quantized, treat as fp16
+                    weight_memory = out_features * in_features * 2  # fp16
+                    bias_memory = out_features * 2 if module.orig_layer.bias is not None else 0
+                    total_memory += (weight_memory + bias_memory) / (1024 * 1024)
+
+        return total_memory
+
     def _calculate_block_memory_usage(self, quantized_block, config: QuantizationConfig) -> float:
         """Calculate actual memory usage of a quantized block in MB."""
         total_memory = 0.0
@@ -687,7 +766,7 @@ class PrecisionOptimizer:
                 return False, float('inf')
             
             wrapper_info = wrapped_info[block_name]
-            
+
             # Step 2: Convert cached_data format for training
             # cached_data is List[(input_dict, output_tensor)]
             block_inputs = []
@@ -862,27 +941,30 @@ class PrecisionOptimizer:
             if quantized_layer is None:
                 print(f"            Could not find quantized layer {layer_name}")
                 return 0.0
-            
+
             # Replace the original layer with quantized layer temporarily
+            # Convert original layer to fp16 to match quantized layer dtype
             if '.' in layer_name:
                 parent_name, attr_name = layer_name.rsplit('.', 1)
                 parent_module = getattr(original_working_block, parent_name)
                 original_layer = getattr(parent_module, attr_name)
+                original_layer_fp16 = original_layer.to(dtype=torch.float16)
                 setattr(parent_module, attr_name, quantized_layer)
             else:
                 original_layer = getattr(original_working_block, layer_name)
+                original_layer_fp16 = original_layer.to(dtype=torch.float16)
                 setattr(original_working_block, layer_name, quantized_layer)
             
             # Get outputs with quantized layer
             quantized_outputs = self._get_block_outputs_on_cached_samples_direct(original_working_block, validation_samples)
             
-            # Restore original layer
+            # Restore original layer (back to fp16 version)
             if '.' in layer_name:
                 parent_name, attr_name = layer_name.rsplit('.', 1)
                 parent_module = getattr(original_working_block, parent_name)
-                setattr(parent_module, attr_name, original_layer)
+                setattr(parent_module, attr_name, original_layer_fp16)
             else:
-                setattr(original_working_block, layer_name, original_layer)
+                setattr(original_working_block, layer_name, original_layer_fp16)
             
             if quantized_outputs is None:
                 return 0.0
@@ -913,16 +995,17 @@ class PrecisionOptimizer:
                     input_tensor = input_dict.get('hidden_states', input_dict.get('input', None))
                     if input_tensor is None:
                         continue
-                    # Ensure input tensor is on same device as block and correct dtype
+                    # Ensure input tensor is on same device as block and convert to fp16
                     device = next(block.parameters()).device
                     input_tensor = input_tensor.to(device=device, dtype=torch.float16)
-                    
+
                     # Forward through block
                     output = block(input_tensor)
                     if isinstance(output, tuple):
                         output = output[0]
-                    
-                    outputs.append(output.detach())
+
+                    # Store output in fp16 to save memory
+                    outputs.append(output.detach().to(dtype=torch.float16))
             
             return outputs if outputs else None
             
@@ -1053,12 +1136,16 @@ class PrecisionOptimizer:
 
         # Store original model block for restoration at the end
         original_model_block = get_module_by_name(self.model, block_name)
-        
+
+        # Convert model to fp16 once for all testing (quantized blocks only work in fp16)
+        print(f"        Converting model to fp16 for testing...")
+        self.model = self.model.to(dtype=torch.float16)
+
         # Phase 1: Exponential search to find upper bound
         recovery_count = 1
         last_failed = 0
         first_success = None
-        
+
         print(f"        Phase 1: Exponential search...")
         while recovery_count <= len(sorted_layer_impacts):
             recovery_set = sorted_layer_impacts[:recovery_count]
@@ -1091,9 +1178,17 @@ class PrecisionOptimizer:
             print(f"        Exponential search failed, trying all {len(sorted_layer_impacts)} layers")
             recovery_set = sorted_layer_impacts
             if self._test_mixed_block_with_recovery_layers(quantized_block, saved_quantized_block_gpu, block_name, recovery_set):
+                # Restore model block and convert back to fp32 before returning
+                set_module_by_name(self.model, block_name, original_model_block)
+                print(f"        Converting model back to fp32...")
+                self.model = self.model.to(dtype=torch.float32)
                 return recovery_set, None
             else:
                 print(f"        Complete recovery failed")
+                # Restore model block and convert back to fp32 before returning
+                set_module_by_name(self.model, block_name, original_model_block)
+                print(f"        Converting model back to fp32...")
+                self.model = self.model.to(dtype=torch.float32)
                 return [], None
 
         # Phase 2: Binary search to find exact minimum
@@ -1144,6 +1239,10 @@ class PrecisionOptimizer:
         # Restore original model block after all testing
         set_module_by_name(self.model, block_name, original_model_block)
 
+        # Convert model back to fp32 after all testing
+        print(f"        Converting model back to fp32...")
+        self.model = self.model.to(dtype=torch.float32)
+
         return final_recovery_set, final_quantized_block
         
     def _find_optimal_recovery_set(self, quantized_block, block_name, sorted_layer_impacts, budget):
@@ -1164,17 +1263,14 @@ class PrecisionOptimizer:
         
         # Compare memory usage of both approaches
         if recovery_set_asc and recovery_set_desc:
-            # Create temporary configs for memory calculation
-            config_asc = QuantizationConfig(bits=4, group_size=64, method="Mixed", error_metric=0.0)
-            config_desc = QuantizationConfig(bits=4, group_size=64, method="Mixed", error_metric=0.0)
-            
-            memory_asc = self._calculate_block_memory_usage(block_asc, config_asc)
-            memory_desc = self._calculate_block_memory_usage(block_desc, config_desc)
-            
+            # Calculate actual memory from layer parameters
+            memory_asc = self._calculate_block_memory_direct(block_asc)
+            memory_desc = self._calculate_block_memory_direct(block_desc)
+
             print(f"        Memory comparison:")
             print(f"          Ascending: {len(recovery_set_asc)} layers, {memory_asc:.1f}MB")
             print(f"          Descending: {len(recovery_set_desc)} layers, {memory_desc:.1f}MB")
-            
+
             if memory_asc <= memory_desc:
                 print(f"        → Using ascending order (better memory efficiency)")
                 return recovery_set_asc, block_asc
@@ -1196,7 +1292,7 @@ class PrecisionOptimizer:
         if not recovery_set:
             return False
 
-        # Ensure quantized_block is on GPU and fp16 (saved_quantized_block is already on GPU)
+        # Ensure quantized_block is on GPU and fp16 (saved_quantized_block is already on GPU and fp16)
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         quantized_block = quantized_block.to(device=device, dtype=torch.float16)
 
@@ -1206,6 +1302,9 @@ class PrecisionOptimizer:
 
         # Store original layers for restoration
         original_layers = {}
+
+        # Store original model block for restoration
+        original_model_block = get_module_by_name(self.model, block_name)
 
         try:
             # Replace specified layers with layers from saved block
@@ -1224,12 +1323,15 @@ class PrecisionOptimizer:
                 if saved_layer is not None:
                     set_module_by_name(quantized_block, layer_name, saved_layer)
 
-            # Put mixed quantized_block in model and test
+            # Keep quantized block in fp16 and put it in model
             set_module_by_name(self.model, block_name, quantized_block)
 
-            # Test performance
+            # Test performance (model is already in fp16 from parent function)
             performance = self.evaluate_block_performance(block_name)
             meets_budget = performance['under_threshold']
+
+            # Restore original model block
+            set_module_by_name(self.model, block_name, original_model_block)
 
             return meets_budget
 
@@ -1472,7 +1574,7 @@ class PrecisionOptimizer:
                 print(f"        Could not find original block {block_name}")
                 return False, float('inf')
             
-            # Create working copy of original block for analysis
+            # Create working copy of original block for analysis (convert to fp16)
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
             working_block = copy.deepcopy(original_block).to(device=device, dtype=torch.float16)
             
@@ -1719,12 +1821,12 @@ class PrecisionOptimizer:
         
         with torch.no_grad():
             for inp in tqdm(block_inputs, desc="Caching outputs", leave=False):
-                inp = inp.to(device)
+                inp = inp.to(device=device, dtype=torch.float32)
                 try:
                     orig_out = wrapped_module(inp)
                     if isinstance(orig_out, tuple):
                         orig_out = orig_out[0]
-                    original_outputs.append(orig_out.detach().cpu())
+                    original_outputs.append(orig_out.detach().cpu().to(dtype=torch.float16))
                 except Exception as e:
                     print(f"Warning: Failed to cache output: {e}")
                     continue
@@ -1802,21 +1904,24 @@ class PrecisionOptimizer:
                 batch_loss = 0.0
                 
                 for idx in batch_indices:
-                    inp = block_inputs[idx].to(device)
-                    target = original_outputs[idx].to(device)
-                    
+                    inp = block_inputs[idx].to(device=device, dtype=torch.float32)
+                    target = original_outputs[idx].to(device=device, dtype=torch.float16)
+
                     optimizer.zero_grad()
-                    
+
                     output = wrapped_module(inp)
                     if isinstance(output, tuple):
                         output = output[0]
-                    
+
+                    # Convert output to fp16 for loss calculation
+                    output = output.to(dtype=torch.float16)
+
                     loss = torch.nn.functional.mse_loss(output, target)
                     loss.backward()
-                    
+
                     optimizer.step()
                     scheduler.step()
-                    
+
                     batch_loss += loss.item()
                 
                 epoch_loss += batch_loss / len(batch_indices)
