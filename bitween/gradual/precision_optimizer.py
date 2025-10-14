@@ -241,17 +241,27 @@ class PrecisionOptimizer:
         # Same bits and group size - prefer better error metric
         return new_config.error_metric < current_config.error_metric
     
+    def _unwrap_module(self, module):
+        """Unwrap a module to get the actual underlying module.
+
+        Handles various wrapper types: RTNWrapper, BlockCacheWrapper, WrapperLinear, etc.
+        """
+        if hasattr(module, 'wrapped_block'):
+            return module.wrapped_block
+        elif hasattr(module, 'wrapped_module'):
+            return module.wrapped_module
+        elif hasattr(module, 'module'):
+            return module.module
+        else:
+            return module
+
     def _separate_layer_types(self, block):
         """Separate attention and MLP layers in a transformer block."""
         attention_layers = []
         mlp_layers = []
-        
+
         # Handle wrapped blocks - get the actual block
-        actual_block = block
-        if hasattr(block, 'wrapped_block'):
-            actual_block = block.wrapped_block
-        elif hasattr(block, 'wrapped_module'):
-            actual_block = block.wrapped_module
+        actual_block = self._unwrap_module(block)
         
         for name, module in actual_block.named_modules():
             # Look for WrapperLinear, torch.nn.Linear, and QuantizedLinear modules
@@ -362,45 +372,51 @@ class PrecisionOptimizer:
         return None
         
     def _save_block_quantization_if_better(self, block_name: str, config: QuantizationConfig, quantized_block):
-        """Save quantization configuration only if it uses less memory than current saved config."""
+        """Save quantization configuration only if it uses less memory than current saved config.
+
+        This is the ONLY function that saves quantized blocks. It handles unwrapping automatically.
+        """
+        # Unwrap the block before saving (handles RTNWrapper, BlockCacheWrapper, etc.)
+        unwrapped_block = self._unwrap_module(quantized_block)
+
         # Calculate memory usage for new config
-        new_memory = self._calculate_block_memory_usage(quantized_block, config)
-        
+        new_memory = self._calculate_block_memory_usage(unwrapped_block, config)
+
         if block_name in self.block_quantizations:
             existing_config = self.block_quantizations[block_name]
             existing_block = self.quantized_blocks[block_name]
             existing_memory = self._calculate_block_memory_usage(existing_block, existing_config)
-            
+
             # Compare memory usage
             if new_memory < existing_memory:
                 compression_improvement = existing_memory - new_memory
                 print(f"        ⚡ Better compression: {existing_memory:.1f}MB → {new_memory:.1f}MB (-{compression_improvement:.1f}MB)")
-                
+
                 # Clean up previous quantized block
                 if hasattr(self.quantized_blocks[block_name], 'cleanup'):
                     self.quantized_blocks[block_name].cleanup()
-                    
-                # Save new better config
+
+                # Save new better config (unwrapped block on CPU)
                 self.block_quantizations[block_name] = config
-                self.quantized_blocks[block_name] = quantized_block.cpu()  # Store on CPU to save GPU memory
+                self.quantized_blocks[block_name] = unwrapped_block.cpu()  # Store on CPU to save GPU memory
                 self.current_model_state[block_name] = 'quantized'
-                
+
                 print(f"        ✓ Saved improved {config.method} {config.bits}-bit for {block_name}")
                 return True
             else:
                 memory_difference = new_memory - existing_memory
                 print(f"        → Keeping existing config: {existing_memory:.1f}MB < {new_memory:.1f}MB (+{memory_difference:.1f}MB)")
-                
+
                 # Clean up current attempt since we're not using it
                 if hasattr(quantized_block, 'cleanup'):
                     quantized_block.cleanup()
                 return False
         else:
-            # First config for this block
+            # First config for this block (unwrapped block on CPU)
             self.block_quantizations[block_name] = config
-            self.quantized_blocks[block_name] = quantized_block.cpu()  # Store on CPU to save GPU memory
+            self.quantized_blocks[block_name] = unwrapped_block.cpu()  # Store on CPU to save GPU memory
             self.current_model_state[block_name] = 'quantized'
-            
+
             print(f"        ✓ Saved {config.method} {config.bits}-bit for {block_name} ({new_memory:.1f}MB)")
             return True
     
@@ -411,35 +427,27 @@ class PrecisionOptimizer:
     def _handle_successful_quantization(self, block_name: str, config: QuantizationConfig, quantized_module, original_block):
         """
         Unified handler for successful quantization (both RTN and training).
-        
+
         Args:
             block_name: Name of the quantized block
             config: Quantization configuration
-            quantized_module: The quantized module (RTNWrapper or wrapped module)
+            quantized_module: The quantized module (may be wrapped or unwrapped)
             original_block: Original block to restore after saving
-            
+
         Returns:
             True if quantization was saved, False otherwise
         """
         try:
-            # Now both RTN and training paths provide QuantizedLinear modules
-            if hasattr(quantized_module, 'wrapped_block'):
-                # This is RTNWrapper - get the wrapped block (contains QuantizedLinear)
-                final_quantized_module = quantized_module.wrapped_block
-            else:
-                # Already in correct form (QuantizedLinear block from training conversion)
-                final_quantized_module = quantized_module
-                
-            # Save the quantized configuration if it's better than existing
-            saved = self._save_block_quantization_if_better(block_name, config, final_quantized_module)
-            
+            # Save the quantized configuration (unwrapping is handled in save function)
+            saved = self._save_block_quantization_if_better(block_name, config, quantized_module)
+
             if saved:
                 print(f"        ✓ Successfully saved {config.method} {config.bits}-bit quantization for {block_name}")
             else:
                 print(f"        → Existing quantization is better for {block_name}")
-                
+
             return saved
-            
+
         except Exception as e:
             print(f"        ⚠ Failed to save quantization for {block_name}: {e}")
             return False
@@ -477,22 +485,10 @@ class PrecisionOptimizer:
     def _calculate_block_memory_usage(self, quantized_block, config: QuantizationConfig) -> float:
         """Calculate actual memory usage of a quantized block in MB."""
         total_memory = 0.0
-        
-        # Handle different wrapper types
-        actual_block = quantized_block
-        
-        # Handle wrappers with wrapped_block attribute (both RTNWrapper and BlockCacheWrapper)
-        if hasattr(quantized_block, 'wrapped_block'):
-            actual_block = quantized_block.wrapped_block
-            
-        # Handle wrappers with wrapped_module attribute  
-        elif hasattr(quantized_block, 'wrapped_module'):
-            actual_block = quantized_block.wrapped_module
-            
-        # Handle other wrapper types
-        elif hasattr(quantized_block, 'module'):
-            actual_block = quantized_block.module
-        
+
+        # Unwrap to get actual block
+        actual_block = self._unwrap_module(quantized_block)
+
         layer_count = 0
         for name, module in actual_block.named_modules():
             # Check for Linear, QuantizedLinear, and WrapperLinear modules
@@ -763,16 +759,13 @@ class PrecisionOptimizer:
     def _analyze_layer_quality_impact(self, quantized_block, working_block, cached_data, block_name):
         """Analyze quality impact by progressively quantizing layers from working block."""
         layer_impacts = []
-        
+
         print(f"        Analyzing layer quality impact for {block_name}")
         print(f"        Progressive quantization: start with original, quantize layers one by one")
-        
+
         # Move quantized block to GPU and unwrap to get QuantizedLinear layers
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        if hasattr(quantized_block, 'wrapped_block'):
-            quantized_block = quantized_block.wrapped_block
-        elif hasattr(quantized_block, 'wrapped_module'):
-            quantized_block = quantized_block.wrapped_module
+        quantized_block = self._unwrap_module(quantized_block)
         quantized_block = quantized_block.to(device=device, dtype=torch.float16)
         
         try:
@@ -1191,23 +1184,27 @@ class PrecisionOptimizer:
         """Test if mixed block meets budget by replacing layers from saved block."""
         if not recovery_set:
             return False
-            
+
         # Store original layers for restoration
         original_layers = {}
-        
+
         try:
+            # Unwrap blocks to get actual modules
+            actual_quantized_block = self._unwrap_module(quantized_block)
+            actual_saved_block = self._unwrap_module(saved_quantized_block)
+            
             # Replace specified layers with layers from saved block
             for layer_info in recovery_set:
                 layer_name = layer_info['layer_name']
                 
                 # Store original layer from quantized block
-                original_layer = get_module_by_name(quantized_block, layer_name)
+                original_layer = get_module_by_name(actual_quantized_block, layer_name)
                 original_layers[layer_name] = original_layer
                 
                 # Get layer from saved block and replace
-                saved_layer = get_module_by_name(saved_quantized_block, layer_name)
+                saved_layer = get_module_by_name(actual_saved_block, layer_name)
                 if saved_layer is not None:
-                    set_module_by_name(quantized_block, layer_name, saved_layer)
+                    set_module_by_name(actual_quantized_block, layer_name, saved_layer)
             
             # Put mixed quantized_block in model and test
             set_module_by_name(self.model, block_name, quantized_block)
@@ -1244,22 +1241,10 @@ class PrecisionOptimizer:
         
         # Get the actual blocks (unwrap if necessary)
         current_block = get_module_by_name(self.model, block_name)
-        
-        # Unwrap current block
-        if hasattr(current_block, 'wrapped_block'):
-            actual_current_block = current_block.wrapped_block
-        elif hasattr(current_block, 'wrapped_module'):
-            actual_current_block = current_block.wrapped_module
-        else:
-            actual_current_block = current_block
-            
-        # Unwrap saved block
-        if hasattr(saved_quantized_block, 'wrapped_block'):
-            actual_saved_block = saved_quantized_block.wrapped_block
-        elif hasattr(saved_quantized_block, 'wrapped_module'):
-            actual_saved_block = saved_quantized_block.wrapped_module
-        else:
-            actual_saved_block = saved_quantized_block
+
+        # Unwrap both blocks
+        actual_current_block = self._unwrap_module(current_block)
+        actual_saved_block = self._unwrap_module(saved_quantized_block)
         
         # Store current layer states for restoration
         current_layers = {}
