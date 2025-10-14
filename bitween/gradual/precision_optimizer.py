@@ -96,11 +96,14 @@ class PrecisionOptimizer:
         self.training_batch_size = training_batch_size
         self.training_manager = training_manager
 
+        # Move model to fp16 globally for consistent dtype across all operations
+        self.model = self.model.to(dtype=torch.float16)
+
         # Persistent state for building final quantized model
         self.block_quantizations = {}  # Store best quantization config for each block
         self.quantized_blocks = {}     # Store actual quantized block instances
         self.current_model_state = {}  # Track current state of model blocks
-        
+
         # Get fixed calibration data for consistent evaluation (reusing ImportanceAnalyzer approach)
         self.eval_samples = self._get_evaluation_samples()
         
@@ -1025,25 +1028,29 @@ class PrecisionOptimizer:
         
     def _find_minimum_recovery_set(self, quantized_block, block_name, sorted_layer_impacts, budget):
         """Find minimum set of layers to replace with layers from saved quantized block.
-        
+
         Algorithm:
         1. Exponential search: 1, 2, 4, 8, 16... layers until success
         2. Binary search between last_failed and first_success to find exact minimum
         3. Replace layers from quantized_block with layers from saved_quantized_block
         """
         print(f"        Finding minimal recovery set for {block_name}...")
-        
+
         if not sorted_layer_impacts:
             print(f"        No layers to recover")
             return []
-            
+
         # Check if we have a saved quantized block
         if block_name not in self.quantized_blocks:
             print(f"        No saved quantized block available for {block_name}")
             return []
-        
+
         saved_quantized_block = self.quantized_blocks[block_name]
-        
+
+        # Move saved block to GPU once at the beginning (it's stored on CPU)
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        saved_quantized_block_gpu = saved_quantized_block.to(device=device, dtype=torch.float16)
+
         # Store original model block for restoration at the end
         original_model_block = get_module_by_name(self.model, block_name)
         
@@ -1056,14 +1063,14 @@ class PrecisionOptimizer:
         while recovery_count <= len(sorted_layer_impacts):
             recovery_set = sorted_layer_impacts[:recovery_count]
             layer_names = [layer['layer_name'] for layer in recovery_set]
-            
+
             print(f"          Testing {recovery_count} layers: {layer_names[:3]}{'...' if len(layer_names) > 3 else ''}")
-            
+
             try:
                 meets_budget = self._test_mixed_block_with_recovery_layers(
-                    quantized_block, saved_quantized_block, block_name, recovery_set
+                    quantized_block, saved_quantized_block_gpu, block_name, recovery_set
                 )
-                
+
                 if meets_budget:
                     print(f"          ✓ SUCCESS with {recovery_count} layers")
                     first_success = recovery_count
@@ -1071,41 +1078,41 @@ class PrecisionOptimizer:
                 else:
                     print(f"          ✗ Failed with {recovery_count} layers")
                     last_failed = recovery_count
-                    
+
             except Exception as e:
                 print(f"          Error testing {recovery_count} layers: {e}")
                 last_failed = recovery_count
-            
+
             # Exponential progression: 1 → 2 → 4 → 8 → 16...
             recovery_count *= 2
-        
+
         if first_success is None:
             # Try all layers as last resort
             print(f"        Exponential search failed, trying all {len(sorted_layer_impacts)} layers")
             recovery_set = sorted_layer_impacts
-            if self._test_mixed_block_with_recovery_layers(quantized_block, saved_quantized_block, block_name, recovery_set):
-                return recovery_set
+            if self._test_mixed_block_with_recovery_layers(quantized_block, saved_quantized_block_gpu, block_name, recovery_set):
+                return recovery_set, None
             else:
                 print(f"        Complete recovery failed")
-                return []
-        
+                return [], None
+
         # Phase 2: Binary search to find exact minimum
         print(f"        Phase 2: Binary search between {last_failed} and {first_success}")
         left = last_failed + 1
         right = first_success
         best_count = first_success
-        
+
         while left < right:
             mid = (left + right) // 2
             recovery_set = sorted_layer_impacts[:mid]
-            
+
             print(f"          Binary testing {mid} layers")
-            
+
             try:
                 meets_budget = self._test_mixed_block_with_recovery_layers(
-                    quantized_block, saved_quantized_block, block_name, recovery_set
+                    quantized_block, saved_quantized_block_gpu, block_name, recovery_set
                 )
-                
+
                 if meets_budget:
                     print(f"          ✓ SUCCESS with {mid} layers - trying fewer")
                     best_count = mid
@@ -1113,26 +1120,30 @@ class PrecisionOptimizer:
                 else:
                     print(f"          ✗ Failed with {mid} layers - need more")
                     left = mid + 1
-                    
+
             except Exception as e:
                 print(f"          Error testing {mid} layers: {e}")
                 left = mid + 1
-        
+
         final_recovery_set = sorted_layer_impacts[:best_count]
-        
+
         # Create final quantized block with recovery layers applied
         final_quantized_block = copy.deepcopy(quantized_block)
+
+        # Use the GPU version of saved block for layer extraction
+        actual_saved_block_gpu = self._unwrap_module(saved_quantized_block_gpu)
+
         for layer_info in final_recovery_set:
             layer_name = layer_info['layer_name']
-            saved_layer = get_module_by_name(saved_quantized_block, layer_name)
+            saved_layer = get_module_by_name(actual_saved_block_gpu, layer_name)
             if saved_layer is not None:
                 set_module_by_name(final_quantized_block, layer_name, saved_layer)
-        
+
         print(f"        Found minimal recovery set: {best_count} layers")
-        
+
         # Restore original model block after all testing
         set_module_by_name(self.model, block_name, original_model_block)
-        
+
         return final_recovery_set, final_quantized_block
         
     def _find_optimal_recovery_set(self, quantized_block, block_name, sorted_layer_impacts, budget):
@@ -1185,38 +1196,52 @@ class PrecisionOptimizer:
         if not recovery_set:
             return False
 
+        # Ensure quantized_block is on GPU and fp16 (saved_quantized_block is already on GPU)
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        quantized_block = quantized_block.to(device=device, dtype=torch.float16)
+
+        # Unwrap blocks to get actual modules
+        quantized_block = self._unwrap_module(quantized_block)
+        saved_quantized_block = self._unwrap_module(saved_quantized_block)
+
         # Store original layers for restoration
         original_layers = {}
 
         try:
-            # Unwrap blocks to get actual modules
-            actual_quantized_block = self._unwrap_module(quantized_block)
-            actual_saved_block = self._unwrap_module(saved_quantized_block)
-            
             # Replace specified layers with layers from saved block
             for layer_info in recovery_set:
                 layer_name = layer_info['layer_name']
-                
+
                 # Store original layer from quantized block
-                original_layer = get_module_by_name(actual_quantized_block, layer_name)
+                original_layer = get_module_by_name(quantized_block, layer_name)
+                if original_layer is None:
+                    continue
+
                 original_layers[layer_name] = original_layer
-                
+
                 # Get layer from saved block and replace
-                saved_layer = get_module_by_name(actual_saved_block, layer_name)
+                saved_layer = get_module_by_name(saved_quantized_block, layer_name)
                 if saved_layer is not None:
-                    set_module_by_name(actual_quantized_block, layer_name, saved_layer)
-            
+                    set_module_by_name(quantized_block, layer_name, saved_layer)
+
             # Put mixed quantized_block in model and test
             set_module_by_name(self.model, block_name, quantized_block)
-            
+
             # Test performance
             performance = self.evaluate_block_performance(block_name)
             meets_budget = performance['under_threshold']
-            
+
             return meets_budget
-            
+
+        except Exception as e:
+            import traceback
+            print(f"          [ERROR] Exception in _test_mixed_block_with_recovery_layers:")
+            print(f"          [ERROR] {type(e).__name__}: {str(e)}")
+            traceback.print_exc()
+            raise
+
         finally:
-            # Restore original layers in quantized block
+            # Restore original layers
             for layer_name, original_layer in original_layers.items():
                 set_module_by_name(quantized_block, layer_name, original_layer)
                 
