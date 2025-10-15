@@ -1251,140 +1251,74 @@ class PrecisionOptimizer:
             # Restore original layers
             for layer_name, original_layer in original_layers.items():
                 set_module_by_name(quantized_block, layer_name, original_layer)
-                
-    def _test_recovery_set(self, block_name, recovery_set):
-        """Test if reverting a set of layers to previous saved quantized state meets the quality budget.
-        
-        Returns True if the recovery set meets budget, False otherwise.
-        """
-        
-        if not recovery_set:
-            return False
-            
-        # Check if we have a previously saved working quantized block
-        if block_name not in self.block_quantizations:
-            print(f"            No previously saved quantization for {block_name}")
-            return False
-            
-        saved_quantized_block = self.quantized_blocks.get(block_name)
-        if saved_quantized_block is None:
-            print(f"            No saved quantized block available for {block_name}")
-            return False
-        
-        # Get the actual blocks (unwrap if necessary)
-        current_block = get_module_by_name(self.model, block_name)
 
-        # Unwrap both blocks
-        actual_current_block = self._unwrap_module(current_block)
-        actual_saved_block = self._unwrap_module(saved_quantized_block)
-        
-        # Store current layer states for restoration
-        current_layers = {}
-        
-        try:
-            # Step 1: Revert specified layers to saved quantized state
-            for layer_info in recovery_set:
-                layer_name = layer_info['layer_name']
-                
-                # Store current layer from actual block
-                try:
-                    current_layer = get_module_by_name(actual_current_block, layer_name)
-                    current_layers[layer_name] = current_layer
-                    
-                    # Get corresponding layer from saved quantized block
-                    saved_layer = get_module_by_name(actual_saved_block, layer_name)
-                    if saved_layer is None:
-                        print(f"            Layer {layer_name} not found in saved block")
-                        continue
-                        
-                    # Replace with saved quantized layer in actual block
-                    set_module_by_name(actual_current_block, layer_name, saved_layer)
-                    print(f"            Reverted {layer_name} to saved quantized state")
-                    
-                except Exception as e:
-                    print(f"            Could not revert {layer_name}: {e}")
-                    continue
-            
-            # Step 2: Evaluate whole model performance with reverted layers
-            performance = self.evaluate_block_performance(block_name)
-            
-            # Step 3: Check if meets budget
-            meets_budget = performance['under_threshold']
-            
-            print(f"            Combined sensitivity: {performance['current_combined_sensitivity']:.4f} (threshold: {performance['threshold_combined_sensitivity']:.4f})")
-            
-            return meets_budget
-            
-        except Exception as e:
-            print(f"            Error testing recovery set: {e}")
-            return False
-            
-        finally:
-            # Step 4: Always restore current layers
-            try:
-                for layer_name, current_layer in current_layers.items():
-                    set_module_by_name(actual_current_block, layer_name, current_layer)
-            except Exception as e:
-                print(f"            Error restoring current layers: {e}")
-        
     def _retrain_mixed_precision_block(self, block_name, recovery_set, cached_data, target_bits, target_group_size):
         """Retrain block with mixed precision (some layers frozen from previous saved block).
-        
+
         Algorithm:
-        1. Copy frozen layers from previously saved quantized block (already trained)
-        2. Wrap block for training with target quantization (bits, group_size from loop)
-        3. Replace frozen layers with saved versions and freeze them from training
-        4. Train only non-frozen layers while keeping frozen layers fixed
+        1. Wrap the block for training (converts all layers to WrapperLinear)
+        2. Replace frozen layers with QuantizedLinear from saved block (they pass gradients but don't train)
+        3. Train only the non-frozen WrapperLinear layers
+        4. The frozen QuantizedLinear layers will pass gradients during backprop but won't update
+
+        Note: QuantizedLinear has custom backward() that computes grad_input, so it can pass gradients
+        even though its weights are frozen (qweight, scale, zero_point return None in backward).
         """
-        
+
         print(f"          Retraining {block_name} with {len(recovery_set)} layers frozen from saved block...")
         print(f"          Target quantization for non-frozen layers: {target_bits}-bit, group_size={target_group_size}")
-        
+
         try:
             # Get current block state
             current_block = get_module_by_name(self.model, block_name)
-            
+
             # Get saved quantized block (source of frozen layers)
             saved_quantized_block = self.quantized_blocks.get(block_name)
             if saved_quantized_block is None:
                 print(f"          No saved quantized block available for frozen layers")
                 return current_block
-            
-            # Get frozen layer names
+
+            # Get frozen layer names from recovery set
             frozen_layer_names = [layer_info['layer_name'] for layer_info in recovery_set]
-            
-            # Step 1: Wrap the block for training with target quantization from loop
+
+            # Step 1: Wrap the block for training with target quantization
+            # This converts all layers to WrapperLinear for training
             wrapped_info = wrap_model_for_training(
                 model=self.model,
-                block_names=[block_name],  # Only this block
+                block_names=[block_name],
                 enable_minmax_tuning=True,
-                bits=target_bits,  # Use bits from quantization loop
-                group_size=target_group_size,  # Use group_size from quantization loop
-                ignore_layers=set()  # Don't ignore any layers in wrapping
+                bits=target_bits,
+                group_size=target_group_size,
+                ignore_layers=set()  # Wrap all layers initially
             )
-            
+
             if block_name not in wrapped_info:
                 print(f"          Failed to wrap {block_name} for mixed precision training")
                 return current_block
-            
+
             wrapper_info = wrapped_info[block_name]
             wrapped_block = wrapper_info['wrapped_module']
-            
-            # Step 2: Replace frozen layers with saved quantized versions
+
+            # Step 2: Replace frozen layers with QuantizedLinear from saved block
+            # These QuantizedLinear layers will pass gradients but won't train (weights are buffers)
             for layer_name in frozen_layer_names:
                 try:
-                    # Get saved quantized layer (already trained)
+                    # Get saved quantized layer (QuantizedLinear with frozen weights)
                     saved_layer = get_module_by_name(saved_quantized_block, layer_name)
                     if saved_layer is None:
                         print(f"            Warning: Layer {layer_name} not found in saved block")
                         continue
-                    
-                    # Replace wrapped layer with saved quantized layer
+
+                    # Ensure it's on the correct device
+                    device = next(wrapped_block.parameters()).device
+                    saved_layer = saved_layer.to(device)
+
+                    # Replace WrapperLinear with QuantizedLinear (frozen but gradient-passing)
                     set_module_by_name(wrapped_block, layer_name, saved_layer)
-                    print(f"            Copied saved quantized layer: {layer_name}")
-                    
+                    print(f"            Froze layer {layer_name}: using QuantizedLinear from saved block")
+
                 except Exception as e:
-                    print(f"            Failed to copy saved layer {layer_name}: {e}")
+                    print(f"            Failed to replace frozen layer {layer_name}: {e}")
                     continue
             
             # Step 3: Convert cached_data format for training
@@ -1415,39 +1349,7 @@ class PrecisionOptimizer:
         except Exception as e:
             print(f"          Mixed precision retraining failed: {e}")
             return current_block
-        
-    def _apply_layer_recovery_config(self, block_name, config, recovery_set):
-        """Apply mixed precision configuration and mark problematic layers as frozen.
-        
-        Algorithm:
-        1. Update QuantizationConfig with layer exceptions
-        2. Mark recovered layers as frozen for future attempts
-        3. Save memory-optimized config (higher precision but min group size)
-        
-        TODO: Add layer_exceptions to QuantizationConfig
-        TODO: Set frozen layers to: 8-bit precision + min_group_size
-        TODO: Update freeze_layer tracking for this block
-        """
-        print(f"          Applying layer recovery config to {block_name}")
-        
-        # Mark layers as frozen
-        for layer_info in recovery_set:
-            layer_name = layer_info['layer_name']
-            self.freeze_layers(block_name, [layer_name])
-            print(f"            Froze layer: {layer_name}")
-        
-        # Update config with layer exceptions
-        config.layer_exceptions = config.layer_exceptions or {}
-        for layer_info in recovery_set:
-            config.layer_exceptions[layer_info['layer_name']] = {
-                'reason': 'quality_recovery',
-                'original_bits': config.bits,
-                'recovery_bits': 8,
-                'recovery_group_size': self.min_group_size
-            }
-        
-        return config
-    
+
     def _try_layer_recovery(self, quantized_block, bits, group_size, cached_data, budget, block_name):
         """Try layer-level recovery for failed quantization using saved quantized block.
         
@@ -1493,11 +1395,41 @@ class PrecisionOptimizer:
                 
                 # Phase 2: Find optimal recovery set (try both directions)
                 recovery_set, mixed_precision_block = self._find_optimal_recovery_set(quantized_block, block_name, layer_impacts, budget)
-                print("##########", recovery_set)
-                
+
                 if not recovery_set:
                     print(f"        No recovery set found")
                     return False, float('inf')
+                
+                print("##########", recovery_set)
+
+                mixed_precision_block = self._retrain_mixed_precision_block(block_name, recovery_set, cached_data, bits, group_size)
+        
+                # Phase 4: Apply recovery configuration and freeze problematic layers
+                config = QuantizationConfig(
+                    bits=bits,
+                    group_size=group_size,
+                    method="Mixed",
+                    error_metric=0.0,  # Will be updated after evaluation
+                    memory_savings=self._estimate_memory_savings(bits, group_size)
+                )
+
+                # Mark layers as frozen and update config with layer exceptions (inlined from _apply_layer_recovery_config)
+                print(f"          Applying layer recovery config to {block_name}")
+                for layer_info in recovery_set:
+                    layer_name = layer_info['layer_name']
+                    self.freeze_layers(block_name, [layer_name])
+                    print(f"            Froze layer: {layer_name}")
+
+                config.layer_exceptions = config.layer_exceptions or {}
+                for layer_info in recovery_set:
+                    config.layer_exceptions[layer_info['layer_name']] = {
+                        'reason': 'quality_recovery',
+                        'original_bits': config.bits,
+                        'recovery_bits': 8,
+                        'recovery_group_size': self.min_group_size
+                    }
+
+                self._save_block_quantization_if_better(block_name, config, mixed_precision_block)
                 
             finally:
                 # Clean up working block
@@ -1505,37 +1437,8 @@ class PrecisionOptimizer:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             
-            # Temporary return for debugging
-            return False, float('inf')
-            
-
-            
-            # # Phase 3: Retrain with mixed precision (some layers reverted from saved block)
-            # mixed_precision_block = self._retrain_mixed_precision_block(block_name, recovery_set, cached_data, bits, group_size)
-            
-            # # Phase 4: Apply recovery configuration and freeze problematic layers
-            # config = QuantizationConfig(
-            #     bits=bits,
-            #     group_size=group_size,
-            #     method="Mixed",
-            #     error_metric=0.0,  # Will be updated after evaluation
-            #     memory_savings=self._estimate_memory_savings(bits, group_size)
-            # )
-            
-            # recovery_config = self._apply_layer_recovery_config(block_name, config, recovery_set)
-            
-            # # Phase 5: Final evaluation
-            # performance = self.evaluate_block_performance(block_name)
-            # recovery_config.error_metric = performance['ppl_increase']
-            
-            # if performance['under_threshold']:
-            #     # Save the mixed precision configuration
-            #     self._save_block_quantization_if_better(block_name, recovery_config, mixed_precision_block)
-            #     print(f"        ✓ Layer recovery successful: {len(recovery_set)} layers frozen")
-            #     return True, performance['ppl_increase']
-            # else:
-            #     print(f"        ✗ Layer recovery failed: still over budget")
-            #     return False, performance['ppl_increase']
+            print(f"        ✓ Layer recovery successful: {len(recovery_set)} layers frozen")
+            return True, performance['ppl_increase']
                 
         except Exception as e:
             print(f"        Layer recovery failed with error: {e}")
@@ -1712,40 +1615,28 @@ class PrecisionOptimizer:
             print("Warning: No original outputs cached")
             return None
         
-        # Find all wrapper instances
+        # Find all WrapperLinear instances (frozen layers are QuantizedLinear, so they're excluded automatically)
         wrappers = []
         if isinstance(wrapped_module, WrapperLinear):
             wrappers = [wrapped_module]
         else:
             for name, submodule in wrapped_module.named_modules():
                 if isinstance(submodule, WrapperLinear):
-                    wrappers.append(submodule)
-        
-        # Setup optimizer parameters (EXCLUDE frozen layers)
+                    wrappers.append((name, submodule))
+
+        # Setup optimizer parameters (only from WrapperLinear - QuantizedLinear layers are automatically excluded)
         learnable_params = []
         trained_wrapper_count = 0
-        
-        for wrapper in wrappers:
-            # Get wrapper's name in the module hierarchy
-            wrapper_name = None
-            for name, submodule in wrapped_module.named_modules():
-                if submodule is wrapper:
-                    wrapper_name = name
-                    break
-            
-            # Skip if this wrapper is frozen
-            if wrapper_name in frozen_layer_names:
-                print(f"        Skipping frozen layer: {wrapper_name}")
-                continue
-            
-            # Add trainable parameters for non-frozen layers
+
+        for name, wrapper in wrappers:
+            # Add trainable parameters from WrapperLinear
             if wrapper.value is not None:
                 learnable_params.append(wrapper.value)
             if wrapper.min_scale is not None:
                 learnable_params.append(wrapper.min_scale)
             if wrapper.max_scale is not None:
                 learnable_params.append(wrapper.max_scale)
-            
+
             trained_wrapper_count += 1
         
         if not learnable_params:
