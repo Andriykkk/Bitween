@@ -1121,18 +1121,22 @@ class PrecisionOptimizer:
 
         if not sorted_layer_impacts:
             print(f"        No layers to recover")
-            return []
+            return [], None
 
         # Check if we have a saved quantized block
         if block_name not in self.quantized_blocks:
             print(f"        No saved quantized block available for {block_name}")
-            return []
+            return [], None
 
         saved_quantized_block = self.quantized_blocks[block_name]
 
         # Move saved block to GPU once at the beginning (it's stored on CPU)
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         saved_quantized_block_gpu = saved_quantized_block.to(device=device, dtype=torch.float16)
+
+        # Unwrap both blocks once at the beginning to work with actual modules
+        quantized_block_unwrapped = self._unwrap_module(quantized_block).to(device=device, dtype=torch.float16)
+        saved_quantized_block_unwrapped = self._unwrap_module(saved_quantized_block_gpu)
 
         # Store original model block for restoration at the end
         original_model_block = get_module_by_name(self.model, block_name)
@@ -1155,7 +1159,7 @@ class PrecisionOptimizer:
 
             try:
                 meets_budget = self._test_mixed_block_with_recovery_layers(
-                    quantized_block, saved_quantized_block_gpu, block_name, recovery_set
+                    quantized_block_unwrapped, saved_quantized_block_unwrapped, block_name, recovery_set
                 )
 
                 if meets_budget:
@@ -1177,12 +1181,22 @@ class PrecisionOptimizer:
             # Try all layers as last resort
             print(f"        Exponential search failed, trying all {len(sorted_layer_impacts)} layers")
             recovery_set = sorted_layer_impacts
-            if self._test_mixed_block_with_recovery_layers(quantized_block, saved_quantized_block_gpu, block_name, recovery_set):
+            if self._test_mixed_block_with_recovery_layers(quantized_block_unwrapped, saved_quantized_block_unwrapped, block_name, recovery_set):
+                # Create final block with all recovery layers applied
+                final_quantized_block = copy.deepcopy(quantized_block_unwrapped)
+                for layer_info in recovery_set:
+                    layer_name = layer_info['layer_name']
+                    saved_layer = get_module_by_name(saved_quantized_block_unwrapped, layer_name)
+                    if saved_layer is not None:
+                        set_module_by_name(final_quantized_block, layer_name, saved_layer)
+
+                print(f"        Found minimal recovery set: {len(recovery_set)} layers (all layers)")
+
                 # Restore model block and convert back to fp32 before returning
                 set_module_by_name(self.model, block_name, original_model_block)
                 print(f"        Converting model back to fp32...")
                 self.model = self.model.to(dtype=torch.float32)
-                return recovery_set, None
+                return recovery_set, final_quantized_block
             else:
                 print(f"        Complete recovery failed")
                 # Restore model block and convert back to fp32 before returning
@@ -1205,7 +1219,7 @@ class PrecisionOptimizer:
 
             try:
                 meets_budget = self._test_mixed_block_with_recovery_layers(
-                    quantized_block, saved_quantized_block_gpu, block_name, recovery_set
+                    quantized_block_unwrapped, saved_quantized_block_unwrapped, block_name, recovery_set
                 )
 
                 if meets_budget:
@@ -1222,15 +1236,13 @@ class PrecisionOptimizer:
 
         final_recovery_set = sorted_layer_impacts[:best_count]
 
-        # Create final quantized block with recovery layers applied
-        final_quantized_block = copy.deepcopy(quantized_block)
+        # Create final quantized block with recovery layers applied (use unwrapped blocks)
+        final_quantized_block = copy.deepcopy(quantized_block_unwrapped)
 
-        # Use the GPU version of saved block for layer extraction
-        actual_saved_block_gpu = self._unwrap_module(saved_quantized_block_gpu)
-
+        # Replace layers with saved versions
         for layer_info in final_recovery_set:
             layer_name = layer_info['layer_name']
-            saved_layer = get_module_by_name(actual_saved_block_gpu, layer_name)
+            saved_layer = get_module_by_name(saved_quantized_block_unwrapped, layer_name)
             if saved_layer is not None:
                 set_module_by_name(final_quantized_block, layer_name, saved_layer)
 
@@ -1288,18 +1300,14 @@ class PrecisionOptimizer:
             return [], None
         
     def _test_mixed_block_with_recovery_layers(self, quantized_block, saved_quantized_block, block_name, recovery_set):
-        """Test if mixed block meets budget by replacing layers from saved block."""
+        """Test if mixed block meets budget by replacing layers from saved block.
+
+        Note: quantized_block and saved_quantized_block should already be unwrapped and on GPU/fp16.
+        """
         if not recovery_set:
             return False
 
-        # Ensure quantized_block is on GPU and fp16 (saved_quantized_block is already on GPU and fp16)
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        quantized_block = quantized_block.to(device=device, dtype=torch.float16)
-
-        # Unwrap blocks to get actual modules
-        quantized_block = self._unwrap_module(quantized_block)
-        saved_quantized_block = self._unwrap_module(saved_quantized_block)
-
+        # Blocks are already unwrapped, on GPU, and in fp16 from the caller
         # Store original layers for restoration
         original_layers = {}
 
@@ -1588,6 +1596,7 @@ class PrecisionOptimizer:
                 
                 # Phase 2: Find optimal recovery set (try both directions)
                 recovery_set, mixed_precision_block = self._find_optimal_recovery_set(quantized_block, block_name, layer_impacts, budget)
+                print("##########", recovery_set)
                 
                 if not recovery_set:
                     print(f"        No recovery set found")
