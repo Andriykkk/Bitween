@@ -363,14 +363,7 @@ class PrecisionOptimizer:
             except:
                 pass
             return False, float('inf')
-            
-    def _find_block_name(self, target_block):
-        """Find the name of a block in the model."""
-        for name, module in self.model.named_modules():
-            if module is target_block:
-                return name
-        return None
-        
+
     def _save_block_quantization_if_better(self, block_name: str, config: QuantizationConfig, quantized_block):
         """Save quantization configuration only if it uses less memory than current saved config.
 
@@ -419,11 +412,7 @@ class PrecisionOptimizer:
 
             print(f"        ✓ Saved {config.method} {config.bits}-bit for {block_name} ({new_memory:.1f}MB)")
             return True
-    
-    def _save_block_quantization(self, block_name: str, config: QuantizationConfig, quantized_block):
-        """Legacy function - redirects to memory-based saving."""
-        return self._save_block_quantization_if_better(block_name, config, quantized_block)
-        
+
     def _handle_successful_quantization(self, block_name: str, config: QuantizationConfig, quantized_module, original_block):
         """
         Unified handler for successful quantization (both RTN and training).
@@ -903,29 +892,7 @@ class PrecisionOptimizer:
         except Exception as e:
             print(f"        Error in layer analysis: {e}")
             return []
-        
-    def _get_cached_data_for_block(self, block_name):
-        """Get cached training data for a specific block from the training manager."""
-        try:
-            if not self.training_manager:
-                print(f"        Warning: No training manager available for cached data")
-                return []
-            
-            # Get the wrapper for this block
-            if hasattr(self.training_manager, 'block_wrappers') and block_name in self.training_manager.block_wrappers:
-                wrapper = self.training_manager.block_wrappers[block_name]
-                if hasattr(wrapper, 'get_all_cached_data'):
-                    cached_data = wrapper.get_all_cached_data()
-                    print(f"        Retrieved {len(cached_data)} cached samples for {block_name}")
-                    return cached_data
-            
-            print(f"        No cached data found for {block_name}")
-            return []
-            
-        except Exception as e:
-            print(f"        Error getting cached data for {block_name}: {e}")
-            return []
-    
+
     def _measure_layer_quantization_impact(self, original_working_block, quantized_block, layer_name, cached_data, baseline_outputs):
         """Measure quality impact from quantizing a single layer (progressive quantization approach)."""
         try:
@@ -1012,40 +979,7 @@ class PrecisionOptimizer:
         except Exception as e:
             print(f"            Error getting block outputs: {e}")
             return None
- 
-    def _calculate_kl_divergence_between_outputs(self, outputs1, outputs2):
-        """Calculate KL divergence between two sets of block outputs."""
-        try:
-            if not outputs1 or not outputs2 or len(outputs1) != len(outputs2):
-                return 0.0
-            
-            total_kl = 0.0
-            total_tokens = 0
-            
-            for out1, out2 in zip(outputs1, outputs2):
-                # Ensure same shape
-                min_shape = [min(s1, s2) for s1, s2 in zip(out1.shape, out2.shape)]
-                out1_trimmed = out1[:min_shape[0], :min_shape[1], :min_shape[2]]
-                out2_trimmed = out2[:min_shape[0], :min_shape[1], :min_shape[2]]
-                
-                # Calculate KL divergence (treat as logits)
-                log_prob1 = F.log_softmax(out1_trimmed, dim=-1)
-                prob2 = F.softmax(out2_trimmed, dim=-1)
-                
-                # Per-token KL divergence
-                per_token_kl = F.kl_div(log_prob1, prob2, reduction='none', log_target=False)
-                per_token_kl = per_token_kl.sum(dim=-1)  # sum over vocab dim
-                
-                total_kl += per_token_kl.sum().item()
-                total_tokens += per_token_kl.numel()
-            
-            avg_kl = total_kl / total_tokens if total_tokens > 0 else 0.0
-            return avg_kl
-            
-        except Exception as e:
-            print(f"            Error calculating KL divergence: {e}")
-            return 0.0
-    
+
     def _calculate_mse_between_outputs(self, outputs1, outputs2):
         """Calculate Mean Squared Error between two sets of block outputs."""
         try:
@@ -1071,44 +1005,7 @@ class PrecisionOptimizer:
         except Exception as e:
             print(f"            Error calculating MSE: {e}")
             return 0.0
-            
-    def _create_original_layer_from_quantized(self, quantized_layer):
-        """Create original torch.nn.Linear layer from quantized wrapper."""
-        try:
-            # Check if this is a wrapper with original weights
-            if hasattr(quantized_layer, 'orig_weight'):
-                # Extract original weights and bias from wrapper
-                original_weight = quantized_layer.orig_weight
-                original_bias = getattr(quantized_layer, 'orig_bias', None)
-                
-                # Create regular Linear layer
-                original_layer = torch.nn.Linear(
-                    in_features=original_weight.shape[1],
-                    out_features=original_weight.shape[0],
-                    bias=original_bias is not None,
-                    device=original_weight.device,
-                    dtype=original_weight.dtype
-                )
-                
-                # Copy weights
-                original_layer.weight.data = original_weight.clone()
-                if original_bias is not None:
-                    original_layer.bias.data = original_bias.clone()
-                
-                return original_layer
-                
-            elif isinstance(quantized_layer, torch.nn.Linear):
-                # Already a regular layer, return as-is
-                return quantized_layer
-                
-            else:
-                print(f"            Unknown layer type: {type(quantized_layer)}")
-                return None
-                
-        except Exception as e:
-            print(f"            Failed to create original layer: {e}")
-            return None
-        
+
     def _find_minimum_recovery_set(self, quantized_block, block_name, sorted_layer_impacts, budget):
         """Find minimum set of layers to replace with layers from saved quantized block.
 
@@ -1684,35 +1581,6 @@ class PrecisionOptimizer:
             'kl_sensitivity': block_budget['kl_sensitivity'],
             'combined_sensitivity': block_budget['combined_sensitivity']
         }
-         
-    def _get_model_logits(self):
-        """Get current model logits on evaluation samples."""
-        self.model.eval()
-        device = next(self.model.parameters()).device
-        
-        current_logits = []
-        
-        with torch.no_grad():
-            for sample in self.eval_samples:
-                input_ids = sample["input_ids"].unsqueeze(0).to(device)
-                
-                # Get current state logits
-                outputs = self.model(input_ids)
-                logits = outputs.logits  # shape: [1, seq_len, vocab]
-                current_logits.append(logits)
-                
-        return current_logits
-        
-    def _evaluate_block_error(self, block, cached_data):
-        """Evaluate reconstruction error on cached data."""
-        # For now, evaluate full model perplexity as proxy for block quality
-        # TODO: Could implement more targeted block-level evaluation
-        current_ppl = self._evaluate_model_perplexity()
-        baseline_ppl = self.baseline_metrics.get('perplexity', current_ppl)
-        
-        # Return perplexity increase as error metric
-        ppl_increase = current_ppl - baseline_ppl
-        return max(0, ppl_increase)  # Ensure non-negative
         
     def apply_all_quantizations(self):
         """Apply all saved quantization configurations to build final quantized model."""
