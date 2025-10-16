@@ -372,13 +372,13 @@ class PrecisionOptimizer:
         # Unwrap the block before saving (handles RTNWrapper, BlockCacheWrapper, etc.)
         unwrapped_block = self._unwrap_module(quantized_block)
 
-        # Calculate memory usage for new config
-        new_memory = self._calculate_block_memory_usage(unwrapped_block, config)
+        # Calculate memory usage by inspecting actual layers
+        new_memory = self._calculate_block_memory_direct(unwrapped_block)
 
         if block_name in self.block_quantizations:
             existing_config = self.block_quantizations[block_name]
             existing_block = self.quantized_blocks[block_name]
-            existing_memory = self._calculate_block_memory_usage(existing_block, existing_config)
+            existing_memory = self._calculate_block_memory_direct(existing_block)
 
             # Compare memory usage
             if new_memory < existing_memory:
@@ -495,7 +495,8 @@ class PrecisionOptimizer:
                 out_features, in_features = module.weight.shape
                 weight_memory = out_features * in_features * 2  # fp16 = 2 bytes
                 bias_memory = out_features * 2 if module.bias is not None else 0
-                total_memory += (weight_memory + bias_memory) / (1024 * 1024)
+                layer_mem = (weight_memory + bias_memory) / (1024 * 1024)
+                total_memory += layer_mem
 
             elif isinstance(module, QuantizedLinear):
                 # Quantized layer - calculate from actual quantized parameters
@@ -503,9 +504,9 @@ class PrecisionOptimizer:
                 out_features = module.out_features
                 in_features = module.in_features
 
-                # Get actual quantized weight size
-                if hasattr(module, 'weight') and module.weight is not None:
-                    weight_memory = module.weight.numel() * module.weight.element_size()
+                # Get actual quantized weight size (stored as 'qweight' in QuantizedLinear)
+                if hasattr(module, 'qweight') and module.qweight is not None:
+                    weight_memory = module.qweight.numel() * module.qweight.element_size()
                 else:
                     weight_memory = 0
 
@@ -520,7 +521,8 @@ class PrecisionOptimizer:
                 # Bias
                 bias_memory = out_features * 4 if hasattr(module, 'bias') and module.bias is not None else 0
 
-                total_memory += (weight_memory + scale_memory + zp_memory + bias_memory) / (1024 * 1024)
+                layer_mem = (weight_memory + scale_memory + zp_memory + bias_memory) / (1024 * 1024)
+                total_memory += layer_mem
 
             elif isinstance(module, WrapperLinear):
                 # WrapperLinear - calculate based on its quantization parameters
@@ -544,94 +546,20 @@ class PrecisionOptimizer:
                     zp_memory = out_features * num_groups * 4     # int32
 
                     bias_memory = out_features * 4 if module.orig_layer.bias is not None else 0
-                    total_memory += (weight_memory + scale_memory + zp_memory + bias_memory) / (1024 * 1024)
+                    layer_mem = (weight_memory + scale_memory + zp_memory + bias_memory) / (1024 * 1024)
+                    total_memory += layer_mem
                 else:
                     # Not quantized, treat as fp16
                     weight_memory = out_features * in_features * 2  # fp16
                     bias_memory = out_features * 2 if module.orig_layer.bias is not None else 0
-                    total_memory += (weight_memory + bias_memory) / (1024 * 1024)
+                    layer_mem = (weight_memory + bias_memory) / (1024 * 1024)
+                    total_memory += layer_mem
 
-        return total_memory
-
-    def _calculate_block_memory_usage(self, quantized_block, config: QuantizationConfig) -> float:
-        """Calculate actual memory usage of a quantized block in MB."""
-        total_memory = 0.0
-
-        # Unwrap to get actual block
-        actual_block = self._unwrap_module(quantized_block)
-
-        layer_count = 0
-        for name, module in actual_block.named_modules():
-            # Check for Linear, QuantizedLinear, and WrapperLinear modules
-            if isinstance(module, (torch.nn.Linear, QuantizedLinear, WrapperLinear)):
-                # Get layer name relative to block
-                layer_name = name
-                layer_count += 1
-                
-                if config.layer_exceptions and layer_name in config.layer_exceptions:
-                    # Frozen layer: higher precision but minimum group size
-                    memory = self._calculate_layer_memory(
-                        module,
-                        bits=8,  # Frozen layers use higher precision
-                        group_size=self.min_group_size
-                    )
-                else:
-                    # Quantized layer: uses config settings
-                    memory = self._calculate_layer_memory(
-                        module,
-                        bits=config.bits,
-                        group_size=config.group_size
-                    )
-                total_memory += memory
-        
-        # Debug: Print layer count and total memory
         if layer_count == 0:
-            print(f"        Warning: No Linear layers found in block")
-            print(f"        Original block type: {type(quantized_block)}")
-            print(f"        Actual block type: {type(actual_block)}")
-            # Try to see what's inside actual_block
-            if hasattr(actual_block, 'named_modules'):
-                all_modules = list(actual_block.named_modules())
-                print(f"        Found {len(all_modules)} modules: {[(name, type(mod).__name__) for name, mod in all_modules[:5]]}")
-        else:
-            print(f"        Calculated memory for {layer_count} layers: {total_memory:.1f}MB")
-                
+            print(f"          [DEBUG] WARNING: No layers found! Block type: {type(actual_block)}")
+
         return total_memory
-        
-    def _calculate_layer_memory(self, layer: Union[torch.nn.Linear, QuantizedLinear, WrapperLinear], bits: int, group_size: int) -> float:
-        """Calculate memory usage for a single layer in MB."""
-        # Get dimensions based on layer type
-        if isinstance(layer, QuantizedLinear):
-            out_features = layer.out_features
-            in_features = layer.in_features
-        elif isinstance(layer, WrapperLinear):
-            out_features, in_features = layer.orig_layer.weight.shape
-        else:
-            out_features, in_features = layer.weight.shape
-        
-        # Quantized weights memory
-        values_per_int32 = 32 // bits
-        total_elements = out_features * in_features
-        packed_elements = (total_elements + values_per_int32 - 1) // values_per_int32  # Ceiling division
-        quantized_weight_memory = packed_elements * 4  # int32 = 4 bytes
-        
-        # Scale and zero_point tensors
-        num_groups = (in_features + group_size - 1) // group_size  # Ceiling division
-        scale_memory = out_features * num_groups * 4  # float32 scales
-        zp_memory = out_features * num_groups * 4     # int32 zero points
-        
-        # Bias (if present)
-        bias_memory = 0
-        if isinstance(layer, WrapperLinear):
-            if layer.orig_layer.bias is not None:
-                bias_memory = out_features * 4  # float32 bias
-        elif hasattr(layer, 'bias') and layer.bias is not None:
-            bias_memory = out_features * 4  # float32 bias
-            
-        total_memory_bytes = quantized_weight_memory + scale_memory + zp_memory + bias_memory
-        return total_memory_bytes / (1024 * 1024)  # Convert to MB
-        
-        
+
     def freeze_layers(self, block_name: str, layer_names: List[str]):
         """Mark specific layers as frozen (won't be quantized further)."""
         if block_name not in self.block_quantizations:
@@ -1311,6 +1239,9 @@ class PrecisionOptimizer:
                 print(f"          No layers wrapped in {block_name}")
                 return current_block
 
+            # Convert entire wrapped_block to fp16 for mixed precision training
+            wrapped_block = wrapped_block.to(dtype=torch.float16)
+
             # Step 2: Replace frozen layers with QuantizedLinear from saved block
             # These QuantizedLinear layers will pass gradients but won't train (weights are buffers)
             for layer_name in frozen_layer_names:
@@ -1321,9 +1252,9 @@ class PrecisionOptimizer:
                         print(f"            Warning: Layer {layer_name} not found in saved block")
                         continue
 
-                    # Ensure it's on the correct device
+                    # Ensure it's on the correct device and dtype (fp16 for consistency)
                     device = next(wrapped_block.parameters()).device
-                    saved_layer = saved_layer.to(device)
+                    saved_layer = saved_layer.to(device=device, dtype=torch.float16)
 
                     # Replace WrapperLinear with QuantizedLinear (frozen but gradient-passing)
                     set_module_by_name(wrapped_block, layer_name, saved_layer)
@@ -1340,7 +1271,11 @@ class PrecisionOptimizer:
                 input_tensor = input_dict.get('hidden_states', input_dict.get('input', None))
                 if input_tensor is not None:
                     block_inputs.append(input_tensor)
-                    block_outputs.append(output_tensor)
+                    # Handle case where output_tensor is a tuple
+                    if isinstance(output_tensor, tuple):
+                        block_outputs.append(output_tensor[0])
+                    else:
+                        block_outputs.append(output_tensor)
 
             if not block_inputs:
                 print(f"          No valid inputs found in cached data")
