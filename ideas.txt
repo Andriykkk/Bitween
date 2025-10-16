@@ -1,12 +1,11 @@
 [ ] add gradual quantisation
     [ ] remove hardcoded values for bits, rtn analys and group
-    [ ] remove if .wrapper and move block to 16 bit for quantization
     [ ] in the end run training quantization for whole model to check everything and also try to increase freeze layers group size
-    [ ] move quantized blocks to ram and move to eval mode
     [ ] make usual algorithm that remove layers that have too high error and could not learn and some layers learn to lover bits
     [ ] make so that so things need to transfer to cpu for memory
     [ ] later think about quantising with separate model look for outliers and model that find hyperparameters and look what layers to train (check usual model and hyerarhical reasoning model)
     [ ] make so that in mlp with experts it also train individual layers that dont get enought attention
+    [ ] check what take memory and also move everything to 16 bit
 [ ] quantise 70b model to 2 bit
 [ ] quantise several neighbor blocks and move by one everytime like this blocks could learn to work with each other instead of blindly quantise each block
 [ ] add evaluation before and after quantisation

@@ -752,9 +752,12 @@ class PrecisionOptimizer:
             
             if block_name not in wrapped_info:
                 print(f"        Failed to wrap {block_name}")
-                return False, float('inf')
-            
+                return False, float('inf'), None
+
             wrapper_info = wrapped_info[block_name]
+
+            # Convert wrapped module to fp16 to match input dtype (LayerNorm params need to be fp16)
+            wrapper_info['wrapped_module'] = wrapper_info['wrapped_module'].to(dtype=torch.float16)
 
             # Step 2: Convert cached_data format for training
             # cached_data is List[(input_dict, output_tensor)]
@@ -764,10 +767,10 @@ class PrecisionOptimizer:
                 input_tensor = input_dict.get('hidden_states', input_dict.get('input', None))
                 if input_tensor is not None:
                     block_inputs.append(input_tensor)
-            
+
             if not block_inputs:
                 print(f"        No valid inputs found in cached data")
-                return False, float('inf')
+                return False, float('inf'), None
             
             # Step 3: Train the wrapped block (automatically handles frozen layers)
             result = self._train_wrapper_respecting_frozen_layers(
@@ -783,7 +786,10 @@ class PrecisionOptimizer:
             # Step 4: Apply best parameters (automatically skips frozen layers)
             if not wrapper_info['is_single_layer']:
                 self._apply_best_params_respecting_frozen_layers(block_name, wrapper_info['wrapped_module'])
-            
+
+            # Convert back to fp32 for evaluation (rest of model expects fp32)
+            wrapper_info['wrapped_module'] = wrapper_info['wrapped_module'].to(dtype=torch.float32)
+
             # Step 5: Evaluate performance
             performance = self.evaluate_block_performance(block_name)
             
@@ -1035,12 +1041,9 @@ class PrecisionOptimizer:
         quantized_block_unwrapped = self._unwrap_module(quantized_block).to(device=device, dtype=torch.float16)
         saved_quantized_block_unwrapped = self._unwrap_module(saved_quantized_block_gpu)
 
-        # Store original model block for restoration at the end
-        original_model_block = get_module_by_name(self.model, block_name)
-
-        # Convert model to fp16 once for all testing (quantized blocks only work in fp16)
-        print(f"        Converting model to fp16 for testing...")
-        self.model = self.model.to(dtype=torch.float16)
+        # Create a copy of the model in fp16 for testing (don't modify original model)
+        print(f"        Creating fp16 copy of model for testing...")
+        model_fp16 = copy.deepcopy(self.model).to(device=device, dtype=torch.float16)
 
         # Phase 1: Exponential search to find upper bound
         recovery_count = 1
@@ -1056,7 +1059,7 @@ class PrecisionOptimizer:
 
             try:
                 meets_budget = self._test_mixed_block_with_recovery_layers(
-                    quantized_block_unwrapped, saved_quantized_block_unwrapped, block_name, recovery_set
+                    quantized_block_unwrapped, saved_quantized_block_unwrapped, block_name, recovery_set, model_fp16
                 )
 
                 if meets_budget:
@@ -1078,7 +1081,7 @@ class PrecisionOptimizer:
             # Try all layers as last resort
             print(f"        Exponential search failed, trying all {len(sorted_layer_impacts)} layers")
             recovery_set = sorted_layer_impacts
-            if self._test_mixed_block_with_recovery_layers(quantized_block_unwrapped, saved_quantized_block_unwrapped, block_name, recovery_set):
+            if self._test_mixed_block_with_recovery_layers(quantized_block_unwrapped, saved_quantized_block_unwrapped, block_name, recovery_set, model_fp16):
                 # Create final block with all recovery layers applied
                 final_quantized_block = copy.deepcopy(quantized_block_unwrapped)
                 for layer_info in recovery_set:
@@ -1088,18 +1091,9 @@ class PrecisionOptimizer:
                         set_module_by_name(final_quantized_block, layer_name, saved_layer)
 
                 print(f"        Found minimal recovery set: {len(recovery_set)} layers (all layers)")
-
-                # Restore model block and convert back to fp32 before returning
-                set_module_by_name(self.model, block_name, original_model_block)
-                print(f"        Converting model back to fp32...")
-                self.model = self.model.to(dtype=torch.float32)
                 return recovery_set, final_quantized_block
             else:
                 print(f"        Complete recovery failed")
-                # Restore model block and convert back to fp32 before returning
-                set_module_by_name(self.model, block_name, original_model_block)
-                print(f"        Converting model back to fp32...")
-                self.model = self.model.to(dtype=torch.float32)
                 return [], None
 
         # Phase 2: Binary search to find exact minimum
@@ -1116,7 +1110,7 @@ class PrecisionOptimizer:
 
             try:
                 meets_budget = self._test_mixed_block_with_recovery_layers(
-                    quantized_block_unwrapped, saved_quantized_block_unwrapped, block_name, recovery_set
+                    quantized_block_unwrapped, saved_quantized_block_unwrapped, block_name, recovery_set, model_fp16
                 )
 
                 if meets_budget:
@@ -1145,13 +1139,7 @@ class PrecisionOptimizer:
 
         print(f"        Found minimal recovery set: {best_count} layers")
 
-        # Restore original model block after all testing
-        set_module_by_name(self.model, block_name, original_model_block)
-
-        # Convert model back to fp32 after all testing
-        print(f"        Converting model back to fp32...")
-        self.model = self.model.to(dtype=torch.float32)
-
+        # No need to restore model - we used a copy (model_fp16) for testing
         return final_recovery_set, final_quantized_block
         
     def _find_optimal_recovery_set(self, quantized_block, block_name, sorted_layer_impacts, budget):
@@ -1196,8 +1184,15 @@ class PrecisionOptimizer:
             print(f"        → Both directions failed")
             return [], None
         
-    def _test_mixed_block_with_recovery_layers(self, quantized_block, saved_quantized_block, block_name, recovery_set):
+    def _test_mixed_block_with_recovery_layers(self, quantized_block, saved_quantized_block, block_name, recovery_set, test_model):
         """Test if mixed block meets budget by replacing layers from saved block.
+
+        Args:
+            quantized_block: Unwrapped quantized block on GPU/fp16
+            saved_quantized_block: Unwrapped saved block on GPU/fp16
+            block_name: Name of the block
+            recovery_set: List of layers to replace
+            test_model: fp16 copy of model for testing (doesn't modify original model)
 
         Note: quantized_block and saved_quantized_block should already be unwrapped and on GPU/fp16.
         """
@@ -1208,8 +1203,8 @@ class PrecisionOptimizer:
         # Store original layers for restoration
         original_layers = {}
 
-        # Store original model block for restoration
-        original_model_block = get_module_by_name(self.model, block_name)
+        # Store original test model block for restoration
+        original_test_model_block = get_module_by_name(test_model, block_name)
 
         try:
             # Replace specified layers with layers from saved block
@@ -1228,15 +1223,23 @@ class PrecisionOptimizer:
                 if saved_layer is not None:
                     set_module_by_name(quantized_block, layer_name, saved_layer)
 
-            # Keep quantized block in fp16 and put it in model
-            set_module_by_name(self.model, block_name, quantized_block)
+            # Keep quantized block in fp16 and put it in test model (not self.model)
+            set_module_by_name(test_model, block_name, quantized_block)
 
-            # Test performance (model is already in fp16 from parent function)
-            performance = self.evaluate_block_performance(block_name)
-            meets_budget = performance['under_threshold']
+            # Temporarily swap model for evaluation
+            original_model = self.model
+            self.model = test_model
 
-            # Restore original model block
-            set_module_by_name(self.model, block_name, original_model_block)
+            try:
+                # Test performance (test_model is in fp16)
+                performance = self.evaluate_block_performance(block_name)
+                meets_budget = performance['under_threshold']
+            finally:
+                # Restore original model
+                self.model = original_model
+
+            # Restore original test model block
+            set_module_by_name(test_model, block_name, original_test_model_block)
 
             return meets_budget
 
@@ -1269,8 +1272,14 @@ class PrecisionOptimizer:
         print(f"          Target quantization for non-frozen layers: {target_bits}-bit, group_size={target_group_size}")
 
         try:
-            # Get current block state
-            current_block = get_module_by_name(self.model, block_name)
+            # Get fresh block from original model (self.model might have quantized version)
+            if self.original_model is None:
+                print(f"          No original model available, using current model")
+                current_block = get_module_by_name(self.model, block_name)
+            else:
+                # Use original model to get unquantized block
+                original_block = get_module_by_name(self.original_model, block_name)
+                current_block = copy.deepcopy(original_block)
 
             # Get saved quantized block (source of frozen layers)
             saved_quantized_block = self.quantized_blocks.get(block_name)
@@ -1278,33 +1287,36 @@ class PrecisionOptimizer:
                 print(f"          No saved quantized block available for frozen layers")
                 return current_block
 
+            # Unwrap saved block to get actual module (might be wrapped in BlockCacheWrapper, RTNWrapper, etc.)
+            saved_quantized_block_unwrapped = self._unwrap_module(saved_quantized_block)
+
             # Get frozen layer names from recovery set
             frozen_layer_names = [layer_info['layer_name'] for layer_info in recovery_set]
 
-            # Step 1: Wrap the block for training with target quantization
-            # This converts all layers to WrapperLinear for training
-            wrapped_info = wrap_model_for_training(
-                model=self.model,
-                block_names=[block_name],
+            # Step 1: Wrap the block directly (not via model, since model might have quantized version)
+            from ..wrapper import unified_wrapper
+
+            wrapped_block, quantized_names = unified_wrapper(
+                current_block,
                 enable_minmax_tuning=True,
+                enable_round_tuning=True,
                 bits=target_bits,
                 group_size=target_group_size,
-                ignore_layers=set()  # Wrap all layers initially
+                device=next(current_block.parameters()).device,
+                ignore_layers=set(),
+                module_prefix=block_name
             )
 
-            if block_name not in wrapped_info:
-                print(f"          Failed to wrap {block_name} for mixed precision training")
+            if not quantized_names:
+                print(f"          No layers wrapped in {block_name}")
                 return current_block
-
-            wrapper_info = wrapped_info[block_name]
-            wrapped_block = wrapper_info['wrapped_module']
 
             # Step 2: Replace frozen layers with QuantizedLinear from saved block
             # These QuantizedLinear layers will pass gradients but won't train (weights are buffers)
             for layer_name in frozen_layer_names:
                 try:
                     # Get saved quantized layer (QuantizedLinear with frozen weights)
-                    saved_layer = get_module_by_name(saved_quantized_block, layer_name)
+                    saved_layer = get_module_by_name(saved_quantized_block_unwrapped, layer_name)
                     if saved_layer is None:
                         print(f"            Warning: Layer {layer_name} not found in saved block")
                         continue
@@ -1321,26 +1333,30 @@ class PrecisionOptimizer:
                     print(f"            Failed to replace frozen layer {layer_name}: {e}")
                     continue
             
-            # Step 3: Convert cached_data format for training
+            # Step 3: Extract inputs and outputs from cached_data
             block_inputs = []
+            block_outputs = []
             for input_dict, output_tensor in cached_data:
                 input_tensor = input_dict.get('hidden_states', input_dict.get('input', None))
                 if input_tensor is not None:
                     block_inputs.append(input_tensor)
-            
+                    block_outputs.append(output_tensor)
+
             if not block_inputs:
                 print(f"          No valid inputs found in cached data")
                 return current_block
-            
-            # Step 4: Train with frozen layers excluded from optimizer (use unified function)
-            result = self._train_wrapper_respecting_frozen_layers(
+
+            # Step 4: Train with frozen layers using cached outputs (no need to recompute)
+            is_single_layer = isinstance(wrapped_block, WrapperLinear)
+            result = self._train_wrapper_with_cached_outputs(
                 module_name=block_name,
                 wrapped_module=wrapped_block,
                 block_inputs=block_inputs,
-                iters=1,  # Number of training epochs
-                lr=1e-4,  # Learning rate 
+                block_outputs=block_outputs,
+                iters=1,
+                lr=1e-4,
                 batch_size=self.training_batch_size,
-                is_single_layer=wrapper_info['is_single_layer']
+                is_single_layer=is_single_layer
             )
             
             # Convert WrapperLinear to QuantizedLinear for consistency
@@ -1400,16 +1416,29 @@ class PrecisionOptimizer:
                     print(f"        No recovery set found")
                     return False, float('inf')
                 
-                print("##########", recovery_set)
-
                 mixed_precision_block = self._retrain_mixed_precision_block(block_name, recovery_set, cached_data, bits, group_size)
-        
-                # Phase 4: Apply recovery configuration and freeze problematic layers
+
+                # Phase 4: Evaluate the retrained mixed precision block
+                print(f"          Evaluating retrained mixed precision block...")
+
+                # Temporarily replace model block to evaluate
+                original_model_block = get_module_by_name(self.model, block_name)
+                set_module_by_name(self.model, block_name, mixed_precision_block.to(device=next(self.model.parameters()).device))
+
+                try:
+                    performance = self.evaluate_block_performance(block_name)
+                    print(f"          Mixed precision result: PPL increase = {performance['ppl_increase']:.4f}")
+                    print(f"          Combined sensitivity = {performance['current_combined_sensitivity']:.4f}, threshold = {performance['threshold_combined_sensitivity']:.4f}")
+                finally:
+                    # Restore original model block
+                    set_module_by_name(self.model, block_name, original_model_block)
+
+                # Phase 5: Apply recovery configuration and freeze problematic layers
                 config = QuantizationConfig(
                     bits=bits,
                     group_size=group_size,
                     method="Mixed",
-                    error_metric=0.0,  # Will be updated after evaluation
+                    error_metric=performance['ppl_increase'],
                     memory_savings=self._estimate_memory_savings(bits, group_size)
                 )
 
@@ -1430,18 +1459,35 @@ class PrecisionOptimizer:
                     }
 
                 self._save_block_quantization_if_better(block_name, config, mixed_precision_block)
-                
+
+                # IMPORTANT: Restore model to original state after layer recovery
+                # The model might have been modified during recovery testing
+                print(f"        Restoring model block to original unquantized state...")
+                if self.original_model is not None:
+                    original_block_for_restore = get_module_by_name(self.original_model, block_name)
+                    restored_block = copy.deepcopy(original_block_for_restore)
+                    set_module_by_name(self.model, block_name, restored_block)
+                    print(f"        ✓ Model block restored to original state")
+
             finally:
                 # Clean up working block
                 del working_block
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-            
+
             print(f"        ✓ Layer recovery successful: {len(recovery_set)} layers frozen")
             return True, performance['ppl_increase']
-                
+
         except Exception as e:
             print(f"        Layer recovery failed with error: {e}")
+            # Try to restore model block even on error
+            try:
+                if self.original_model is not None:
+                    original_block_for_restore = get_module_by_name(self.original_model, block_name)
+                    restored_block = copy.deepcopy(original_block_for_restore)
+                    set_module_by_name(self.model, block_name, restored_block)
+            except:
+                pass
             return False, float('inf')
         
         
@@ -1578,6 +1624,111 @@ class PrecisionOptimizer:
                 
         return frozen_layers
         
+    def _train_wrapper_with_cached_outputs(self, module_name, wrapped_module, block_inputs, block_outputs, iters, lr, batch_size, is_single_layer):
+        """Training function that uses pre-cached outputs (for layer recovery with mixed precision)."""
+        # Get frozen layer names for this block
+        frozen_layer_names = self._get_frozen_layer_names_for_block(module_name)
+
+        if frozen_layer_names:
+            print(f"        Training {module_name} with {len(frozen_layer_names)} frozen layers: {frozen_layer_names}")
+        else:
+            print(f"        Training {module_name} (no frozen layers)")
+
+        if not block_inputs or not block_outputs:
+            print("Warning: No cached inputs/outputs for training, skipping...")
+            return None
+
+        num_samples = len(block_inputs)
+        device = next(wrapped_module.parameters()).device
+
+        # Use the pre-cached outputs (no need to compute them again!)
+        print(f"        Using {len(block_outputs)} pre-cached outputs from original model")
+
+        # Find all WrapperLinear instances (frozen layers are QuantizedLinear, so they're excluded automatically)
+        wrappers = []
+        if isinstance(wrapped_module, WrapperLinear):
+            wrappers = [("root", wrapped_module)]
+        else:
+            for name, submodule in wrapped_module.named_modules():
+                if isinstance(submodule, WrapperLinear):
+                    wrappers.append((name, submodule))
+
+        # Setup optimizer parameters (only from WrapperLinear - QuantizedLinear layers are automatically excluded)
+        learnable_params = []
+        trained_wrapper_count = 0
+
+        for name, wrapper in wrappers:
+            # Add trainable parameters from WrapperLinear
+            if wrapper.value is not None:
+                learnable_params.append(wrapper.value)
+            if wrapper.min_scale is not None:
+                learnable_params.append(wrapper.min_scale)
+            if wrapper.max_scale is not None:
+                learnable_params.append(wrapper.max_scale)
+
+            trained_wrapper_count += 1
+
+        if not learnable_params:
+            print(f"        Warning: No learnable parameters found (all {len(wrappers)} layers frozen?)")
+            return wrapped_module
+
+        print(f"        Training {trained_wrapper_count}/{len(wrappers)} layers ({len(wrappers)-trained_wrapper_count} frozen)")
+
+        # Create optimizer with only non-frozen parameters
+        optimizer = SignSGD(learnable_params, lr=lr, momentum=0.9)
+
+        batch_size = min(batch_size, num_samples)
+        steps_per_epoch = (num_samples + batch_size - 1) // batch_size
+        total_steps = iters * steps_per_epoch
+
+        # Learning rate scheduler
+        scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=1.0, end_factor=0.0, total_iters=total_steps
+        )
+
+        wrapped_module.train()
+
+        # Training loop
+        for epoch in range(iters):
+            epoch_loss = 0.0
+            indices = torch.randperm(num_samples)
+
+            for step in range(steps_per_epoch):
+                start_idx = step * batch_size
+                end_idx = min(start_idx + batch_size, num_samples)
+                batch_indices = indices[start_idx:end_idx]
+
+                batch_loss = 0.0
+
+                for idx in batch_indices:
+                    inp = block_inputs[idx].to(device=device, dtype=torch.float16)  # Use fp16 for QuantizedLinear
+                    target = block_outputs[idx].to(device=device, dtype=torch.float16)
+
+                    optimizer.zero_grad()
+
+                    output = wrapped_module(inp)
+                    if isinstance(output, tuple):
+                        output = output[0]
+
+                    # Ensure output is fp16 for loss calculation
+                    output = output.to(dtype=torch.float16)
+
+                    loss = torch.nn.functional.mse_loss(output, target)
+                    loss.backward()
+
+                    optimizer.step()
+                    scheduler.step()
+
+                    batch_loss += loss.item()
+
+                epoch_loss += batch_loss / len(batch_indices)
+
+            avg_loss = epoch_loss / steps_per_epoch
+            print(f"        Epoch {epoch+1}/{iters}: Loss = {avg_loss:.6f}, LR = {scheduler.get_last_lr()[0]:.6f}")
+
+        wrapped_module.eval()
+        return wrapped_module
+
     def _train_wrapper_respecting_frozen_layers(self, module_name, wrapped_module, block_inputs, iters, lr, batch_size, is_single_layer):
         """Unified training function that automatically excludes frozen layers from optimizer."""
         # Get frozen layer names for this block
@@ -1598,17 +1749,24 @@ class PrecisionOptimizer:
         # Cache original outputs (before training)
         original_outputs = []
         wrapped_module.eval()
-        
+
         with torch.no_grad():
             for inp in tqdm(block_inputs, desc="Caching outputs", leave=False):
-                inp = inp.to(device=device, dtype=torch.float32)
+                # Ensure input is on correct device and dtype
+                if not isinstance(inp, torch.Tensor):
+                    continue
+                # Use fp16 for consistency (WrapperLinear works with fp16 internally)
+                inp = inp.to(device=device, dtype=torch.float16)
                 try:
                     orig_out = wrapped_module(inp)
                     if isinstance(orig_out, tuple):
                         orig_out = orig_out[0]
                     original_outputs.append(orig_out.detach().cpu().to(dtype=torch.float16))
                 except Exception as e:
+                    import traceback
                     print(f"Warning: Failed to cache output: {e}")
+                    print("Traceback:")
+                    traceback.print_exc()
                     continue
         
         if not original_outputs:
@@ -1670,9 +1828,9 @@ class PrecisionOptimizer:
                 batch_indices = indices[start_idx:end_idx]
                 
                 batch_loss = 0.0
-                
+
                 for idx in batch_indices:
-                    inp = block_inputs[idx].to(device=device, dtype=torch.float32)
+                    inp = block_inputs[idx].to(device=device, dtype=torch.float16)  # Use fp16 for QuantizedLinear
                     target = original_outputs[idx].to(device=device, dtype=torch.float16)
 
                     optimizer.zero_grad()
@@ -1681,7 +1839,7 @@ class PrecisionOptimizer:
                     if isinstance(output, tuple):
                         output = output[0]
 
-                    # Convert output to fp16 for loss calculation
+                    # Ensure output is fp16 for loss calculation
                     output = output.to(dtype=torch.float16)
 
                     loss = torch.nn.functional.mse_loss(output, target)
