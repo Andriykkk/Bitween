@@ -85,14 +85,16 @@ class PrecisionOptimizer:
             training_batch_size: Batch size for trainable quantization (default: 4)
             training_manager: Reference to training manager for accessing cached data
         """
-        self.model = model
+        # Convert models to fp16 for QuantizedLinear compatibility
+        self.model = model.to(dtype=torch.float16)
+        self.original_model = original_model.to(dtype=torch.float16) if original_model is not None else None
+
         self.tokenizer = tokenizer
         self.min_group_size = min_group_size
         self.max_group_size = max_group_size
         self.baseline_metrics = baseline_metrics or {}
         self.evaluation_samples = evaluation_samples
         self.budget_allocations = budget_allocations or {}
-        self.original_model = original_model
         self.training_batch_size = training_batch_size
         self.training_manager = training_manager
 
@@ -103,8 +105,9 @@ class PrecisionOptimizer:
 
         # Get fixed calibration data for consistent evaluation (reusing ImportanceAnalyzer approach)
         self.eval_samples = self._get_evaluation_samples()
-        
+
         print(f"PrecisionOptimizer initialized:")
+        print(f"  Models converted to fp16 for QuantizedLinear compatibility")
         print(f"  Budget allocations for {len(self.budget_allocations)} blocks")
         print(f"  Evaluation samples: {self.evaluation_samples}")
         print(f"  Training batch size: {self.training_batch_size}")
@@ -715,10 +718,7 @@ class PrecisionOptimizer:
             if not wrapper_info['is_single_layer']:
                 self._apply_best_params_respecting_frozen_layers(block_name, wrapper_info['wrapped_module'])
 
-            # Convert back to fp32 for evaluation (rest of model expects fp32)
-            wrapper_info['wrapped_module'] = wrapper_info['wrapped_module'].to(dtype=torch.float32)
-
-            # Step 5: Evaluate performance
+            # Step 5: Evaluate performance (everything is fp16 now)
             performance = self.evaluate_block_performance(block_name)
             
             print(f"        Training result: PPL increase = {performance['ppl_increase']:.4f}")
@@ -1264,18 +1264,20 @@ class PrecisionOptimizer:
                     print(f"            Failed to replace frozen layer {layer_name}: {e}")
                     continue
             
-            # Step 3: Extract inputs and outputs from cached_data
+            # Step 3: Extract inputs and outputs from cached_data and move to GPU
             block_inputs = []
             block_outputs = []
+            device = next(wrapped_block.parameters()).device
             for input_dict, output_tensor in cached_data:
                 input_tensor = input_dict.get('hidden_states', input_dict.get('input', None))
                 if input_tensor is not None:
-                    block_inputs.append(input_tensor)
+                    # Move to GPU and convert to fp16
+                    block_inputs.append(input_tensor.to(device=device, dtype=torch.float16))
                     # Handle case where output_tensor is a tuple
                     if isinstance(output_tensor, tuple):
-                        block_outputs.append(output_tensor[0])
+                        block_outputs.append(output_tensor[0].to(device=device, dtype=torch.float16))
                     else:
-                        block_outputs.append(output_tensor)
+                        block_outputs.append(output_tensor.to(device=device, dtype=torch.float16))
 
             if not block_inputs:
                 print(f"          No valid inputs found in cached data")
