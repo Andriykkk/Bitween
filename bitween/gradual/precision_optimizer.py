@@ -962,11 +962,12 @@ class PrecisionOptimizer:
         saved_quantized_block = self.quantized_blocks[block_name]
 
         # Move saved block to GPU once at the beginning (it's stored on CPU)
+        # DON'T specify dtype - QuantizedLinear has mixed dtypes (int32 qweight, fp16 scale/zero_point)
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        saved_quantized_block_gpu = saved_quantized_block.to(device=device, dtype=torch.float16)
+        saved_quantized_block_gpu = saved_quantized_block.to(device=device)
 
         # Unwrap both blocks once at the beginning to work with actual modules
-        quantized_block_unwrapped = self._unwrap_module(quantized_block).to(device=device, dtype=torch.float16)
+        quantized_block_unwrapped = self._unwrap_module(quantized_block).to(device=device)
         saved_quantized_block_unwrapped = self._unwrap_module(saved_quantized_block_gpu)
 
         # Create a copy of the model in fp16 for testing (don't modify original model)
@@ -1215,8 +1216,14 @@ class PrecisionOptimizer:
                 print(f"          No saved quantized block available for frozen layers")
                 return current_block
 
+            # Move saved block to GPU (it's stored on CPU) before extracting layers
+            # DON'T specify dtype - QuantizedLinear has mixed dtypes (int32 qweight, fp16 scale/zero_point)
+            # Get device from self.model (on GPU), not from current_block (from original_model on CPU)
+            device = next(self.model.parameters()).device
+            saved_quantized_block_gpu = saved_quantized_block.to(device=device)
+
             # Unwrap saved block to get actual module (might be wrapped in BlockCacheWrapper, RTNWrapper, etc.)
-            saved_quantized_block_unwrapped = self._unwrap_module(saved_quantized_block)
+            saved_quantized_block_unwrapped = self._unwrap_module(saved_quantized_block_gpu)
 
             # Get frozen layer names from recovery set
             frozen_layer_names = [layer_info['layer_name'] for layer_info in recovery_set]
@@ -1224,13 +1231,14 @@ class PrecisionOptimizer:
             # Step 1: Wrap the block directly (not via model, since model might have quantized version)
             from ..wrapper import unified_wrapper
 
+            # Use device from self.model (on GPU), not current_block (from original_model on CPU)
             wrapped_block, quantized_names = unified_wrapper(
                 current_block,
                 enable_minmax_tuning=True,
                 enable_round_tuning=True,
                 bits=target_bits,
                 group_size=target_group_size,
-                device=next(current_block.parameters()).device,
+                device=device,  # Use device from self.model (defined above)
                 ignore_layers=set(),
                 module_prefix=block_name
             )
@@ -1239,8 +1247,9 @@ class PrecisionOptimizer:
                 print(f"          No layers wrapped in {block_name}")
                 return current_block
 
-            # Convert entire wrapped_block to fp16 for mixed precision training
-            wrapped_block = wrapped_block.to(dtype=torch.float16)
+            # Move wrapped_block to GPU and convert to fp16 for mixed precision training
+            # Must specify device AND dtype since current_block came from CPU (original_model)
+            wrapped_block = wrapped_block.to(device=device, dtype=torch.float16)
 
             # Step 2: Replace frozen layers with QuantizedLinear from saved block
             # These QuantizedLinear layers will pass gradients but won't train (weights are buffers)
@@ -1252,9 +1261,20 @@ class PrecisionOptimizer:
                         print(f"            Warning: Layer {layer_name} not found in saved block")
                         continue
 
-                    # Ensure it's on the correct device and dtype (fp16 for consistency)
-                    device = next(wrapped_block.parameters()).device
-                    saved_layer = saved_layer.to(device=device, dtype=torch.float16)
+                    # Explicitly move all buffers to GPU (qweight, scale, zero_point)
+                    # Reuse device from above (from self.model)
+                    if isinstance(saved_layer, QuantizedLinear):
+                        if hasattr(saved_layer, 'qweight') and saved_layer.qweight is not None:
+                            saved_layer.qweight = saved_layer.qweight.to(device=device)
+                        if hasattr(saved_layer, 'scale') and saved_layer.scale is not None:
+                            saved_layer.scale = saved_layer.scale.to(device=device)
+                        if hasattr(saved_layer, 'zero_point') and saved_layer.zero_point is not None:
+                            saved_layer.zero_point = saved_layer.zero_point.to(device=device)
+                        if hasattr(saved_layer, 'bias') and saved_layer.bias is not None:
+                            saved_layer.bias = saved_layer.bias.to(device=device)
+
+                    # Also ensure layer dtype is fp16
+                    saved_layer = saved_layer.to(dtype=torch.float16)
 
                     # Replace WrapperLinear with QuantizedLinear (frozen but gradient-passing)
                     set_module_by_name(wrapped_block, layer_name, saved_layer)
@@ -1267,7 +1287,7 @@ class PrecisionOptimizer:
             # Step 3: Extract inputs and outputs from cached_data and move to GPU
             block_inputs = []
             block_outputs = []
-            device = next(wrapped_block.parameters()).device
+            # Reuse device from above (from self.model)
             for input_dict, output_tensor in cached_data:
                 input_tensor = input_dict.get('hidden_states', input_dict.get('input', None))
                 if input_tensor is not None:
