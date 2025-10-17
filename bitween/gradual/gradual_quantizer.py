@@ -244,7 +244,7 @@ class GradualQuantizer:
             
             print(f"Completed processing {block_name}")
 
-            break
+            # break
             
         print(f"\nCompleted processing {block_count} blocks")
         
