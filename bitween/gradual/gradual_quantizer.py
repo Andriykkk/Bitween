@@ -86,10 +86,14 @@ class GradualQuantizer:
     def quantize(self) -> nn.Module:
         """
         Main entry point for gradual quantization.
-        
+
         Focus is on minimizing memory by reducing precision while staying within
         perplexity and KL divergence constraints.
-        
+
+        Note: This method modifies the input model in-place. A copy of the original
+        unquantized model is saved internally and can be accessed via self.original_model
+        (stored on CPU to save GPU memory).
+
         Returns:
             Quantized model optimized for maximum precision reduction within quality limits
         """
@@ -239,6 +243,8 @@ class GradualQuantizer:
             self.training_manager.clear_block_cache(block_name)
             
             print(f"Completed processing {block_name}")
+
+            break
             
         print(f"\nCompleted processing {block_count} blocks")
         
@@ -275,58 +281,3 @@ class GradualQuantizer:
             print(f"✓ Successfully quantized {block_name}: {quantization_config.bits}-bit, group_size={quantization_config.group_size}")
         else:
             print(f"⚠ Could not quantize {block_name} within budget - keeping original precision")
-            
-
-
-class QuantizationState:
-    """
-    Tracks the current precision configuration of all blocks and layers.
-    """
-    
-    def __init__(self):
-        self.block_precisions = {}  # block_name -> bit precision
-        self.layer_precisions = {}  # layer_name -> bit precision  
-        self.group_sizes = {}       # module_name -> group_size
-        self.ignored_layers = set() # layers excluded from quantization
-        self.precision_history = [] # track changes for rollback
-        
-    def set_block_precision(self, block_name: str, bits: int):
-        """Set precision for entire block."""
-        pass
-        
-    def set_layer_precision(self, layer_name: str, bits: int):
-        """Set precision for specific layer."""
-        pass
-        
-    def get_current_precision(self, module_name: str) -> int:
-        """Get current precision for module."""
-        pass
-        
-    def rollback_to_checkpoint(self, checkpoint_name: str):
-        """Rollback to previously saved state."""
-        pass
-        
-    def create_checkpoint(self, checkpoint_name: str):
-        """Save current state as checkpoint.""" 
-        pass
-        
-    def apply_to_model(self, model: nn.Module):
-        """Apply current precision configuration to model."""
-        pass
-        
-    def get_precision_summary(self) -> Dict:
-        """
-        Get summary of current precision configuration.
-        
-        Returns:
-            Dictionary with precision distribution statistics
-        """
-        pass
-        
-    def get_average_precision(self) -> float:
-        """Calculate average precision across all quantized modules."""
-        pass
-        
-    def get_precision_distribution(self) -> Dict[int, int]:
-        """Get count of modules at each precision level."""
-        pass

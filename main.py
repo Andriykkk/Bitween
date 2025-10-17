@@ -132,7 +132,8 @@ def main():
     quantized_path = os.path.join(save_dir, "opt125m_quantized.pth")
 
     print(f"Saving FP32 model to {fp32_path}...")
-    torch.save(model, fp32_path)
+    # Use the original model saved inside quantizer (not the modified 'model' variable)
+    torch.save(quantizer.original_model, fp32_path)
     
     print(f"Saving quantized model to {quantized_path}...")
     torch.save(quantized_model, quantized_path)

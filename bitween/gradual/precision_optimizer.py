@@ -130,8 +130,8 @@ class PrecisionOptimizer:
         """
         
         # Configuration
-        # precision_levels = [8, 4, 2]  # bits
-        precision_levels = [4, 2]  # bits
+        precision_levels = [8, 4, 2]  # bits
+        # precision_levels = [4, 2]  # bits
         
         # Get the block
         block = get_module_by_name(self.model, block_name)
@@ -147,8 +147,8 @@ class PrecisionOptimizer:
             print(f"    Trying {target_bits}-bit quantization...")
             
             # Try different group sizes from large to small
-            # all_group_sizes = self._get_group_size_sequence(self.max_group_size, self.min_group_size)
-            all_group_sizes = self._get_group_size_sequence(64, self.min_group_size)
+            all_group_sizes = self._get_group_size_sequence(self.max_group_size, self.min_group_size)
+            # all_group_sizes = self._get_group_size_sequence(64, self.min_group_size)
             
             # Skip group sizes that failed for higher bits (they'll definitely fail for lower bits)
             group_sizes = [gs for gs in all_group_sizes if gs not in failed_group_sizes]
@@ -792,10 +792,9 @@ class PrecisionOptimizer:
             baseline_outputs = self._get_block_outputs_on_cached_samples_direct(working_block, cached_data[:self.evaluation_samples])
             
             for layer_name, layer_module in all_layers:
-                # Skip if layer is already frozen
-                if self.is_layer_frozen(block_name, layer_name):
-                    continue
-                    
+                # Don't skip frozen layers - they should be reconsidered with different quantization params
+                # Frozen layers are only skipped during training (handled in optimizer setup)
+
                 print(f"          Testing impact of quantizing {layer_name}...")
                 
                 try:
@@ -1216,9 +1215,6 @@ class PrecisionOptimizer:
                 print(f"          No saved quantized block available for frozen layers")
                 return current_block
 
-            # Move saved block to GPU (it's stored on CPU) before extracting layers
-            # DON'T specify dtype - QuantizedLinear has mixed dtypes (int32 qweight, fp16 scale/zero_point)
-            # Get device from self.model (on GPU), not from current_block (from original_model on CPU)
             device = next(self.model.parameters()).device
             saved_quantized_block_gpu = saved_quantized_block.to(device=device)
 
