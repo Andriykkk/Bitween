@@ -26,50 +26,56 @@ class QuantizedLinearFunction(torch.autograd.Function):
         ctx.bits = bits
         ctx.group_size = group_size
 
-        # The fast, non-differentiable forward pass using the Triton kernel
         device = x.device
         original_shape = x.shape
-        
-        # Use 16-bit dtype based on GPU capability
-        # if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
-        #     target_dtype = torch.bfloat16
-        # else:
-        #     target_dtype = torch.float16
         target_dtype = torch.float16
-        
+
         # Convert input to target dtype before kernel
         x_reshaped = x.reshape(-1, original_shape[-1]).to(target_dtype)
 
         M, K = x_reshaped.shape
         N, _ = qweight.shape
-        
-        c = torch.empty((M, N), device=device, dtype=target_dtype)
 
-        DTYPE = {
-            torch.float16: tl.float16,
-            torch.bfloat16: tl.bfloat16,
-            torch.float32: tl.float32
-        }
+        if USE_CUDA_KERNEL:
+            # Use optimized CUDA kernel with tensor cores
+            c = quantized_matmul_cuda(
+                x_reshaped,
+                qweight,
+                scale,
+                zero_point,
+                bias,
+                bits,
+                group_size
+            )
+        else:
+            # Fallback to Triton kernel
+            c = torch.empty((M, N), device=device, dtype=target_dtype)
 
-        def grid(meta):
-            return (triton.cdiv(M, meta['BLOCK_M']), triton.cdiv(N, meta['BLOCK_N']))
+            DTYPE = {
+                torch.float16: tl.float16,
+                torch.bfloat16: tl.bfloat16,
+                torch.float32: tl.float32
+            }
 
-        quantized_linear_kernel[grid](
-            x_reshaped, qweight, scale, zero_point, bias, c,
-            M, N, K,
-            bits,
-            (1 << bits) - 1,  # qmask
-            x_reshaped.stride(0), x_reshaped.stride(1),
-            qweight.stride(0), qweight.stride(1),
-            scale.stride(0), scale.stride(1),
-            zero_point.stride(0), zero_point.stride(1),
-            bias.stride(0) if bias is not None else 0,
-            c.stride(0), c.stride(1),
-            GROUP_SIZE=group_size,
-            BIAS_ENABLED=(bias is not None),
-            DTYPE=DTYPE[target_dtype]
-        )
-        
+            def grid(meta):
+                return (triton.cdiv(M, meta['BLOCK_M']), triton.cdiv(N, meta['BLOCK_N']))
+
+            quantized_linear_kernel[grid](
+                x_reshaped, qweight, scale, zero_point, bias, c,
+                M, N, K,
+                bits,
+                (1 << bits) - 1,  # qmask
+                x_reshaped.stride(0), x_reshaped.stride(1),
+                qweight.stride(0), qweight.stride(1),
+                scale.stride(0), scale.stride(1),
+                zero_point.stride(0), zero_point.stride(1),
+                bias.stride(0) if bias is not None else 0,
+                c.stride(0), c.stride(1),
+                GROUP_SIZE=group_size,
+                BIAS_ENABLED=(bias is not None),
+                DTYPE=DTYPE[target_dtype]
+            )
+
         return c.reshape(*original_shape[:-1], N)
 
     @staticmethod
