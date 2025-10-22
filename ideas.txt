@@ -4,6 +4,7 @@
     [ ] make so that in mlp with experts it also train individual layers that dont get enought attention
     [ ] check what take memory and also move everything to 16 bit
 [ ] quantise 70b model to 2 bit
+[ ] add expert avare quantization
 [ ] quantise several neighbor blocks and move by one everytime like this blocks could learn to work with each other instead of blindly quantise each block
 [ ] add evaluation before and after quantisation
 [ ] add quantisation on cpu instead of gpu
