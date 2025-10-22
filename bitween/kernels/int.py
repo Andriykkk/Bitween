@@ -6,78 +6,33 @@ def bitween_kernel_config_pruner(configs, nargs, **kwargs):
     The global `configs` dict config after pruner is applied.
     """
     m, n, k = nargs["M"], nargs["N"], nargs["K"]
-    
+
     # Prune configs that don't make sense for small matrices
     used = set()
     for config in configs:
-        BLOCK_SIZE_M = config.kwargs["BLOCK_SIZE_M"]
-        BLOCK_SIZE_N = config.kwargs["BLOCK_SIZE_N"]
-        BLOCK_SIZE_K = config.kwargs["BLOCK_SIZE_K"]
-        
+        BLOCK_M = config.kwargs["BLOCK_M"]
+        BLOCK_N = config.kwargs["BLOCK_N"]
+        BLOCK_K = config.kwargs["BLOCK_K"]
+
         # Skip configs where block size exceeds matrix dimensions significantly
-        if BLOCK_SIZE_M > m * 2 or BLOCK_SIZE_N > n * 2:
+        if BLOCK_M > m * 2 or BLOCK_N > n * 2:
             continue
-            
+
         # Skip configs with overly large K blocks for small matrices
-        if k < 512 and BLOCK_SIZE_K > 64:
+        if k < 512 and BLOCK_K > 64:
             continue
-            
+
         used.add(config)
-        
+
     return list(used) if used else configs[:1]  # Keep at least one config
 
 @triton.autotune(
     configs=[
-        triton.Config({
-            "BLOCK_SIZE_M": 64,
-            "BLOCK_SIZE_N": 256,
-            "BLOCK_SIZE_K": 32,
-        }, num_stages=4, num_warps=4),
-        triton.Config({
-            "BLOCK_SIZE_M": 128,
-            "BLOCK_SIZE_N": 128,
-            "BLOCK_SIZE_K": 32,
-        }, num_stages=4, num_warps=4),
-        triton.Config({
-            "BLOCK_SIZE_M": 64,
-            "BLOCK_SIZE_N": 128,
-            "BLOCK_SIZE_K": 32,
-        }, num_stages=4, num_warps=4),
-        triton.Config({
-            "BLOCK_SIZE_M": 128,
-            "BLOCK_SIZE_N": 32,
-            "BLOCK_SIZE_K": 32,
-        }, num_stages=4, num_warps=4),
-        triton.Config({
-            "BLOCK_SIZE_M": 64,
-            "BLOCK_SIZE_N": 64,
-            "BLOCK_SIZE_K": 32,
-        }, num_stages=4, num_warps=4),
-        triton.Config({
-            "BLOCK_SIZE_M": 32,
-            "BLOCK_SIZE_N": 128,
-            "BLOCK_SIZE_K": 32,
-        }, num_stages=2, num_warps=8),
-        triton.Config({
-            "BLOCK_SIZE_M": 32,
-            "BLOCK_SIZE_N": 64,
-            "BLOCK_SIZE_K": 64,
-        }, num_stages=2, num_warps=4),
-        triton.Config({
-            "BLOCK_SIZE_M": 16,
-            "BLOCK_SIZE_N": 256,
-            "BLOCK_SIZE_K": 64,
-        }, num_stages=3, num_warps=4),
-        triton.Config({
-            "BLOCK_SIZE_M": 32,
-            "BLOCK_SIZE_N": 32,
-            "BLOCK_SIZE_K": 128,
-        }, num_stages=2, num_warps=4),
-        triton.Config({
-            "BLOCK_SIZE_M": 16,
-            "BLOCK_SIZE_N": 64,
-            "BLOCK_SIZE_K": 128,
-        }, num_stages=3, num_warps=2),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64}, num_stages=4, num_warps=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64}, num_stages=4, num_warps=4),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64}, num_stages=4, num_warps=4),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, num_stages=4, num_warps=4),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 64}, num_stages=2, num_warps=4),
     ],
     key=["M", "N", "K"],
     prune_configs_by={
@@ -88,87 +43,121 @@ def bitween_kernel_config_pruner(configs, nargs, **kwargs):
 )
 @triton.jit
 def quantized_linear_kernel(
-    # Pointers to input/output tensors
-    x_ptr, qweight_ptr, scale_ptr, zero_point_ptr, bias_ptr, c_ptr,
-    # Dimensions
+    # inputs
+    x_ptr,             # (M, K) input matrix (float)
+    qweight_ptr,       # (N, packed_K) int32 packed quantized weights
+    scale_ptr,         # (N, num_groups) per-group scales (float)
+    zp_ptr,            # (N, num_groups) per-group zero points (float)
+    bias_ptr,          # (N,) bias or 0 pointer
+    out_ptr,           # (M, N) output matrix (float)
+
+    # shapes / sizes
     M, N, K,
-    # Quantization parameters
     bits: tl.constexpr,
-    maxq: tl.constexpr,
+    qmask: tl.constexpr,  # (1<<bits)-1
     # Strides
     stride_xm, stride_xk,
     stride_qn, stride_qk,
-    stride_scale_row, stride_scale_group,
-    stride_zp_row, stride_zp_group,
+    stride_scalen, stride_scaleg,
+    stride_zpn, stride_zpg,
     stride_bias,
-    stride_cm, stride_cn,
-    # Block sizes
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE: tl.constexpr,
-    # Other configs
+    stride_outm, stride_outn,
+
+    # compile-time configs
+    GROUP_SIZE: tl.constexpr,      # number of input features per group
+    BLOCK_M: tl.constexpr,         # block size for M
+    BLOCK_N: tl.constexpr,         # block size for N
+    BLOCK_K: tl.constexpr,         # block size for K (in *unpacked* elements)
     BIAS_ENABLED: tl.constexpr,
-    DTYPE: tl.constexpr
+    DTYPE: tl.constexpr,
 ):
-    # 1. Block (tile) IDs
-    pid_m = tl.program_id(axis=0)  # output row tile
-    pid_n = tl.program_id(axis=1)  # output col tile
+    """
+    Outer product style quantized matmul kernel.
 
-    # 2. Offsets in matrix
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)  # row indices
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)  # col indices
+    Key optimization: Load each packed int32 ONCE, then extract all values from it.
+    Uses outer product accumulation instead of tensor core matmul to avoid broadcast loads.
 
-    # 3. Accumulator for result
-    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float16)
+    Trade-off: No tensor cores, but better memory access patterns.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
 
-    values_per_int32 = 32 // bits  # e.g. 8 for 4-bit
+    m_off = pid_m * BLOCK_M
+    n_off = pid_n * BLOCK_N
 
-    for k_tile in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        offs_k = k_tile * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)  # input feature idx
+    # allocate accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=DTYPE)
 
-        # 4. Load X block (input activations)
-        x_ptrs = x_ptr + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
-        x_block = tl.load(x_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] < K), other=0.0)
+    # values stored per int32
+    values_per_int32: tl.constexpr = 32 // bits
 
-        # 5. Prepare unpacked weight buffer
-        deq_w_block = tl.zeros((BLOCK_SIZE_K, BLOCK_SIZE_N), dtype=tl.float16)
+    # Iterate K in blocks of BLOCK_K (unpacked elements)
+    k = 0
+    while k < K:
+        # clamp size of this chunk
+        k_chunk = tl.minimum(BLOCK_K, K - k)
+        # number of packed ints to load for this k_chunk
+        packed_start = k // values_per_int32
+        packed_count = tl.cdiv(k_chunk, values_per_int32)
 
-        # 6. Get group index per input feature
-        group_idx = offs_k // GROUP_SIZE  # shape: [BLOCK_SIZE_K]
+        # iterate over packed ints for this k-chunk
+        for p in range(packed_count):
+            # index of packed int across whole K
+            packed_idx = packed_start + p
 
-        # 7. Bit shift for unpacking
-        shift = (offs_k % values_per_int32) * bits  # shape: [BLOCK_SIZE_K]
+            # Load packed int32 for BLOCK_N columns: shape (BLOCK_N,)
+            # This is COALESCED - each thread loads different packed int
+            offs_n = n_off + tl.arange(0, BLOCK_N)
+            offs_q = offs_n * stride_qn + packed_idx * stride_qk
+            valid_n_mask = offs_n < N
+            packed_int = tl.load(qweight_ptr + offs_q, mask=valid_n_mask, other=0)
 
-        # 8. Compute where to load packed weights
-        packed_idx = offs_k // values_per_int32  # index into packed columns
-        q_ptrs = qweight_ptr + offs_n[None, :] * stride_qn + packed_idx[:, None] * stride_qk
-        packed_vals = tl.load(q_ptrs, mask=(offs_n[None, :] < N), other=0)
+            # For each of the sub-values inside the packed_int (values_per_int32)
+            for s in range(values_per_int32):
+                # compute the unpacked feature index
+                unpacked_feature_idx = k + p * values_per_int32 + s
 
-        # 9. Unpack and dequantize
-        q_vals = (packed_vals >> shift[:, None]) & maxq  # extract bits
-        q_vals = q_vals.to(tl.float16)
+                # Only process if within bounds
+                if unpacked_feature_idx < K:
+                    # Load the specific x column for this feature
+                    offs_m = m_off + tl.arange(0, BLOCK_M)
+                    x_ptrs = offs_m * stride_xm + unpacked_feature_idx * stride_xk
+                    x_col = tl.load(x_ptr + x_ptrs, mask=(offs_m < M), other=0.0)
 
-        # 10. Load scale and zp using group indices
-        scale_ptrs = scale_ptr + offs_n[None, :] * stride_scale_row + group_idx[:, None] * stride_scale_group
-        zp_ptrs = zero_point_ptr + offs_n[None, :] * stride_zp_row + group_idx[:, None] * stride_zp_group
-        scale = tl.load(scale_ptrs)
-        zp = tl.load(zp_ptrs)
+                    # shift & mask to extract q
+                    q_vals = (packed_int >> (s * bits)) & qmask    # vector length BLOCK_N (int)
+                    q_f = q_vals.to(DTYPE)
 
-        # 11. Dequantize
-        deq_w_block = (q_vals - zp.to(tl.float16)) * scale
-        
-        # 12. Matrix multiplication (force 16-bit output)
-        dot_result = tl.dot(x_block, deq_w_block, out_dtype=tl.float16)
-        acc += dot_result
+                    # Compute which group this feature belongs to
+                    group_idx = unpacked_feature_idx // GROUP_SIZE
 
-    # 13. Add bias if needed
+                    # load per-group scale and zero_point for each output column n
+                    offs_scale = offs_n * stride_scalen + group_idx * stride_scaleg
+                    scale_v = tl.load(scale_ptr + offs_scale, mask=valid_n_mask, other=1.0).to(DTYPE)
+                    offs_zp = offs_n * stride_zpn + group_idx * stride_zpg
+                    zp_v = tl.load(zp_ptr + offs_zp, mask=valid_n_mask, other=0.0).to(DTYPE)
+
+                    # dequantize: w = scale * (q - zero_point)
+                    w_vals = scale_v * (q_f - zp_v)  # (BLOCK_N,) float
+
+                    # Outer product update
+                    acc += x_col[:, None] * w_vals[None, :]
+
+        # advance along K
+        k += k_chunk
+
+    # Convert to output dtype
+    result = acc.to(DTYPE)
+
+    # optional: add bias per column
     if BIAS_ENABLED:
-        bias_ptrs = bias_ptr + offs_n * stride_bias
-        bias = tl.load(bias_ptrs, mask=(offs_n < N), other=0.0)
-        acc += bias[None, :]
+        offs_n = n_off + tl.arange(0, BLOCK_N)
+        bias_n = tl.load(bias_ptr + offs_n * stride_bias, mask=(offs_n < N), other=0.0)
+        result += bias_n[None, :]
 
-    # 14. Store result
-    out_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    # write out block
+    offs_m = m_off + tl.arange(0, BLOCK_M)
+    offs_n = n_off + tl.arange(0, BLOCK_N)
+    offs_out = offs_m[:, None] * stride_outm + offs_n[None, :] * stride_outn
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    tl.store(out_ptrs, acc, mask=mask)
+    tl.store(out_ptr + offs_out, result, mask=mask)

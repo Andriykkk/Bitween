@@ -162,12 +162,12 @@ def benchmark_quantized_layers():
     
     # Define test configurations
     layer_sizes = [128, 256, 512, 1024,
-                    # 2048, 4096
+                    2048, 4096
                     ]
-    batch_sizes = [1, 
+    batch_sizes = [1, 2, 4, 8
                 #    16, 32
                    ]
-    warmup_iterations = 10
+    warmup_iterations = 100
     benchmark_iterations = 1000
     
     # Results storage
@@ -389,10 +389,134 @@ def _generate_summary_table(results):
     print(f"Average Mean Error: {np.mean(all_mean_errors):.4f} (±{np.std(all_mean_errors):.4f})")
 
 
+def test_cuda_kernel():
+    """
+    Test the new CUDA quantized matmul kernel.
+    """
+    print("\n--- Testing CUDA Quantized Kernel ---")
+
+    try:
+        from bitween.kernels.cuda_loader import quantized_matmul_cuda
+        print("✓ CUDA kernel loaded successfully")
+    except Exception as e:
+        print(f"✗ Failed to load CUDA kernel: {e}")
+        return
+
+    # Test configuration
+    M, N, K = 512, 1024, 2048
+    bits = 8
+    group_size = 128
+
+    print(f"\nTest shape: M={M}, N={N}, K={K}")
+    print(f"Quantization: {bits}-bit, group_size={group_size}")
+
+    # Create a reference float layer
+    float_layer = torch.nn.Linear(K, N, bias=True, dtype=torch.float32).cuda()
+
+    # Quantize it
+    from bitween.functional import quantize_rtn
+    qweight, scale, zero_point, _ = quantize_rtn(float_layer.weight.data, bits=bits, group_size=group_size)
+
+    qweight = qweight.contiguous().cuda()
+    scale = scale.contiguous().cuda().half()
+    zero_point = zero_point.contiguous().cuda().half()
+    bias = float_layer.bias.data.cuda().half()
+
+    # Create test input
+    x = torch.randn(M, K, device='cuda', dtype=torch.float16)
+
+    print("\nRunning CUDA kernel...")
+    try:
+        # Call CUDA kernel
+        output_cuda = quantized_matmul_cuda(x, qweight, scale, zero_point, bias, bits, group_size)
+        print(f"✓ CUDA kernel executed successfully")
+        print(f"  Output shape: {output_cuda.shape}")
+        print(f"  Output dtype: {output_cuda.dtype}")
+        print(f"  Output range: [{output_cuda.min().item():.4f}, {output_cuda.max().item():.4f}]")
+    except Exception as e:
+        print(f"✗ CUDA kernel failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return
+
+    # Compare with PyTorch reference (dequantize and matmul)
+    print("\nComparing with PyTorch reference...")
+    values_per_int32 = 32 // bits
+    num_groups = K // group_size
+
+    # Dequantize weights
+    total_vals = N * num_groups * group_size
+    q_flat = torch.empty(total_vals, dtype=torch.int32, device='cuda')
+
+    for i in range(values_per_int32):
+        shift = i * bits
+        mask = (1 << bits) - 1
+        q_vals = (qweight.view(-1) >> shift) & mask
+        q_flat[i::values_per_int32] = q_vals
+
+    q = q_flat.view(N, num_groups, group_size)
+    scale_expanded = scale.view(N, num_groups, 1)
+    zero_point_expanded = zero_point.view(N, num_groups, 1)
+    weight_dequant = scale_expanded * (q.float() - zero_point_expanded.float())
+    weight_dequant = weight_dequant.view(N, K).half()
+
+    # Reference matmul
+    output_ref = torch.nn.functional.linear(x, weight_dequant, bias)
+
+    # Compare
+    max_diff = (output_cuda - output_ref).abs().max().item()
+    mean_diff = (output_cuda - output_ref).abs().mean().item()
+    rel_error = mean_diff / output_ref.abs().mean().item()
+
+    print(f"  Max difference: {max_diff:.6f}")
+    print(f"  Mean difference: {mean_diff:.6f}")
+    print(f"  Relative error: {rel_error*100:.4f}%")
+
+    if rel_error < 0.01:  # Less than 1% error
+        print("✓ CUDA kernel output matches reference!")
+    else:
+        print("✗ CUDA kernel output differs from reference")
+
+    # Benchmark
+    print("\nBenchmarking...")
+    warmup = 100
+    iterations = 1000
+
+    # Warmup
+    for _ in range(warmup):
+        _ = quantized_matmul_cuda(x, qweight, scale, zero_point, bias, bits, group_size)
+        _ = torch.nn.functional.linear(x, weight_dequant, bias)
+
+    torch.cuda.synchronize()
+
+    # Benchmark CUDA kernel
+    start = time.time()
+    for _ in range(iterations):
+        _ = quantized_matmul_cuda(x, qweight, scale, zero_point, bias, bits, group_size)
+    torch.cuda.synchronize()
+    cuda_time = (time.time() - start) / iterations
+
+    # Benchmark PyTorch
+    start = time.time()
+    for _ in range(iterations):
+        _ = torch.nn.functional.linear(x, weight_dequant, bias)
+    torch.cuda.synchronize()
+    pytorch_time = (time.time() - start) / iterations
+
+    print(f"  CUDA kernel: {cuda_time*1000:.3f} ms")
+    print(f"  PyTorch FP16: {pytorch_time*1000:.3f} ms")
+    print(f"  Speedup: {pytorch_time/cuda_time:.2f}x")
+
+    print("\n✓ CUDA kernel test complete!")
+
+
 if __name__ == "__main__":
+    # Test CUDA kernel
+    test_cuda_kernel()
+
     # benchmark_results = benchmark_quantized_layers()
-    
-    main()
+
+    # main()
 
     # def get_quantized_model_size(model):
     #     total_bytes = 0

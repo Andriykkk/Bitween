@@ -7,6 +7,16 @@ import triton
 import triton.language as tl
 import copy
 
+# Try to load CUDA kernel, fallback to Triton if not available
+USE_CUDA_KERNEL = False
+try:
+    from .kernels.cuda_loader import quantized_matmul_cuda
+    USE_CUDA_KERNEL = True
+    print("Using optimized CUDA kernel for quantized matmul")
+except Exception as e:
+    print(f"CUDA kernel not available ({e}), using Triton kernel")
+    USE_CUDA_KERNEL = False
+
 class QuantizedLinearFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, qweight, scale, zero_point, bias, bits, group_size):
@@ -42,16 +52,16 @@ class QuantizedLinearFunction(torch.autograd.Function):
         }
 
         def grid(meta):
-            return (triton.cdiv(M, meta['BLOCK_SIZE_M']), triton.cdiv(N, meta['BLOCK_SIZE_N']))
+            return (triton.cdiv(M, meta['BLOCK_M']), triton.cdiv(N, meta['BLOCK_N']))
 
         quantized_linear_kernel[grid](
             x_reshaped, qweight, scale, zero_point, bias, c,
             M, N, K,
             bits,
-            (1 << bits) - 1,
+            (1 << bits) - 1,  # qmask
             x_reshaped.stride(0), x_reshaped.stride(1),
             qweight.stride(0), qweight.stride(1),
-            scale.stride(0), scale.stride(1),    
+            scale.stride(0), scale.stride(1),
             zero_point.stride(0), zero_point.stride(1),
             bias.stride(0) if bias is not None else 0,
             c.stride(0), c.stride(1),

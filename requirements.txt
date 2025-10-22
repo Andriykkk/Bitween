@@ -1,4 +1,4 @@
-
+ninja
 torch
 transformers
 bitsandbytes
