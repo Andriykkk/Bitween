@@ -7,3 +7,4 @@ scipy
 accelerate
 peft
 datasets
+hf_transfer
