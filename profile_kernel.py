@@ -145,14 +145,21 @@ def profile_all():
     try:
         print("Compiling CUDA FP16 kernel...")
         kernel_dir = Path(__file__).parent / "bitween" / "kernels"
+
+        # Force recompilation by using a unique build directory
+        import time
+        build_dir = Path(__file__).parent / "build" / f"fp16_build_{int(time.time())}"
+        build_dir.mkdir(parents=True, exist_ok=True)
+
         fp16_module = load(
             name='fp16_matmul_cuda',
             sources=[
                 str(kernel_dir / 'fp16_matmul_binding.cpp'),
                 str(kernel_dir / 'fp16_matmul.cu'),
             ],
+            build_directory=str(build_dir),
             extra_cuda_cflags=['-O3', '--use_fast_math', '-std=c++17'],
-            verbose=False,
+            verbose=True,
         )
         cuda_fp16_available = True
         print("✓ CUDA FP16 kernel loaded")
@@ -261,7 +268,8 @@ def profile_all():
     print(f"  Memory: {total_bytes_q / 1e6:.1f} MB")
     print(f"  Bandwidth: {quantized_bw:.1f} GB/s")
     print(f"  Speedup vs PyTorch: {pytorch_time / quantized_time:.2f}x")
-    print(f"  Speedup vs Triton FP16: {triton_time / quantized_time:.2f}x")
+    if cuda_fp16_available:
+        print(f"  Speedup vs CUDA FP16: {cuda_fp16_time / quantized_time:.2f}x")
 
     # Benchmark 4: CUDA Quantized kernel
     if cuda_available:
@@ -283,7 +291,8 @@ def profile_all():
         print(f"  Memory: {total_bytes_q / 1e6:.1f} MB")
         print(f"  Bandwidth: {cuda_bw:.1f} GB/s")
         print(f"  Speedup vs PyTorch: {pytorch_time / cuda_time:.2f}x")
-        print(f"  Speedup vs Triton FP16: {triton_time / cuda_time:.2f}x")
+        if cuda_fp16_available:
+            print(f"  Speedup vs CUDA FP16: {cuda_fp16_time / cuda_time:.2f}x")
         print(f"  Speedup vs Triton Quantized: {quantized_time / cuda_time:.2f}x")
     else:
         cuda_time = None
@@ -306,30 +315,30 @@ def profile_all():
     print("ANALYSIS")
     print("="*70)
 
-    if cuda_available:
+    if cuda_available and cuda_fp16_available:
         print(f"Triton vs CUDA Quantized: {quantized_time / cuda_time:.2f}x speedup with CUDA")
 
-        if cuda_time > triton_time:
-            slowdown = cuda_time / triton_time
-            print(f"\n⚠️  CUDA quantized kernel is {slowdown:.2f}x SLOWER than FP16 Triton")
+        if cuda_time > cuda_fp16_time:
+            slowdown = cuda_time / cuda_fp16_time
+            print(f"\n⚠️  CUDA quantized kernel is {slowdown:.2f}x SLOWER than CUDA FP16")
             print(f"   This suggests:")
             print(f"     - Dequantization overhead dominates")
             print(f"     - Need to optimize shared memory usage")
             print(f"     - May need tensor cores for matmul")
         else:
-            speedup = triton_time / cuda_time
-            print(f"\n✅ CUDA quantized kernel is {speedup:.2f}x FASTER than FP16 Triton!")
+            speedup = cuda_fp16_time / cuda_time
+            print(f"\n✅ CUDA quantized kernel is {speedup:.2f}x FASTER than CUDA FP16!")
             print(f"   This is the expected behavior - less memory traffic wins!")
 
-        if cuda_bw < triton_bw * 0.5:
-            print(f"\n⚠️  CUDA bandwidth ({cuda_bw:.1f} GB/s) is lower than")
-            print(f"   FP16 bandwidth ({triton_bw:.1f} GB/s)")
+        if cuda_bw < cuda_fp16_bw * 0.5:
+            print(f"\n⚠️  CUDA quantized bandwidth ({cuda_bw:.1f} GB/s) is lower than")
+            print(f"   CUDA FP16 bandwidth ({cuda_fp16_bw:.1f} GB/s)")
             print(f"   But this may be expected - more compute per byte loaded")
         else:
-            print(f"\n✅ CUDA bandwidth ({cuda_bw:.1f} GB/s) is comparable to")
-            print(f"   FP16 bandwidth ({triton_bw:.1f} GB/s)")
+            print(f"\n✅ CUDA quantized bandwidth ({cuda_bw:.1f} GB/s) is comparable to")
+            print(f"   CUDA FP16 bandwidth ({cuda_fp16_bw:.1f} GB/s)")
     else:
-        print("\n⚠️  CUDA kernel not available - skipping CUDA analysis")
+        print("\n⚠️  CUDA kernels not fully available - skipping analysis")
 
     # Verify correctness
     print("\n" + "="*70)
@@ -337,13 +346,14 @@ def profile_all():
     print("="*70)
 
     y_pt = float_layer(x)
-    y_triton = triton_matmul(x, weight)
     y_q = q_layer(x)
 
-    error_triton = (y_pt - y_triton).abs().max().item()
-    error_q = (y_pt - y_q).abs().max().item()
+    if cuda_fp16_available:
+        y_cuda_fp16 = cuda_fp16_matmul(x, weight, fp16_module)
+        error_cuda_fp16 = (y_pt - y_cuda_fp16).abs().max().item()
+        print(f"Max error (PyTorch vs CUDA FP16):        {error_cuda_fp16:.6f}")
 
-    print(f"Max error (PyTorch vs Triton FP16):      {error_triton:.6f}")
+    error_q = (y_pt - y_q).abs().max().item()
     print(f"Max error (PyTorch vs Triton Quantized): {error_q:.6f}")
 
     if cuda_available:
@@ -353,7 +363,7 @@ def profile_all():
         print(f"Max error (PyTorch vs CUDA Quantized):   {error_cuda:.6f}")
         print(f"Max error (Triton vs CUDA Quantized):    {error_cuda_vs_triton:.6f}")
 
-    return pytorch_time, triton_time, quantized_time, cuda_time if cuda_available else None
+    return pytorch_time, cuda_fp16_time if cuda_fp16_available else None, quantized_time, cuda_time if cuda_available else None
 
 
 if __name__ == "__main__":
