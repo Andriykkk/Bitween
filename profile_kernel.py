@@ -1,7 +1,7 @@
 """
 Profile and compare four approaches:
 1. PyTorch FP16 matmul (baseline)
-2. Custom Triton FP16 matmul kernel
+2. Custom CUDA FP16 matmul kernel (WMMA)
 3. Triton quantized INT8 kernel
 4. CUDA quantized INT8 kernel (optimized)
 
@@ -13,6 +13,8 @@ import torch.nn as nn
 from bitween import QuantizedLinear
 import triton
 import triton.language as tl
+from pathlib import Path
+from torch.utils.cpp_extension import load
 
 
 # Simple Triton matmul kernel for comparison
@@ -94,28 +96,10 @@ def matmul_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
-def triton_matmul(a, b):
-    """Wrapper for custom Triton matmul"""
+def cuda_fp16_matmul(a, b, fp16_module):
+    """Wrapper for custom CUDA FP16 WMMA matmul"""
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
-    M, K = a.shape
-    K, N = b.shape
-
-    # Allocate output
-    c = torch.empty((M, N), device=a.device, dtype=torch.float16)
-
-    # Launch kernel
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']),)
-
-    matmul_kernel[grid](
-        a, b, c,
-        M, N, K,
-        a.stride(0), a.stride(1),
-        b.stride(0), b.stride(1),
-        c.stride(0), c.stride(1),
-        GROUP_SIZE_M=8,
-    )
-
-    return c
+    return fp16_module.fp16_matmul_wmma(a, b)
 
 
 def profile_all():
@@ -148,29 +132,51 @@ def profile_all():
     # Prepare quantized layer (from FP32 for better quantization)
     q_layer = QuantizedLinear.from_float(float_layer_fp32, bits=bits, group_size=group_size).cuda()
 
-    # Try to load CUDA kernel
+    # Load CUDA kernels
     try:
         from bitween.kernels.cuda_loader import quantized_matmul_cuda
         cuda_available = True
-        print("\n✓ CUDA kernel loaded")
+        print("\n✓ CUDA quantized kernel loaded")
     except Exception as e:
         cuda_available = False
-        print(f"\n✗ CUDA kernel not available: {e}")
+        print(f"\n✗ CUDA quantized kernel not available: {e}")
+
+    # Load CUDA FP16 kernel
+    try:
+        print("Compiling CUDA FP16 kernel...")
+        kernel_dir = Path(__file__).parent / "bitween" / "kernels"
+        fp16_module = load(
+            name='fp16_matmul_cuda',
+            sources=[
+                str(kernel_dir / 'fp16_matmul_binding.cpp'),
+                str(kernel_dir / 'fp16_matmul.cu'),
+            ],
+            extra_cuda_cflags=['-O3', '--use_fast_math', '-std=c++17'],
+            verbose=False,
+        )
+        cuda_fp16_available = True
+        print("✓ CUDA FP16 kernel loaded")
+    except Exception as e:
+        cuda_fp16_available = False
+        fp16_module = None
+        print(f"✗ CUDA FP16 kernel not available: {e}")
 
     # Warm up
     print("\nWarming up...")
     for _ in range(20):
         _ = float_layer(x)
-        _ = triton_matmul(x, weight)
+        if cuda_fp16_available:
+            _ = cuda_fp16_matmul(x, weight, fp16_module)
         _ = q_layer(x)
         if cuda_available:
             _ = quantized_matmul_cuda(x, q_layer.qweight, q_layer.scale, q_layer.zero_point, q_layer.bias, bits, group_size)
     torch.cuda.synchronize()
 
-    # Extra warm-up for Triton kernels to ensure JIT compilation is complete
-    print("Extra warm-up for Triton/CUDA JIT compilation...")
+    # Extra warm-up for kernels to ensure JIT compilation is complete
+    print("Extra warm-up for CUDA/Triton JIT compilation...")
     for _ in range(50):
-        _ = triton_matmul(x, weight)
+        if cuda_fp16_available:
+            _ = cuda_fp16_matmul(x, weight, fp16_module)
         _ = q_layer(x)
         if cuda_available:
             _ = quantized_matmul_cuda(x, q_layer.qweight, q_layer.scale, q_layer.zero_point, q_layer.bias, bits, group_size)
@@ -203,29 +209,34 @@ def profile_all():
     print(f"  Memory: {total_bytes_pt / 1e6:.1f} MB")
     print(f"  Bandwidth: {pytorch_bw:.1f} GB/s")
 
-    # Benchmark 2: Custom Triton matmul
+    # Benchmark 2: Custom CUDA FP16 WMMA matmul
     print("\n" + "="*70)
-    print("2. Custom Triton FP16 Matmul")
+    print("2. Custom CUDA FP16 Matmul (WMMA)")
     print("="*70)
 
-    start.record()
-    for _ in range(iters):
-        y_triton = triton_matmul(x, weight)
-    end.record()
-    torch.cuda.synchronize()
-    triton_time = start.elapsed_time(end) / iters
+    if cuda_fp16_available:
+        start.record()
+        for _ in range(iters):
+            y_cuda_fp16 = cuda_fp16_matmul(x, weight, fp16_module)
+        end.record()
+        torch.cuda.synchronize()
+        cuda_fp16_time = start.elapsed_time(end) / iters
+    else:
+        cuda_fp16_time = None
+        print("  SKIPPED - kernel not available")
 
-    # Calculate memory bandwidth
-    weight_bytes_fp16 = size * size * 2  # fp16
-    input_bytes_fp16 = batch * size * 2
-    output_bytes_fp16 = batch * size * 2
-    total_bytes_triton = weight_bytes_fp16 + input_bytes_fp16 + output_bytes_fp16
-    triton_bw = (total_bytes_triton / 1e9) / (triton_time / 1000)
+    if cuda_fp16_available:
+        # Calculate memory bandwidth
+        weight_bytes_fp16 = size * size * 2  # fp16
+        input_bytes_fp16 = batch * size * 2
+        output_bytes_fp16 = batch * size * 2
+        total_bytes_cuda_fp16 = weight_bytes_fp16 + input_bytes_fp16 + output_bytes_fp16
+        cuda_fp16_bw = (total_bytes_cuda_fp16 / 1e9) / (cuda_fp16_time / 1000)
 
-    print(f"  Time: {triton_time:.3f} ms")
-    print(f"  Memory: {total_bytes_triton / 1e6:.1f} MB")
-    print(f"  Bandwidth: {triton_bw:.1f} GB/s")
-    print(f"  Speedup vs PyTorch: {pytorch_time / triton_time:.2f}x")
+        print(f"  Time: {cuda_fp16_time:.3f} ms")
+        print(f"  Memory: {total_bytes_cuda_fp16 / 1e6:.1f} MB")
+        print(f"  Bandwidth: {cuda_fp16_bw:.1f} GB/s")
+        print(f"  Speedup vs PyTorch: {pytorch_time / cuda_fp16_time:.2f}x")
 
     # Benchmark 3: Quantized kernel
     print("\n" + "="*70)
@@ -285,7 +296,8 @@ def profile_all():
     print(f"{'Method':<30} {'Time (ms)':<12} {'Bandwidth (GB/s)':<18} {'Speedup':<10}")
     print("-"*70)
     print(f"{'PyTorch FP16':<30} {pytorch_time:>10.3f}   {pytorch_bw:>16.1f}   {'1.00x':>8}")
-    print(f"{'Triton FP16':<30} {triton_time:>10.3f}   {triton_bw:>16.1f}   {pytorch_time/triton_time:>8.2f}x")
+    if cuda_fp16_available:
+        print(f"{'CUDA FP16 (WMMA)':<30} {cuda_fp16_time:>10.3f}   {cuda_fp16_bw:>16.1f}   {pytorch_time/cuda_fp16_time:>8.2f}x")
     print(f"{'Triton Quantized INT8':<30} {quantized_time:>10.3f}   {quantized_bw:>16.1f}   {pytorch_time/quantized_time:>8.2f}x")
     if cuda_available:
         print(f"{'CUDA Quantized INT8':<30} {cuda_time:>10.3f}   {cuda_bw:>16.1f}   {pytorch_time/cuda_time:>8.2f}x")
