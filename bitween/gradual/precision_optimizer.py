@@ -1419,6 +1419,9 @@ class PrecisionOptimizer:
                 if self.original_model is not None:
                     original_block_for_restore = get_module_by_name(self.original_model, block_name)
                     restored_block = copy.deepcopy(original_block_for_restore)
+                    # Move restored block to GPU (original_model is on CPU)
+                    target_device = next(self.model.parameters()).device
+                    restored_block = restored_block.to(device=target_device)
                     set_module_by_name(self.model, block_name, restored_block)
                     print(f"        ✓ Model block restored to original state")
 
@@ -1438,6 +1441,9 @@ class PrecisionOptimizer:
                 if self.original_model is not None:
                     original_block_for_restore = get_module_by_name(self.original_model, block_name)
                     restored_block = copy.deepcopy(original_block_for_restore)
+                    # Move restored block to GPU (original_model is on CPU)
+                    target_device = next(self.model.parameters()).device
+                    restored_block = restored_block.to(device=target_device)
                     set_module_by_name(self.model, block_name, restored_block)
             except:
                 pass
