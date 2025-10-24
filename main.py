@@ -160,10 +160,13 @@ def benchmark_quantized_layers():
     print("\n--- Benchmarking Quantized Layers ---")
     
     # Define test configurations
-    layer_sizes = [128, 256, 512, 1024,
+    layer_sizes = [
+        # 128, 256, 512, 1024,
                     2048, 4096
                     ]
-    batch_sizes = [1, 2, 4, 8
+    batch_sizes = [
+        # 1, 2, 4, 
+                   8
                 #    16, 32
                    ]
     warmup_iterations = 100
@@ -511,11 +514,11 @@ def test_cuda_kernel():
 
 if __name__ == "__main__":
     # Test CUDA kernel
-    # test_cuda_kernel()
+    test_cuda_kernel()
 
-    # benchmark_results = benchmark_quantized_layers()
+    benchmark_results = benchmark_quantized_layers()
 
-    main()
+    # main()
 
     # def get_quantized_model_size(model):
     #     total_bytes = 0

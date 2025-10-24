@@ -7,15 +7,55 @@ import triton
 import triton.language as tl
 import copy
 
-# Try to load CUDA kernel, fallback to Triton if not available
-USE_CUDA_KERNEL = False
-try:
-    from .kernels.cuda_loader import quantized_matmul_cuda
-    USE_CUDA_KERNEL = True
-    print("Using optimized CUDA kernel for quantized matmul")
-except Exception as e:
-    print(f"CUDA kernel not available ({e}), using Triton kernel")
-    USE_CUDA_KERNEL = False
+@triton.jit
+def dequantize_weights_kernel(
+    qweight_ptr,    # [N, packed_K] int32
+    scale_ptr,      # [N, num_groups] fp16
+    zp_ptr,         # [N, num_groups] fp16
+    weight_ptr,     # [N, K] fp16 output
+    N, K,
+    packed_K,
+    num_groups,
+    bits: tl.constexpr,
+    group_size: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Triton kernel to dequantize weights from INT to FP16."""
+    pid = tl.program_id(0)
+    n = pid
+
+    if n >= N:
+        return
+
+    values_per_int32: tl.constexpr = 32 // bits
+    mask: tl.constexpr = (1 << bits) - 1
+
+    # Process K dimension in chunks
+    for k_start in range(0, K, BLOCK_SIZE):
+        k_offs = k_start + tl.arange(0, BLOCK_SIZE)
+        k_mask = k_offs < K
+
+        # Get packed indices
+        packed_k = k_offs // values_per_int32
+        idx_in_packed = k_offs % values_per_int32
+
+        # Load packed values
+        packed_vals = tl.load(qweight_ptr + n * packed_K + packed_k, mask=k_mask, other=0)
+
+        # Extract quantized values
+        shift = idx_in_packed * bits
+        q_vals = (packed_vals >> shift) & mask
+
+        # Get scale and zero_point for this group
+        group_idx = k_offs // group_size
+        scales = tl.load(scale_ptr + n * num_groups + group_idx, mask=k_mask, other=0.0)
+        zps = tl.load(zp_ptr + n * num_groups + group_idx, mask=k_mask, other=0.0)
+
+        # Dequantize: weight = scale * (q - zero_point)
+        weights = scales * (q_vals.to(tl.float32) - zps)
+
+        # Store
+        tl.store(weight_ptr + n * K + k_offs, weights.to(tl.float16), mask=k_mask)
 
 class QuantizedLinearFunction(torch.autograd.Function):
     @staticmethod
@@ -34,47 +74,34 @@ class QuantizedLinearFunction(torch.autograd.Function):
         x_reshaped = x.reshape(-1, original_shape[-1]).to(target_dtype)
 
         M, K = x_reshaped.shape
-        N, _ = qweight.shape
+        N, packed_K = qweight.shape
 
-        if USE_CUDA_KERNEL:
-            # Use optimized CUDA kernel with tensor cores
-            c = quantized_matmul_cuda(
-                x_reshaped,
-                qweight,
-                scale,
-                zero_point,
-                bias,
-                bits,
-                group_size
-            )
-        else:
-            # Fallback to Triton kernel
-            c = torch.empty((M, N), device=device, dtype=target_dtype)
+        # BASELINE: Dequantize to FP16, then use PyTorch's cuBLAS matmul
+        values_per_int32 = 32 // bits
+        actual_K = packed_K * values_per_int32
+        num_groups = actual_K // group_size
 
-            DTYPE = {
-                torch.float16: tl.float16,
-                torch.bfloat16: tl.bfloat16,
-                torch.float32: tl.float32
-            }
+        # Allocate temporary dequantized weights
+        weight_fp16 = torch.empty((N, actual_K), dtype=torch.float16, device=device)
 
-            def grid(meta):
-                return (triton.cdiv(M, meta['BLOCK_M']), triton.cdiv(N, meta['BLOCK_N']))
+        # Launch Triton dequantization kernel
+        grid = lambda meta: (N,)
+        dequantize_weights_kernel[grid](
+            qweight, scale, zero_point, weight_fp16,
+            N, actual_K, packed_K, num_groups,
+            bits=bits,
+            group_size=group_size,
+            BLOCK_SIZE=256
+        )
 
-            quantized_linear_kernel[grid](
-                x_reshaped, qweight, scale, zero_point, bias, c,
-                M, N, K,
-                bits,
-                (1 << bits) - 1,  # qmask
-                x_reshaped.stride(0), x_reshaped.stride(1),
-                qweight.stride(0), qweight.stride(1),
-                scale.stride(0), scale.stride(1),
-                zero_point.stride(0), zero_point.stride(1),
-                bias.stride(0) if bias is not None else 0,
-                c.stride(0), c.stride(1),
-                GROUP_SIZE=group_size,
-                BIAS_ENABLED=(bias is not None),
-                DTYPE=DTYPE[target_dtype]
-            )
+        c = torch.matmul(x_reshaped, weight_fp16.T)
+
+        # Add bias
+        if bias is not None:
+            c = c + bias
+
+        # Clear dequantized weights immediately
+        del weight_fp16
 
         return c.reshape(*original_shape[:-1], N)
 
@@ -111,7 +138,6 @@ class QuantizedLinearFunction(torch.autograd.Function):
         if ctx.needs_input_grad[0]:
             grad_input = grad_output @ weight.to(grad_output.dtype)
 
-        # Return None for all other non-differentiable inputs
         return grad_input, None, None, None, None, None, None
 
 class QuantizedLinear(nn.Module):
@@ -130,7 +156,7 @@ class QuantizedLinear(nn.Module):
 
         if self.bits not in [2, 4, 8]:
             raise ValueError("Only 2, 4, or 8 bits are supported.")
-        
+
         if group_size < 1:
             raise ValueError("Group size must be at least 1.")
 
@@ -139,7 +165,7 @@ class QuantizedLinear(nn.Module):
         # else:
         #     self.dtype = torch.float16
         self.dtype = torch.float16
-        
+
         # Determine the shape of the quantized weight tensor
         values_per_int32 = 32 // self.bits
         q_in_features = self.in_features // values_per_int32
@@ -147,18 +173,16 @@ class QuantizedLinear(nn.Module):
 
         num_groups = in_features // group_size
         scale_zp_shape = (out_features, num_groups)
-            
+
         self.register_buffer('scale', torch.zeros(scale_zp_shape, dtype=self.dtype))
         self.register_buffer('zero_point', torch.zeros(scale_zp_shape, dtype=self.dtype))
-        
+
         if bias:
             self.register_buffer('bias', torch.zeros(out_features, dtype=self.dtype))
         else:
             self.bias = None
- 
+
     def forward(self, x):
-        # if x.dtype != torch.bfloat16 or x.dtype != torch.float16:
-        #     x = x.to(self.dtype)
         x = QuantizedLinearFunction.apply(x, self.qweight, self.scale, self.zero_point, self.bias, self.bits, self.group_size)
         return x
 

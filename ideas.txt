@@ -1,3 +1,4 @@
+[ ] check this for fast kernel https://leimao.github.io/article/CUDA-Matrix-Multiplication-Optimization/ https://github.com/leimao/CUDA-GEMM-Optimization https://siboehm.com/articles/22/CUDA-MMM
 [ ] add gradual quantisation
     [ ] in the end run training quantization for whole model to check everything and also try to increase freeze layers group size
     [ ] later think about quantising with separate model look for outliers and model that find hyperparameters and look what layers to train (check usual model and hyerarhical reasoning model)
