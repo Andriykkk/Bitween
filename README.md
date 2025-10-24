@@ -9,6 +9,8 @@
 - **Per-group quantization**: Configurable group sizes (32, 64, 128, ...) for accuracy/compression trade-off
 - **Memory efficient**: Reduce model size by 75-87.5% with minimal accuracy loss
 
+> **Note:** Quantization primarily reduces model size, not inference speed. Dequantization and matrix multiplication overhead can negate speed benefits, as cuBLAS (closed-source) is highly optimized for FP16 operations on modern GPUs. Quantization is most useful for memory savings and deploying larger models in limited VRAM.
+
 ## Installation
 
 ```bash
